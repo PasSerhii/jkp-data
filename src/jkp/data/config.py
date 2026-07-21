@@ -3,11 +3,29 @@ from datetime import date
 import polars as pl
 
 # Last calendar date kept in pipeline outputs.
-END_DATE = date(2025, 12, 31)
+END_DATE = date(2026, 5, 31)
+
+# Earliest calendar date to download from WRDS (filters date-bearing source
+# tables to `>= START_DATE`). None means no lower bound (full history, ~1950).
+# Mirrors the modified SAS `update_mode=1` start_date.
+START_DATE: date | None = date(2000, 1, 1)
 
 # Earliest fiscal-period-end date kept when building the standardized
 # accounting panel; rows with `datadate` before this are dropped.
 ACCOUNTING_START_DATE = pl.datetime(1949, 12, 31)
+
+# Bypass CRSP entirely and build the dataset from Compustat only. When True the
+# pipeline skips all CRSP downloads/processing and mirrors the SAS `bypass_crsp=1`
+# path: Compustat-only security files, FF risk-free rate (with last-month
+# fallback) instead of the CRSP 30y T-bill, NYSE breakpoints from `comp_exchg=11`,
+# and industry codes from Compustat only. The `jkp build --bypass-crsp/--no-bypass-crsp`
+# flag overrides this default per run.
+BYPASS_CRSP = True
+
+# Also emit the alpha-beta production CSVs (per-country monthly characteristics
+# and daily returns, with company name, sedol/cusip/isin, turnover, ILS values),
+# mirroring the SAS `*_production_*` macros. Written under processed/production/.
+PRODUCTION_OUTPUT = True
 
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
@@ -218,7 +236,7 @@ ROLLING_DAILY_SPECS: list[tuple[str, int, list[str]]] = [
 PORTFOLIO_SETTINGS = {
     "end_date": END_DATE,
     "pfs": PORTFOLIO_PFS,
-    "source": ["CRSP", "COMPUSTAT"],
+    "source": ["COMPUSTAT"],
     "wins_ret": True,
     "bps": "non_mc",
     "bp_min_n": PORTFOLIO_BP_MIN_N,

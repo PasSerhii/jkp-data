@@ -5,6 +5,7 @@ This module tests the download_raw_data_tables function and its helper functions
 particularly the persistent connection feature that uses ATTACH instead of postgres_scan().
 """
 
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -93,7 +94,9 @@ class TestDownloadRawDataTablesBranching:
         sql_joined = " ".join(executed_sql)
 
         assert "postgres_scan" in sql_joined
-        assert "ATTACH" not in sql_joined
+        # Ordinary tables retain postgres_scan. The compact full-history age
+        # aggregate uses one temporary attached connection.
+        assert "AS age_anchor_source" in sql_joined
 
     def test_persistent_connection_true_uses_attach(self, mock_duckdb, test_paths):
         """When persistent_connection=True, should use ATTACH."""
@@ -112,7 +115,7 @@ class TestDownloadRawDataTablesBranching:
 
         assert "ATTACH" in sql_joined
         assert "DETACH" in sql_joined
-        assert "wrds." in sql_joined
+        assert "source_db." in sql_joined
 
     def test_persistent_connection_true_single_attach(self, mock_duckdb, test_paths):
         """Persistent connection should only ATTACH once for all tables."""
@@ -147,6 +150,44 @@ class TestDownloadRawDataTablesBranching:
 
         download_raw_data_tables(test_paths, "user", "pass", persistent_connection=True)
         mock_conn.close.assert_called_once()
+
+    def test_persistent_connection_oom_retries_with_postgres_scan(self, mock_duckdb, test_paths):
+        """Attached downloads that hit DuckDB OOM should retry with postgres_scan."""
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        class OutOfMemoryException(Exception):
+            pass
+
+        attached_calls = 0
+
+        def attached_side_effect(*args, **kwargs):
+            nonlocal attached_calls
+            attached_calls += 1
+            if attached_calls == 1:
+                raise OutOfMemoryException("allocation failure")
+            return None
+
+        with (
+            patch(
+                "jkp.data.aux_functions.download_wrds_table_attached",
+                side_effect=attached_side_effect,
+            ) as mock_attached,
+            patch("jkp.data.aux_functions.download_wrds_table") as mock_postgres_scan,
+        ):
+            download_raw_data_tables(
+                test_paths,
+                "user",
+                "pass",
+                persistent_connection=True,
+                bypass_crsp=True,
+                countries=("USA",),
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 1, 31),
+            )
+
+        assert mock_attached.called
+        assert mock_postgres_scan.called
+        assert mock_postgres_scan.call_args_list[0].args[2] == "comp.exrt_dly"
 
 
 class TestGetColumnsAttached:

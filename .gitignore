@@ -115,3 +115,4 @@ aux_*.ddb
 # Rust plugin build artifacts
 jkp-plugin/target/
 jkp-plugin/Cargo.lock
+/docs/

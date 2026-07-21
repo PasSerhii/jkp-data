@@ -119,6 +119,17 @@ class TestRunPortfolioOutputs:
         assert (country_dir / "USA.parquet").exists()
         assert (country_dir / "FRA.parquet").exists()
 
+    def test_country_filter_limits_portfolio_outputs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup(tmp_path, monkeypatch, countries=("USA", "FRA"))
+        run_portfolio(output_format="parquet", output_dir=tmp_path, countries=["USA"])
+
+        out = _portfolios_dir(tmp_path)
+        assert set(pl.read_parquet(out / "pfs.parquet")["excntry"].unique().to_list()) == {"USA"}
+        assert (out / "country_factors" / "USA.parquet").exists()
+        assert not (out / "country_factors" / "FRA.parquet").exists()
+
     def test_writes_regional_factors_partition(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

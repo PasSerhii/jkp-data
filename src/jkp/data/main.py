@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 from .aux_functions import (
@@ -16,6 +17,7 @@ from .aux_functions import (
     ff_ind_class,
     filter_dsf,
     filter_msf,
+    filter_security_files_by_country,
     filter_world,
     finish_daily_chars,
     firm_age,
@@ -28,6 +30,7 @@ from .aux_functions import (
     merge_roll_apply_daily_results,
     merge_world_data_prelim,
     mispricing_factors,
+    normalize_country_filter,
     nyse_size_cutoffs,
     prepare_comp_sf,
     prepare_crsp_sf,
@@ -45,41 +48,110 @@ from .aux_functions import (
     setup_folder_structure,
     standardized_accounting_data,
 )
-from .config import ACCOUNTING_START_DATE, END_DATE, ROLLING_DAILY_SPECS
+from .config import (
+    ACCOUNTING_START_DATE,
+    BYPASS_CRSP,
+    PRODUCTION_OUTPUT,
+    ROLLING_DAILY_SPECS,
+)
+from .config import (
+    END_DATE as DEFAULT_END_DATE,
+)
+from .config import (
+    START_DATE as DEFAULT_START_DATE,
+)
+from .database_sources import CompustatSource, get_xpressfeed_connection_info
 from .paths import DataPaths
+from .production import export_production
 from .wrds_credentials import get_wrds_credentials
 
 
-def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> None:
-    """Run the full JKP data generation pipeline."""
+def run_pipeline(
+    *,
+    persistent_connection: bool = False,
+    output_dir: Path,
+    bypass_crsp: bool = BYPASS_CRSP,
+    production_output: bool = PRODUCTION_OUTPUT,
+    countries: list[str] | tuple[str, ...] | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
+) -> None:
+    """Run the full JKP data generation pipeline.
+
+    When ``bypass_crsp`` is True the pipeline is built from Compustat only:
+    all CRSP downloads and CRSP-specific processing steps are skipped, mirroring
+    the SAS ``bypass_crsp=1`` path. XpressFeed RDS is the default Compustat
+    source and requires this mode because it does not contain CRSP. Select
+    ``compustat_source="wrds"`` for historical comparison runs.
+    """
     paths = DataPaths(base_dir=output_dir.resolve())
-    creds = get_wrds_credentials()
+    source = CompustatSource(compustat_source)
+    if source is CompustatSource.xpressfeed:
+        if not bypass_crsp:
+            raise ValueError(
+                "The XpressFeed RDS contains Compustat and Fama-French data but not CRSP. "
+                "Use --bypass-crsp, or select --compustat-source wrds for a CRSP build."
+            )
+        source_connection_info = get_xpressfeed_connection_info()
+        source_label = "XpressFeed RDS"
+        raw_schema = "public"
+        username = None
+        password = None
+    else:
+        creds = get_wrds_credentials()
+        source_connection_info = None
+        source_label = "WRDS"
+        raw_schema = "comp"
+        username = creds.username
+        password = creds.password
+    country_filter = normalize_country_filter(countries)
+    effective_start_date = DEFAULT_START_DATE if start_date is None else start_date
+    effective_end_date = DEFAULT_END_DATE if end_date is None else end_date
+    if (
+        effective_start_date is not None
+        and effective_end_date is not None
+        and effective_start_date > effective_end_date
+    ):
+        raise ValueError(
+            f"start_date ({effective_start_date}) must be on or before end_date ({effective_end_date})"
+        )
 
     interim = paths.interim_dir
 
     setup_folder_structure(paths)
     download_raw_data_tables(
         paths,
-        username=creds.username,
-        password=creds.password,
-        end_date=END_DATE,
+        username=username,
+        password=password,
+        connection_info=source_connection_info,
+        source_label=source_label,
+        raw_schema=raw_schema,
+        end_date=effective_end_date,
         persistent_connection=persistent_connection,
+        bypass_crsp=bypass_crsp,
+        start_date=effective_start_date,
+        countries=country_filter,
     )
-    gen_raw_data_dfs(paths)
-    prepare_comp_sf(paths, "both")
-    prepare_crsp_sf(paths, "m")
-    prepare_crsp_sf(paths, "d")
-    combine_crsp_comp_sf(paths)
-    crsp_industry(paths)
-    comp_industry(paths)
-    merge_industry_to_world_msf(paths)
+    gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
+    prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)
+    if not bypass_crsp:
+        prepare_crsp_sf(paths, "m")
+        prepare_crsp_sf(paths, "d")
+    combine_crsp_comp_sf(paths, bypass_crsp=bypass_crsp)
+    if not bypass_crsp:
+        crsp_industry(paths)
+    comp_industry(paths, end_date=effective_end_date)
+    merge_industry_to_world_msf(paths, bypass_crsp=bypass_crsp)
     ff_ind_class(paths, interim / "__msf_world2.parquet")
-    nyse_size_cutoffs(paths, interim / "__msf_world3.parquet")
+    nyse_size_cutoffs(paths, interim / "__msf_world3.parquet", bypass_crsp=bypass_crsp)
     classify_stocks_size_groups(paths)
     return_cutoffs(paths, "m", 0)
     return_cutoffs(paths, "d", 0)
     add_ret_exc_wins(paths, "m")
     add_ret_exc_wins(paths, "d")
+    if country_filter is not None:
+        filter_security_files_by_country(paths, country_filter)
     market_returns(
         paths,
         interim / "world_dsf.parquet",
@@ -154,7 +226,7 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
         10,
         3,
     )
-    firm_age(paths, interim / "world_msf.parquet")
+    firm_age(paths, interim / "world_msf.parquet", bypass_crsp=bypass_crsp)
     mispricing_factors(paths, interim / "world_data_prelim.parquet", 10, min_fcts=3)
     market_beta(
         paths,
@@ -163,6 +235,7 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
         interim / "ap_factors_monthly.parquet",
         60,
         36,
+        end_date=effective_end_date,
     )
     residual_momentum(
         paths,
@@ -173,6 +246,7 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
         24,
         12,
         1,
+        end_date=effective_end_date,
     )
     residual_momentum(
         paths,
@@ -183,6 +257,7 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
         24,
         6,
         1,
+        end_date=effective_end_date,
     )
     bidask_hl(
         paths,
@@ -194,8 +269,8 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
     prepare_daily(paths, interim / "world_dsf.parquet", interim / "ap_factors_daily.parquet")
     for sfx, min_obs, vars_ in ROLLING_DAILY_SPECS:
         for var in vars_:
-            roll_apply_daily(paths, var, sfx, min_obs)
-    merge_roll_apply_daily_results(paths)
+            roll_apply_daily(paths, var, sfx, min_obs, end_date=effective_end_date)
+    merge_roll_apply_daily_results(paths, end_date=effective_end_date)
     finish_daily_chars(paths, interim / "market_chars_d.parquet")
     merge_world_data_prelim(paths)
     quality_minus_junk(paths, interim / "world_data_-1.parquet", 10)
@@ -208,4 +283,8 @@ def run_pipeline(*, persistent_connection: bool = False, output_dir: Path) -> No
     save_monthly_ret(paths)
     save_accounting_data(paths)
     save_output_files(paths)
+    # Production CSVs must run before cleanup: they read the filtered interim
+    # outputs and the raw SECD/G_SECD identifier tables, all cleared below.
+    if production_output:
+        export_production(paths, end_date=effective_end_date)
     save_full_files_and_cleanup(paths, clear_interim=True)

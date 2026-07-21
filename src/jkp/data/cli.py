@@ -1,11 +1,13 @@
 """JKP Data CLI - Factor data generation pipeline."""
 
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 
 import typer
 
 from . import __version__
+from .database_sources import CompustatSource
 
 
 class OutputFormat(StrEnum):
@@ -26,6 +28,15 @@ def _version_callback(value: bool) -> None:
     if value:
         typer.echo(__version__)
         raise typer.Exit()
+
+
+def _parse_iso_date(value: str | None, option_name: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise typer.BadParameter(f"{option_name} must be an ISO date like 2024-12-31") from None
 
 
 @app.callback()
@@ -50,7 +61,7 @@ def build(
         False,
         "--persistent-connection",
         "-p",
-        help="Use a single persistent WRDS connection (reduces MFA prompts on NAT-rotated networks).",
+        help="Use one persistent PostgreSQL connection for all source downloads.",
     ),
     force: bool = typer.Option(
         False,
@@ -58,8 +69,45 @@ def build(
         "-f",
         help="Overwrite existing data in output directory without prompting.",
     ),
+    bypass_crsp: bool | None = typer.Option(
+        None,
+        "--bypass-crsp/--no-bypass-crsp",
+        help="Build from Compustat only, skipping all CRSP download/processing. "
+        "Defaults to config.BYPASS_CRSP when not specified.",
+    ),
+    production_output: bool | None = typer.Option(
+        None,
+        "--production/--no-production",
+        help="Also emit the alpha-beta production CSVs (per-country monthly + daily). "
+        "Defaults to config.PRODUCTION_OUTPUT when not specified.",
+    ),
+    country: list[str] | None = typer.Option(
+        None,
+        "--country",
+        "-c",
+        help="Restrict downstream build outputs to one ISO-3 country code. "
+        "Repeat for multiple countries, e.g. -c USA -c ISR.",
+    ),
+    start_date: str | None = typer.Option(
+        None,
+        "--start-date",
+        help="Earliest database source date to download, as YYYY-MM-DD. "
+        "Defaults to config.START_DATE.",
+    ),
+    end_date: str | None = typer.Option(
+        None,
+        "--end-date",
+        help="Latest database source date to download, as YYYY-MM-DD. "
+        "Defaults to config.END_DATE.",
+    ),
+    compustat_source: CompustatSource = typer.Option(
+        CompustatSource.xpressfeed,
+        "--compustat-source",
+        help="Compustat source: XpressFeed RDS (default) or WRDS for regression runs.",
+    ),
 ) -> None:
     """Run the full data generation pipeline."""
+    from .config import BYPASS_CRSP, PRODUCTION_OUTPUT
     from .main import run_pipeline
 
     if not force and output_dir.exists() and any(output_dir.iterdir()):
@@ -68,7 +116,16 @@ def build(
             abort=True,
         )
 
-    run_pipeline(persistent_connection=persistent_connection, output_dir=output_dir)
+    run_pipeline(
+        persistent_connection=persistent_connection,
+        output_dir=output_dir,
+        bypass_crsp=BYPASS_CRSP if bypass_crsp is None else bypass_crsp,
+        production_output=PRODUCTION_OUTPUT if production_output is None else production_output,
+        countries=country,
+        start_date=_parse_iso_date(start_date, "--start-date"),
+        end_date=_parse_iso_date(end_date, "--end-date"),
+        compustat_source=compustat_source,
+    )
 
 
 @app.command()
@@ -81,11 +138,28 @@ def portfolio(
         "--output-format",
         help="Output file format.",
     ),
+    country: list[str] | None = typer.Option(
+        None,
+        "--country",
+        "-c",
+        help="Restrict portfolio generation to one ISO-3 country code. "
+        "Repeat for multiple countries.",
+    ),
+    end_date: str | None = typer.Option(
+        None,
+        "--end-date",
+        help="Latest portfolio output date, as YYYY-MM-DD. Defaults to config.END_DATE.",
+    ),
 ) -> None:
     """Generate factor portfolios from characteristics data."""
     from .portfolio import run_portfolio
 
-    run_portfolio(output_format=output_format.value, output_dir=output_dir)
+    run_portfolio(
+        output_format=output_format.value,
+        output_dir=output_dir,
+        countries=country,
+        end_date=_parse_iso_date(end_date, "--end-date"),
+    )
 
 
 # This help text is the canonical description of the credential precedence

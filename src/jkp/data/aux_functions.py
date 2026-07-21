@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import operator
 import os
@@ -96,6 +97,8 @@ def setup_folder_structure(paths: DataPaths) -> None:
     (paths.processed_dir / "accounting_data").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "other_output").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "portfolios").mkdir(parents=True, exist_ok=True)
+    paths.sas_output_dir.mkdir(parents=True, exist_ok=True)
+    (paths.sas_output_dir / "CharacteristicsProduction").mkdir(parents=True, exist_ok=True)
     shutil.copy2(get_data_readme_path(), paths.base_dir / "README.md")
 
 
@@ -117,6 +120,53 @@ def collect_and_write(df, filename, collect_streaming=False):
         Parquet file at `filename`.
     """
     df.collect(streaming=collect_streaming).write_parquet(filename)
+
+
+def _write_sas_csv(df: pl.DataFrame | pl.LazyFrame, path: Path) -> None:
+    """Write a SAS-style CSV with quoted strings and blank nulls."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(df, pl.LazyFrame):
+        df = df.collect(engine="streaming")
+    df.write_csv(path, quote_style="non_numeric", null_value="")
+
+
+def normalize_country_filter(countries: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
+    """Normalize an optional country filter to uppercase ISO-3 codes."""
+    if not countries:
+        return None
+    normalized = tuple(dict.fromkeys(c.strip().upper() for c in countries if c.strip()))
+    invalid = [c for c in normalized if not re.fullmatch(r"[A-Z]{3}", c)]
+    if invalid:
+        raise ValueError(f"Country codes must be ISO-3 alphabetic codes, got {invalid!r}")
+    return normalized or None
+
+
+@measure_time
+def filter_security_files_by_country(paths: DataPaths, countries: tuple[str, ...]) -> None:
+    """Restrict world_msf/world_dsf to selected countries for downstream debugging/builds."""
+    outputs: list[tuple[Path, Path]] = []
+    for filename in ("world_msf.parquet", "world_dsf.parquet"):
+        path = paths.interim_dir / filename
+        tmp_path = paths.interim_dir / f"{path.stem}_country_filter.parquet"
+        tmp_path.unlink(missing_ok=True)
+        (
+            pl.scan_parquet(path)
+            .filter(pl.col("excntry").is_in(countries))
+            .sink_parquet(tmp_path)
+        )
+
+        if pl.scan_parquet(tmp_path).select(pl.len()).collect().item() == 0:
+            for _, created_tmp in outputs:
+                created_tmp.unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Country filter {countries!r} produced no rows in {filename}. "
+                "Use ISO-3 country codes from the `excntry` column, e.g. USA."
+            )
+        outputs.append((path, tmp_path))
+
+    for path, tmp_path in outputs:
+        os.replace(tmp_path, path)
 
 
 def sic_naics_aux(filename):
@@ -403,7 +453,7 @@ def gen_fx1(paths: DataPaths):
 
 
 @measure_time
-def gen_raw_data_dfs(paths: DataPaths):
+def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
     """
     Description:
         Generate a suite of “raw data” helper Parquet files from Compustat/CRSP sources.
@@ -418,6 +468,11 @@ def gen_raw_data_dfs(paths: DataPaths):
         5) Standardize types/columns, sort/deduplicate where needed.
         6) Write all to raw_data_dfs/*.parquet.
 
+    When ``bypass_crsp`` is True, all CRSP-derived helper files (permno0,
+    crsp_*sedelist, crsp_mcti_t30ret, the augmented CRSP monthly file, and the
+    CRSP security files) are skipped, since the dataset is built from Compustat
+    only. See config.BYPASS_CRSP.
+
     Output:
         Multiple helper Parquets under raw_data_dfs/ used in later pipelines.
     """
@@ -426,50 +481,56 @@ def gen_raw_data_dfs(paths: DataPaths):
     collect_and_write(sic_naics_na, paths.interim_dir / "raw_data_dfs" / "sic_naics_na.parquet")
     sic_naics_gl = sic_naics_aux(paths.raw_tables_dir / "comp_g_funda.parquet")
     collect_and_write(sic_naics_gl, paths.interim_dir / "raw_data_dfs" / "sic_naics_gl.parquet")
-    permno0 = (
-        pl.scan_parquet(paths.raw_tables_dir / "crsp_stksecurityinfohist.parquet")
-        .select(
-            [
-                col("permno").cast(pl.Int64),
-                col("permco").cast(pl.Int64),
-                "secinfostartdt",
-                "secinfoenddt",
-                col("siccd").cast(pl.Int64).alias("sic"),
-                col("naics").cast(pl.Int64),
-            ]
+    if not bypass_crsp:
+        permno0 = (
+            pl.scan_parquet(paths.raw_tables_dir / "crsp_stksecurityinfohist.parquet")
+            .select(
+                [
+                    col("permno").cast(pl.Int64),
+                    col("permco").cast(pl.Int64),
+                    "secinfostartdt",
+                    "secinfoenddt",
+                    col("siccd").cast(pl.Int64).alias("sic"),
+                    col("naics").cast(pl.Int64),
+                ]
+            )
+            .unique()
+            .sort(["permno", "secinfostartdt", "secinfoenddt"])
         )
-        .unique()
-        .sort(["permno", "secinfostartdt", "secinfoenddt"])
-    )
-    collect_and_write(permno0, paths.interim_dir / "raw_data_dfs" / "permno0.parquet")
+        collect_and_write(permno0, paths.interim_dir / "raw_data_dfs" / "permno0.parquet")
     comp_hgics_na = comp_hgics_aux(paths.raw_tables_dir / "comp_co_hgic.parquet")
     collect_and_write(comp_hgics_na, paths.interim_dir / "raw_data_dfs" / "comp_hgics_na.parquet")
     comp_hgics_gl = comp_hgics_aux(paths.raw_tables_dir / "comp_g_co_hgic.parquet")
     collect_and_write(comp_hgics_gl, paths.interim_dir / "raw_data_dfs" / "comp_hgics_gl.parquet")
-    crsp_dsedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
-        [
-            "delret",
-            "delactiontype",
-            "delstatustype",
-            "delreasontype",
-            "delpaymenttype",
-            col("permno").cast(pl.Int64),
-            "delistingdt",
-        ]
-    )
-    collect_and_write(crsp_dsedelist, paths.interim_dir / "raw_data_dfs" / "crsp_dsedelist.parquet")
-    crsp_msedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
-        [
-            "delret",
-            "delactiontype",
-            "delstatustype",
-            "delreasontype",
-            "delpaymenttype",
-            col("permno").cast(pl.Int64),
-            "delistingdt",
-        ]
-    )
-    collect_and_write(crsp_msedelist, paths.interim_dir / "raw_data_dfs" / "crsp_msedelist.parquet")
+    if not bypass_crsp:
+        crsp_dsedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
+            [
+                "delret",
+                "delactiontype",
+                "delstatustype",
+                "delreasontype",
+                "delpaymenttype",
+                col("permno").cast(pl.Int64),
+                "delistingdt",
+            ]
+        )
+        collect_and_write(
+            crsp_dsedelist, paths.interim_dir / "raw_data_dfs" / "crsp_dsedelist.parquet"
+        )
+        crsp_msedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
+            [
+                "delret",
+                "delactiontype",
+                "delstatustype",
+                "delreasontype",
+                "delpaymenttype",
+                col("permno").cast(pl.Int64),
+                "delistingdt",
+            ]
+        )
+        collect_and_write(
+            crsp_msedelist, paths.interim_dir / "raw_data_dfs" / "crsp_msedelist.parquet"
+        )
     __sec_info = pl.concat(
         [
             sec_info_aux(paths.raw_tables_dir / "comp_security.parquet"),
@@ -477,13 +538,14 @@ def gen_raw_data_dfs(paths: DataPaths):
         ]
     )
     collect_and_write(__sec_info, paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
-    build_mcti(paths)
-    crsp_mcti_t30ret = pl.scan_parquet(
-        paths.interim_dir / "raw_data_dfs" / "crsp_mcti.parquet"
-    ).select(["caldt", "t30ret"])
-    collect_and_write(
-        crsp_mcti_t30ret, paths.interim_dir / "raw_data_dfs" / "crsp_mcti_t30ret.parquet"
-    )
+    if not bypass_crsp:
+        build_mcti(paths)
+        crsp_mcti_t30ret = pl.scan_parquet(
+            paths.interim_dir / "raw_data_dfs" / "crsp_mcti.parquet"
+        ).select(["caldt", "t30ret"])
+        collect_and_write(
+            crsp_mcti_t30ret, paths.interim_dir / "raw_data_dfs" / "crsp_mcti_t30ret.parquet"
+        )
     ff_factors_monthly = pl.scan_parquet(
         paths.raw_tables_dir / "ff_factors_monthly.parquet"
     ).select(["date", "rf"])
@@ -510,9 +572,14 @@ def gen_raw_data_dfs(paths: DataPaths):
     )
     gen_prihist_files(paths)
     gen_fx1(paths)
-    aug_msf_v2(paths)
-    gen_crsp_sf(paths, "m").to_parquet(paths.interim_dir / "raw_data_dfs" / "__crsp_sf_m.parquet")
-    gen_crsp_sf(paths, "d").to_parquet(paths.interim_dir / "raw_data_dfs" / "__crsp_sf_d.parquet")
+    if not bypass_crsp:
+        aug_msf_v2(paths)
+        gen_crsp_sf(paths, "m").to_parquet(
+            paths.interim_dir / "raw_data_dfs" / "__crsp_sf_m.parquet"
+        )
+        gen_crsp_sf(paths, "d").to_parquet(
+            paths.interim_dir / "raw_data_dfs" / "__crsp_sf_d.parquet"
+        )
 
 
 def gen_crsp_sf(paths: DataPaths, freq):
@@ -679,7 +746,7 @@ def gen_wrds_connection_info(user, password):
 def get_columns(conn, conninfo, lib, table):
     cols = conn.execute(f"""
         SELECT *
-        FROM postgres_scan('{conninfo}', '{lib}', '{table}')
+        FROM postgres_scan({_sql_literal(conninfo)}, '{lib}', '{table}')
         LIMIT 0
     """).description
     return [c[0] for c in cols]
@@ -702,15 +769,20 @@ def download_wrds_table_attached(
     filename,
     date_column: str | None = None,
     end_date: date | None = None,
+    start_date: date | None = None,
+    country_filter: tuple[str, ...] | None = None,
 ):
     """Download a WRDS table using an attached persistent connection."""
     lib, table = table_name.split(".")
     cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
     projection = build_projection(cols)
 
-    where_clause = ""
-    if date_column and end_date:
-        where_clause = f"WHERE {date_column} <= '{end_date}'"
+    def table_ref(name: str) -> str:
+        ref_lib, ref_table = name.split(".")
+        return f"{db_alias}.{ref_lib}.{ref_table}"
+
+    country_condition = _country_filter_condition(table_name, country_filter, table_ref)
+    where_clause = _where_clause(date_column, start_date, end_date, country_condition)
 
     duckdb_conn.execute(f"""
         COPY (
@@ -720,6 +792,117 @@ def download_wrds_table_attached(
         )
         TO '{filename}' (FORMAT PARQUET);
     """)
+
+
+def _date_where_clause(
+    date_column: str | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> str:
+    """Build a WHERE clause filtering ``date_column`` to [start_date, end_date].
+
+    Either bound may be None. Returns an empty string when there is no date
+    column or no bounds to apply.
+    """
+    return _where_clause(date_column, start_date, end_date)
+
+
+def _where_clause(
+    date_column: str | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    extra_condition: str | None = None,
+) -> str:
+    """Build a WHERE clause from optional date bounds and an extra predicate."""
+    if not date_column:
+        conditions = []
+    else:
+        conditions = []
+        if start_date:
+            conditions.append(f"{date_column} >= '{start_date}'")
+        if end_date:
+            conditions.append(f"{date_column} <= '{end_date}'")
+    if extra_condition:
+        conditions.append(extra_condition)
+    if not conditions:
+        return ""
+    return "WHERE " + " AND ".join(conditions)
+
+
+def _country_sql_list(country_filter: tuple[str, ...]) -> str:
+    """Return a quoted SQL IN-list for validated ISO-3 country codes."""
+    return ", ".join(f"'{country}'" for country in country_filter)
+
+
+def _sql_literal(value: str) -> str:
+    """Quote a value as a single-quoted SQL literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _pg_ident(value: str) -> str:
+    """Quote a PostgreSQL identifier."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _country_filter_condition(
+    table_name: str,
+    country_filter: tuple[str, ...] | None,
+    table_ref,
+) -> str | None:
+    """Return a table-specific Compustat country predicate for WRDS download SQL."""
+    if not country_filter:
+        return None
+
+    countries = _country_sql_list(country_filter)
+    national_security = table_ref("comp.security")
+    global_security = table_ref("comp.g_security")
+
+    direct_country_tables = {
+        "comp.security",
+        "comp.g_security",
+    }
+    national_gvkey_tables = {
+        "comp.secd",
+        "comp.secm",
+        "comp.sec_history",
+        "comp.company",
+        "comp.funda",
+        "comp.fundq",
+        "comp.co_hgic",
+    }
+    global_gvkey_tables = {
+        "comp.g_secd",
+        "comp.g_sec_history",
+        "comp.g_company",
+        "comp.g_funda",
+        "comp.g_fundq",
+        "comp.g_co_hgic",
+    }
+
+    if table_name in direct_country_tables:
+        return f"excntry IN ({countries})"
+    if table_name in national_gvkey_tables:
+        return (
+            "gvkey IN ("
+            f"SELECT DISTINCT gvkey FROM {national_security} WHERE excntry IN ({countries})"
+            ")"
+        )
+    if table_name in global_gvkey_tables:
+        return (
+            "gvkey IN ("
+            f"SELECT DISTINCT gvkey FROM {global_security} WHERE excntry IN ({countries})"
+            ")"
+        )
+
+    return None
+
+
+def _remote_country_filter_condition(
+    table_name: str,
+    country_filter: tuple[str, ...] | None,
+) -> str | None:
+    """Return a WRDS PostgreSQL-side country predicate for postgres_query."""
+    return _country_filter_condition(table_name, country_filter, lambda name: name)
 
 
 def build_projection(cols):
@@ -739,6 +922,23 @@ def build_projection(cols):
         return "*"
 
 
+def build_postgres_projection(cols):
+    """Build a PostgreSQL-compatible projection matching build_projection casts."""
+    integer_cast_cols = {"permno", "permco", "sic", "sich"}
+    projection = []
+    for col_name in cols:
+        ident = _pg_ident(col_name)
+        if col_name in integer_cast_cols:
+            projection.append(
+                "CASE WHEN "
+                f"{ident}::text ~ '^-?[0-9]+$' THEN {ident}::bigint ELSE NULL END "
+                f"AS {ident}"
+            )
+        else:
+            projection.append(ident)
+    return ", ".join(projection)
+
+
 def download_wrds_table(
     conninfo: str,
     duckdb_conn: duckdb.DuckDBPyConnection,
@@ -746,48 +946,195 @@ def download_wrds_table(
     filename: str,
     date_column: str | None = None,
     end_date: date | None = None,
+    start_date: date | None = None,
+    country_filter: tuple[str, ...] | None = None,
 ) -> None:
     lib, table = table_name.split(".")
     cols = get_columns(duckdb_conn, conninfo, lib, table)
     projection = build_projection(cols)
 
-    where_clause = ""
-    if date_column and end_date:
-        where_clause = f"WHERE {date_column} <= '{end_date}'"
+    def table_ref(name: str) -> str:
+        ref_lib, ref_table = name.split(".")
+        return f"postgres_scan({_sql_literal(conninfo)}, '{ref_lib}', '{ref_table}')"
+
+    country_condition = _country_filter_condition(table_name, country_filter, table_ref)
+    where_clause = _where_clause(date_column, start_date, end_date, country_condition)
+    remote_country_condition = _remote_country_filter_condition(table_name, country_filter)
+    if remote_country_condition:
+        remote_alias = f"wrds_query_{lib}_{table}"
+        remote_where_clause = _where_clause(
+            date_column,
+            start_date,
+            end_date,
+            remote_country_condition,
+        )
+        remote_sql = (
+            f"SELECT {build_postgres_projection(cols)} "
+            f"FROM {lib}.{table} "
+            f"{remote_where_clause}"
+        )
+        duckdb_conn.execute(
+            f"ATTACH {_sql_literal(conninfo)} AS {remote_alias} (TYPE postgres, READ_ONLY)"
+        )
+        try:
+            duckdb_conn.execute(f"""
+                COPY (
+                  SELECT *
+                  FROM postgres_query({_sql_literal(remote_alias)}, {_sql_literal(remote_sql)})
+                )
+                TO {_sql_literal(filename)} (FORMAT PARQUET);
+            """)
+        finally:
+            duckdb_conn.execute(f"DETACH {remote_alias}")
+        return
 
     duckdb_conn.execute(f"""
         COPY (
           SELECT {projection}
-          FROM postgres_scan('{conninfo}', '{lib}', '{table}')
+          FROM postgres_scan({_sql_literal(conninfo)}, '{lib}', '{table}')
           {where_clause}
         )
         TO '{filename}' (FORMAT PARQUET);
     """)
 
 
+def build_compustat_age_anchor_query(raw_schema: str) -> str:
+    """Build the full-history, index-driven Compustat age-anchor query.
+
+    The daily price table is hundreds of millions of rows, so this deliberately
+    starts from the small security header and performs ``ORDER BY datadate
+    LIMIT 1`` probes on each source's natural-key index.  It reproduces the
+    years used by ``firm_age`` without scanning or downloading full history.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_schema):
+        raise ValueError(f"Invalid raw PostgreSQL schema: {raw_schema!r}")
+    schema = _pg_ident(raw_schema)
+
+    def first_date(table: str) -> str:
+        return (
+            f"(SELECT x.datadate FROM {schema}.{_pg_ident(table)} x "
+            "WHERE x.gvkey=s.gvkey AND x.iid=s.iid "
+            "ORDER BY x.datadate LIMIT 1)"
+        )
+
+    global_first = ",\n             ".join(
+        first_date(table) for table in ("sec_dprc", "sec_divid", "sec_dtrt", "sec_split")
+    )
+    national_first = ",\n             ".join(
+        first_date(table) for table in ("sec_mth", "sec_mthprc", "sec_mthtrt")
+    )
+    return f"""
+WITH security_pairs AS MATERIALIZED (
+  SELECT s.gvkey,
+         CASE WHEN s.iid LIKE '%W' THEN
+           LEAST(
+             {global_first}
+           )
+         ELSE
+           LEAST(
+             {national_first}
+           )
+         END AS first_date
+  FROM {schema}.{_pg_ident("security")} s
+  LEFT JOIN {schema}.{_pg_ident("company")} c ON c.gvkey=s.gvkey
+  WHERE s.iid NOT LIKE '%W'
+     OR (s.iid LIKE '%W'
+         AND c.fic IS DISTINCT FROM 'USA'
+         AND c.fic IS DISTINCT FROM 'CAN')
+), ret AS (
+  SELECT gvkey, MIN(first_date)::date AS comp_ret_first
+  FROM security_pairs
+  WHERE first_date IS NOT NULL
+  GROUP BY gvkey
+), acc AS (
+  SELECT gvkey, MIN(datadate)::date AS comp_acc_first
+  FROM {schema}.{_pg_ident("co_adesind")}
+  WHERE popsrc IN ('D', 'I')
+  GROUP BY gvkey
+)
+SELECT COALESCE(ret.gvkey, acc.gvkey)::varchar AS gvkey,
+       ret.comp_ret_first,
+       acc.comp_acc_first
+FROM ret
+FULL JOIN acc USING (gvkey)
+ORDER BY gvkey
+""".strip()
+
+
+def download_postgres_query_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    remote_sql: str,
+    filename: str,
+) -> None:
+    """Execute a PostgreSQL-side query and copy its small result to Parquet."""
+    duckdb_conn.execute(f"""
+        COPY (
+          SELECT *
+          FROM postgres_query({_sql_literal(db_alias)}, {_sql_literal(remote_sql)})
+        )
+        TO {_sql_literal(filename)} (FORMAT PARQUET);
+    """)
+
+
+def download_compustat_age_anchor_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    filename: str,
+    raw_schema: str,
+) -> None:
+    """Download the small full-history company age anchor."""
+    download_postgres_query_attached(
+        duckdb_conn,
+        db_alias,
+        build_compustat_age_anchor_query(raw_schema),
+        filename,
+    )
+
+
+def _raise_redacted_source_error(source_label: str, action: str, exc: Exception) -> None:
+    """Raise a useful source error without echoing a connection string."""
+    raise RuntimeError(
+        f"{source_label} {action} failed ({exc.__class__.__name__}). "
+        "Connection details were redacted; check the source configuration and database logs."
+    ) from None
+
+
 @measure_time
 def download_raw_data_tables(
     paths: DataPaths,
-    username: str,
-    password: str,
+    username: str | None = None,
+    password: str | None = None,
     end_date: date | None = None,
     persistent_connection: bool = False,
+    bypass_crsp: bool = False,
+    start_date: date | None = None,
+    countries: list[str] | tuple[str, ...] | None = None,
+    connection_info: str | None = None,
+    source_label: str = "WRDS",
+    raw_schema: str = "comp",
 ) -> None:
     """
     Description:
-        Bulk-download core WRDS tables to raw_tables and a few curated variants with column subsets.
+        Bulk-download WRDS-shaped source tables to raw_tables.
 
     Steps:
-        1) Connect to WRDS; iterate through a fixed list of library.tables.
+        1) Connect to the selected PostgreSQL source; iterate through a fixed
+           list of library.tables.
         2) For each table: download to raw_tables/lib_table.parquet, applying date filtering
-           when end_date is provided and the table has a known date column.
+           to [start_date, end_date] (either bound optional) when the table has a known
+           date column.
         3) If persistent_connection: ATTACH a single postgres connection and download all tables.
            Otherwise: use postgres_scan() which creates a new connection per query.
         4) Disconnect.
 
     Args:
-        username: WRDS username
-        password: WRDS password
+        username: WRDS username when ``connection_info`` is not supplied.
+        password: WRDS password when ``connection_info`` is not supplied.
+        connection_info: Optional complete PostgreSQL connection URL/DSN, used
+            for XpressFeed RDS. It is never printed.
+        raw_schema: Schema containing native XpressFeed tables (``public`` on
+            RDS and ``comp`` on WRDS).
         persistent_connection: If True, use a single persistent connection via ATTACH.
             This reduces MFA prompts on systems with NAT IP rotation (e.g., Yale Bouchet).
             If False (default), use postgres_scan() which creates a new connection per query.
@@ -824,6 +1171,14 @@ def download_raw_data_tables(
         "comp.g_secd",
     ]
 
+    country_filter = normalize_country_filter(countries)
+
+    # In CRSP-bypass mode, or when a country filter excludes USA, no CRSP source
+    # tables are needed. CRSP is a US database; non-US selected countries are
+    # represented by Compustat only.
+    if bypass_crsp or (country_filter is not None and "USA" not in country_filter):
+        table_names = [t for t in table_names if not t.startswith("crsp.")]
+
     # Tables with a known date column are filtered to end_date during download.
     # Reference/metadata tables (not listed here) are downloaded in full.
     date_columns: dict[str, str] = {
@@ -838,7 +1193,12 @@ def download_raw_data_tables(
         "comp.g_fundq": "datadate",
     }
 
-    wrds_session_data = gen_wrds_connection_info(username, password)
+    if connection_info is None:
+        if not username or not password:
+            raise ValueError("WRDS username and password are required when connection_info is absent")
+        source_connection_info = gen_wrds_connection_info(username, password)
+    else:
+        source_connection_info = connection_info
     con = duckdb.connect(":memory:")
     con.execute("INSTALL postgres; LOAD postgres;")
 
@@ -848,37 +1208,110 @@ def download_raw_data_tables(
         # in error messages. If the connection fails, suppress the original exception to
         # avoid leaking credentials in logs/tracebacks, and raise a generic error instead.
         try:
-            con.execute(f"ATTACH '{wrds_session_data}' AS wrds (TYPE postgres, READ_ONLY)")
+            con.execute(
+                f"ATTACH {_sql_literal(source_connection_info)} "
+                "AS source_db (TYPE postgres, READ_ONLY)"
+            )
         except Exception as e:
-            if password in str(e):
-                raise RuntimeError(
-                    "Failed to attach persistent WRDS connection. "
-                    "Check credentials and MFA approval."
-                ) from None
-            raise
+            _raise_redacted_source_error(source_label, "connection", e)
         try:
             for table in table_names:
-                download_wrds_table_attached(
+                filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
+                print(f"Downloading {source_label} table {table}...", flush=True)
+                try:
+                    if _remote_country_filter_condition(table, country_filter):
+                        download_wrds_table(
+                            source_connection_info,
+                            con,
+                            table,
+                            filename,
+                            date_column=date_columns.get(table),
+                            end_date=end_date,
+                            start_date=start_date,
+                            country_filter=country_filter,
+                        )
+                    else:
+                        download_wrds_table_attached(
+                            con,
+                            "source_db",
+                            table,
+                            filename,
+                            date_column=date_columns.get(table),
+                            end_date=end_date,
+                            start_date=start_date,
+                            country_filter=country_filter,
+                        )
+                except Exception as e:
+                    if e.__class__.__name__ != "OutOfMemoryException":
+                        _raise_redacted_source_error(source_label, f"download of {table}", e)
+                    Path(filename).unlink(missing_ok=True)
+                    print(
+                        f"Attached {source_label} download ran out of memory on {table}; "
+                        "retrying with postgres_scan."
+                    )
+                    try:
+                        download_wrds_table(
+                            source_connection_info,
+                            con,
+                            table,
+                            filename,
+                            date_column=date_columns.get(table),
+                            end_date=end_date,
+                            start_date=start_date,
+                            country_filter=country_filter,
+                        )
+                    except Exception as retry_error:
+                        _raise_redacted_source_error(
+                            source_label, f"fallback download of {table}", retry_error
+                        )
+            print(f"Downloading {source_label} full-history age anchor...", flush=True)
+            try:
+                download_compustat_age_anchor_attached(
                     con,
-                    "wrds",
+                    "source_db",
+                    str(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+                    raw_schema,
+                )
+            except Exception as e:
+                _raise_redacted_source_error(source_label, "age-anchor download", e)
+        finally:
+            con.execute("DETACH source_db")
+    else:
+        # Use postgres_scan() which creates a new connection per query (default)
+        for table in table_names:
+            print(f"Downloading {source_label} table {table}...", flush=True)
+            try:
+                download_wrds_table(
+                    source_connection_info,
+                    con,
                     table,
                     str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet")),
                     date_column=date_columns.get(table),
                     end_date=end_date,
+                    start_date=start_date,
+                    country_filter=country_filter,
                 )
-        finally:
-            con.execute("DETACH wrds")
-    else:
-        # Use postgres_scan() which creates a new connection per query (default)
-        for table in table_names:
-            download_wrds_table(
-                wrds_session_data,
-                con,
-                table,
-                str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet")),
-                date_column=date_columns.get(table),
-                end_date=end_date,
+            except Exception as e:
+                _raise_redacted_source_error(source_label, f"download of {table}", e)
+
+        print(f"Downloading {source_label} full-history age anchor...", flush=True)
+        anchor_alias = "age_anchor_source"
+        try:
+            con.execute(
+                f"ATTACH {_sql_literal(source_connection_info)} AS {anchor_alias} "
+                "(TYPE postgres, READ_ONLY)"
             )
+            download_compustat_age_anchor_attached(
+                con,
+                anchor_alias,
+                str(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+                raw_schema,
+            )
+        except Exception as e:
+            _raise_redacted_source_error(source_label, "age-anchor download", e)
+        finally:
+            with contextlib.suppress(Exception):
+                con.execute(f"DETACH {anchor_alias}")
 
     con.close()
 
@@ -977,7 +1410,7 @@ def build_mcti(paths: DataPaths):
 
 
 @measure_time
-def prepare_comp_sf(paths: DataPaths, freq):
+def prepare_comp_sf(paths: DataPaths, freq, bypass_crsp: bool = False):
     """
     Description:
         Prepare Compustat security-file derivatives (Comp DSF/SSF equivalents) for daily/monthly runs.
@@ -985,6 +1418,9 @@ def prepare_comp_sf(paths: DataPaths, freq):
     Steps:
         1) Ensure firm-shares table is populated (populate_own), then create Comp DSF (gen_comp_dsf).
         2) Run process_comp_sf1 for requested frequency: 'd', 'm', or 'both'.
+
+    When ``bypass_crsp`` is True, excess returns use the FF risk-free rate (with a
+    last-month fallback) instead of the CRSP 30y T-bill. See config.BYPASS_CRSP.
 
     Output:
         Intermediate Comp security files written by downstream helpers (no direct return).
@@ -998,10 +1434,10 @@ def prepare_comp_sf(paths: DataPaths, freq):
     )
     gen_comp_dsf(paths)
     if freq == "both":
-        process_comp_sf1(paths, "d")
-        process_comp_sf1(paths, "m")
+        process_comp_sf1(paths, "d", bypass_crsp=bypass_crsp)
+        process_comp_sf1(paths, "m", bypass_crsp=bypass_crsp)
     else:
-        process_comp_sf1(paths, freq)
+        process_comp_sf1(paths, freq, bypass_crsp=bypass_crsp)
 
 
 def populate_own(paths: DataPaths, inset_path, idvar, datevar, datename):
@@ -1155,6 +1591,7 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN prcstd != 5 THEN prcld / qunit
             ELSE NULL
         END AS prc_low_lcl,
+        prcod AS prc_open_lcl,
         cshtrd, (prccd / qunit) / ajexdi * trfd AS ri_local,
         curcddv, div, divd, divsp
     FROM comp_g_secd;
@@ -1170,6 +1607,7 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN a.prcstd != 5 THEN a.prcld
             ELSE NULL
         END AS prc_low_lcl,
+        a.prcod AS prc_open_lcl,
         a.cshtrd, COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
         (a.prccd / a.ajexdi * a.trfd) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
@@ -1190,7 +1628,7 @@ def gen_comp_dsf(paths: DataPaths):
     SELECT *
     FROM __comp_dsf_na
     FULL OUTER JOIN __comp_dsf_global
-    USING (gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prc_local, ajexdi, prc_high_lcl, prc_low_lcl, cshtrd, cshoc, ri_local, curcddv, div, divd, divsp);
+    USING (gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prc_local, ajexdi, prc_high_lcl, prc_low_lcl, prc_open_lcl, cshtrd, cshoc, ri_local, curcddv, div, divd, divsp);
 
     CREATE TABLE __comp_dsf2 AS
     SELECT a.*, b.fx AS fx, c.fx AS fx_div
@@ -1528,12 +1966,19 @@ def comp_exchanges(paths: DataPaths):
         WHERE excntry IS NOT NULL AND exchg IS NOT NULL
         GROUP BY exchg
         """
+    # US exchange codes 15, 16, 17, 18, 21 are in `special_exchanges` (normally
+    # excluded), but they are legitimate US exchanges, so for excntry == 'USA'
+    # they are treated as a main exchange. Mirrors the SAS manual change
+    # (project_macros.sas, 30-12-2025).
+    us_override_exchanges = [15, 16, 17, 18, 21]
     exch_exp = (
-        pl.when(
-            (col("excntry") != "multi national") & (col("exchg").is_in(special_exchanges).not_())
-        )
+        pl.when(col("excntry") == "multi national")
+        .then(pl.lit(0))
+        .when((col("excntry") == "USA") & col("exchg").is_in(us_override_exchanges))
         .then(pl.lit(1))
-        .otherwise(pl.lit(0))
+        .when(col("exchg").is_in(special_exchanges))
+        .then(pl.lit(0))
+        .otherwise(pl.lit(1))
         .alias("exch_main")
     )
     comp_r_ex_codes = pl.read_parquet(
@@ -1808,7 +2253,9 @@ def gen_temporary_sf(paths: DataPaths, freq, __returns, __delist):
     return temp_sf
 
 
-def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
+def add_rf_and_exchange_data_to_temporary_sf(
+    paths: DataPaths, freq, temp_sf, bypass_crsp: bool = False
+):
     """
     Description:
         Append T-bill / RF and exchange metadata to the temp security file; compute excess returns.
@@ -1818,11 +2265,41 @@ def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
         2) Compute ret_exc = ret − (t30ret or rf)/scale, with scale=1 (m) or 21 (d).
         3) Cast exchg to int64 and join exchange-country mapping.
 
+    When ``bypass_crsp`` is True the CRSP 30y T-bill (t30ret) is unavailable, so
+    excess returns use the FF risk-free rate with a last-available-month fallback
+    for recent dates not yet published by FF:
+    ``ret_exc = ret − coalesce(rf, last_rf)/scale``. This mirrors the SAS
+    ``bypass_crsp`` path (``coalesce(c.rf, &lffm.)``). See config.BYPASS_CRSP.
+
     Output:
         Polars LazyFrame temp_sf with ret_exc and exchange info attached.
     """
-    crsp_mcti, ff_factors_monthly, __exchanges = load_rf_and_exchange_data(paths)
     scale = 1 if (freq == "m") else 21
+
+    if bypass_crsp:
+        ff_factors_monthly = add_MMYY_column_drop_original(
+            pl.scan_parquet(paths.interim_dir / "raw_data_dfs" / "ff_factors_monthly.parquet"),
+            "date",
+        ).collect()
+        # Last available FF risk-free rate (highest month index), used as a
+        # fallback for recent dates FF has not yet published.
+        last_rf = (
+            ff_factors_monthly.sort("merge_aux").select(pl.col("rf").last()).item()
+            if ff_factors_monthly.height > 0
+            else None
+        )
+        __exchanges = comp_exchanges(paths)
+        temp_sf = (
+            temp_sf.with_columns(merge_aux=gen_MMYY_column("datadate"))
+            .join(ff_factors_monthly, how="left", on="merge_aux")
+            .with_columns(ret_exc=col("ret") - pl.coalesce(["rf", pl.lit(last_rf)]) / scale)
+            .drop(["merge_aux", "rf"])
+            .with_columns(col("exchg").cast(pl.Int64))
+            .join(__exchanges, how="left", on=["exchg"])
+        )
+        return temp_sf
+
+    crsp_mcti, ff_factors_monthly, __exchanges = load_rf_and_exchange_data(paths)
     temp_sf = (
         temp_sf.with_columns(merge_aux=gen_MMYY_column("datadate"))
         .join(crsp_mcti, how="left", on="merge_aux")
@@ -1835,7 +2312,7 @@ def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
     return temp_sf
 
 
-def process_comp_sf1(paths: DataPaths, freq):
+def process_comp_sf1(paths: DataPaths, freq, bypass_crsp: bool = False):
     """
     Description:
         Full pipeline to build Compustat monthly or daily security files with returns,
@@ -1847,6 +2324,9 @@ def process_comp_sf1(paths: DataPaths, freq):
         3) Add RF/exchange metadata; write __comp_sf2.parquet.
         4) Call add_primary_sec(...) to add primary_sec and write final comp_{freq}sf.parquet.
 
+    When ``bypass_crsp`` is True, excess returns use the FF risk-free rate (with a
+    last-month fallback) instead of the CRSP 30y T-bill. See config.BYPASS_CRSP.
+
     Output:
         comp_msf.parquet or comp_dsf.parquet with enriched fields (ret_exc, primary_sec, etc.).
     """
@@ -1856,7 +2336,9 @@ def process_comp_sf1(paths: DataPaths, freq):
     __returns = gen_returns_df(paths, freq)
     __delist = gen_delist_df(paths, __returns)
     __comp_sf2 = gen_temporary_sf(paths, freq, __returns, __delist)
-    __comp_sf2 = add_rf_and_exchange_data_to_temporary_sf(paths, freq, __comp_sf2)
+    __comp_sf2 = add_rf_and_exchange_data_to_temporary_sf(
+        paths, freq, __comp_sf2, bypass_crsp=bypass_crsp
+    )
     __comp_sf2.write_parquet(paths.interim_dir / "__comp_sf2.parquet")
     del __comp_sf2
     add_primary_sec(
@@ -2061,7 +2543,7 @@ def prepare_crsp_sf(paths: DataPaths, freq):
 
 
 @measure_time
-def combine_crsp_comp_sf(paths: DataPaths) -> None:
+def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
     """
     Description:
         Create unified monthly and daily security datasets by combining CRSP and Compustat,
@@ -2075,6 +2557,11 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
            on tie via ROW_NUMBER).
         5) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
         6) Clean up DuckDB file.
+
+    When ``bypass_crsp`` is True, the CRSP normalization CTEs and the UNION ALL are
+    dropped so the world files are built from Compustat only (every row has
+    source_crsp=0); the CRSP monthly/daily parquet inputs are not read. This
+    mirrors the SAS ``bypass_crsp`` path. See config.BYPASS_CRSP.
 
     Note on the dedup tie-break (ORDER BY source_crsp DESC, primary_sec DESC):
         CRSP rows use raw permno as id (5-digit ints), while Compustat rows construct
@@ -2103,11 +2590,14 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
     comp_dsf_path = (paths.interim_dir / "comp_dsf.parquet").as_posix()
     msf_world_out = (paths.interim_dir / "__msf_world.parquet").as_posix()
     world_dsf_out = (paths.interim_dir / "world_dsf.parquet").as_posix()
-    try:
-        # Monthly: normalize CRSP/Comp, UNION ALL, compute ret_exc_lead1m
-        con.execute(f"""
-            CREATE TABLE sf_world_m AS
-            WITH crsp_msf_norm AS (
+
+    # In CRSP-bypass mode the CRSP normalization CTEs are omitted and the world
+    # files are sourced from the Compustat CTE only (no UNION ALL). The CRSP
+    # parquet inputs are never read. See config.BYPASS_CRSP.
+    crsp_msf_norm_cte = (
+        ""
+        if bypass_crsp
+        else f"""crsp_msf_norm AS (
                 SELECT
                     permno AS id, permno, permco, gvkey, iid,
                     'USA' AS excntry,
@@ -2139,7 +2629,56 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                     1 AS source_crsp
                 FROM read_parquet('{crsp_msf_path}')
             ),
-            comp_msf_norm AS (
+            """
+    )
+    monthly_union = (
+        "SELECT * FROM comp_msf_norm"
+        if bypass_crsp
+        else """SELECT * FROM crsp_msf_norm
+                UNION ALL
+                SELECT * FROM comp_msf_norm"""
+    )
+    crsp_dsf_norm_cte = (
+        ""
+        if bypass_crsp
+        else f"""crsp_dsf_norm AS (
+                    SELECT
+                        permno AS id,
+                        'USA' AS excntry,
+                        exch_main::INT AS exch_main,
+                        CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
+                        1 AS primary_sec,
+                        bidask::INT AS bidask,
+                        'USD' AS curcd,
+                        1.0 AS fx,
+                        date,
+                        last_day(date) AS eom,
+                        cfacshr AS adjfct,
+                        shrout AS shares,
+                        me, dolvol,
+                        vol AS tvol,
+                        prc, prc_high, prc_low,
+                        NULL::DOUBLE AS prc_open_lcl,
+                        ret AS ret_local,
+                        ret, ret_exc,
+                        1::BIGINT AS ret_lag_dif,
+                        1 AS source_crsp
+                    FROM read_parquet('{crsp_dsf_path}')
+                ),
+                """
+    )
+    daily_union = (
+        "SELECT * FROM comp_dsf_norm"
+        if bypass_crsp
+        else """SELECT * FROM crsp_dsf_norm
+                    UNION ALL
+                    SELECT * FROM comp_dsf_norm"""
+    )
+    try:
+        # Monthly: normalize CRSP/Comp, UNION ALL, compute ret_exc_lead1m
+        con.execute(f"""
+            CREATE TABLE sf_world_m AS
+            WITH {crsp_msf_norm_cte}comp_msf_norm AS (
                 SELECT
                     CAST(
                         CASE
@@ -2182,9 +2721,7 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                     ELSE LEAD(ret_exc, 1) OVER (PARTITION BY id ORDER BY eom)
                 END AS ret_exc_lead1m
             FROM (
-                SELECT * FROM crsp_msf_norm
-                UNION ALL
-                SELECT * FROM comp_msf_norm
+                {monthly_union}
             ) unioned
         """)
 
@@ -2242,30 +2779,7 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
         # Daily: normalize CRSP/Comp, UNION ALL, join obs_main, dedup, write
         con.execute(f"""
             COPY (
-                WITH crsp_dsf_norm AS (
-                    SELECT
-                        permno AS id,
-                        'USA' AS excntry,
-                        exch_main::INT AS exch_main,
-                        CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
-                        1 AS primary_sec,
-                        bidask::INT AS bidask,
-                        'USD' AS curcd,
-                        1.0 AS fx,
-                        date,
-                        last_day(date) AS eom,
-                        cfacshr AS adjfct,
-                        shrout AS shares,
-                        me, dolvol,
-                        vol AS tvol,
-                        prc, prc_high, prc_low,
-                        ret AS ret_local,
-                        ret, ret_exc,
-                        1::BIGINT AS ret_lag_dif,
-                        1 AS source_crsp
-                    FROM read_parquet('{crsp_dsf_path}')
-                ),
-                comp_dsf_norm AS (
+                WITH {crsp_dsf_norm_cte}comp_dsf_norm AS (
                     SELECT
                         CAST(
                             CASE
@@ -2287,16 +2801,14 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                         cshoc AS shares,
                         me, dolvol,
                         cshtrd AS tvol,
-                        prc, prc_high, prc_low,
+                        prc, prc_high, prc_low, prc_open_lcl,
                         ret_local, ret, ret_exc,
                         ret_lag_dif::BIGINT AS ret_lag_dif,
                         0 AS source_crsp
                     FROM read_parquet('{comp_dsf_path}')
                 ),
                 sf_world_d AS (
-                    SELECT * FROM crsp_dsf_norm
-                    UNION ALL
-                    SELECT * FROM comp_dsf_norm
+                    {daily_union}
                 ),
                 ranked AS (
                     -- See dedup tie-break note in monthly block above.
@@ -2311,7 +2823,7 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                 SELECT
                     id, excntry, exch_main, common, primary_sec, bidask, curcd, fx,
                     date, eom, adjfct, shares, me, dolvol, tvol, prc, prc_high, prc_low,
-                    ret_local, ret, ret_exc, ret_lag_dif, source_crsp, obs_main
+                    prc_open_lcl, ret_local, ret, ret_exc, ret_lag_dif, source_crsp, obs_main
                 FROM ranked
                 WHERE _rn = 1
                 ORDER BY id, date
@@ -2350,7 +2862,7 @@ def crsp_industry(paths: DataPaths):
     permno0.collect().write_parquet(paths.interim_dir / "crsp_ind.parquet")
 
 
-def comp_hgics(paths: DataPaths, lib):
+def comp_hgics(paths: DataPaths, lib, end_date: date = END_DATE):
     """
     Description:
         Expand Compustat GICS history (national/global) to a daily panel with forward-filled
@@ -2358,7 +2870,8 @@ def comp_hgics(paths: DataPaths, lib):
 
     Steps:
         1) Load raw file (national/global); replace null gics with -999 sentinel.
-        2) Compute row counts and terminal rows; set open-ended indthru to (max(indfrom) or END_DATE).
+        2) Compute row counts and terminal rows; set open-ended indthru to
+           (max(indfrom) or the runtime end date).
         3) Create date ranges [indfrom, indthru]; explode; unique per (gvkey,date).
         4) Write to na_hgics.parquet or g_hgics.parquet.
 
@@ -2377,6 +2890,12 @@ def comp_hgics(paths: DataPaths, lib):
         },
     }
     data = pl.read_parquet(file_paths["raw data"][lib])  # .sort(['gvkey', 'indfrom'])
+    if data.is_empty():
+        pl.DataFrame(schema={"gvkey": pl.String, "date": pl.Date, "gics": pl.Int64}).write_parquet(
+            file_paths["output"][lib]
+        )
+        return
+
     data = data.with_columns(
         gics=pl.when(col("gics").is_null()).then(-999).otherwise(col("gics")),
         n=pl.len().over("gvkey"),
@@ -2384,8 +2903,8 @@ def comp_hgics(paths: DataPaths, lib):
     )
     indthru_date = (
         pl.lit(data[["indfrom"]].max()[0, 0])
-        if data[["indfrom"]].max()[0, 0] > END_DATE
-        else pl.lit(END_DATE)
+        if data[["indfrom"]].max()[0, 0] > end_date
+        else pl.lit(end_date)
     )
     c1 = col("n") == col("n_aux")
     c2 = col("indthru").is_null()
@@ -2399,7 +2918,7 @@ def comp_hgics(paths: DataPaths, lib):
     data.write_parquet(file_paths["output"][lib])
 
 
-def hgics_join(paths: DataPaths):
+def hgics_join(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Merge national and global GICS daily panels, preferring local (national) where available.
@@ -2412,8 +2931,8 @@ def hgics_join(paths: DataPaths):
     Output:
         Parquet comp_hgics.parquet with consolidated GICS per (gvkey,date).
     """
-    comp_hgics(paths, "global")
-    comp_hgics(paths, "national")
+    comp_hgics(paths, "global", end_date=end_date)
+    comp_hgics(paths, "national", end_date=end_date)
     global_data = pl.scan_parquet(paths.interim_dir / "g_hgics.parquet")
     local_data = pl.scan_parquet(paths.interim_dir / "na_hgics.parquet")
     gjoin = local_data.join(global_data, on=["gvkey", "date"], how="full", coalesce=True)
@@ -2531,7 +3050,7 @@ def comp_sic_naics(paths: DataPaths):
 
 
 @measure_time
-def comp_industry(paths: DataPaths):
+def comp_industry(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Merge daily GICS and SIC/NAICS into a single daily Compustat industry file,
@@ -2547,7 +3066,7 @@ def comp_industry(paths: DataPaths):
         Parquet comp_ind.parquet with {gvkey,date,gics,sic,naics} daily.
     """
     comp_sic_naics(paths)
-    hgics_join(paths)
+    hgics_join(paths, end_date=end_date)
     (paths.interim_dir / "aux_comp_ind.ddb").unlink(missing_ok=True)
     con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_ind.ddb"), threads=os.cpu_count())
     con.create_table("comp_other", con.read_parquet(paths.interim_dir / "comp_other.parquet"))
@@ -2677,7 +3196,7 @@ def ff_ind_class(paths: DataPaths, data_path: str) -> None:
 
 
 @measure_time
-def nyse_size_cutoffs(paths: DataPaths, data_path):
+def nyse_size_cutoffs(paths: DataPaths, data_path, bypass_crsp: bool = False):
     """
     Description:
         Compute NYSE market equity cutoffs (1%,20%,50%,80%) by month.
@@ -2688,10 +3207,16 @@ def nyse_size_cutoffs(paths: DataPaths, data_path):
         3) Apply QUANTILE_DISC for cutoffs.
         4) Collect and save.
 
+    NYSE membership is identified via the CRSP exchange code (``crsp_exchcd = 1``).
+    When ``bypass_crsp`` is True there is no CRSP data, so NYSE is identified via
+    the Compustat exchange code (``comp_exchg = 11``), mirroring the SAS bypass
+    path. See config.BYPASS_CRSP.
+
     Output:
         'nyse_cutoffs.parquet' with [eom, n, nyse_p1, nyse_p20, nyse_p50, nyse_p80].
     """
-    nyse_sf = pl.scan_parquet(data_path).sql("""
+    nyse_filter = "comp_exchg = 11" if bypass_crsp else "crsp_exchcd = 1"
+    nyse_sf = pl.scan_parquet(data_path).sql(f"""
             SELECT
                 eom,
                 COUNT(*)                    AS n,
@@ -2700,7 +3225,7 @@ def nyse_size_cutoffs(paths: DataPaths, data_path):
                 QUANTILE_DISC(me, 0.50)     AS nyse_p50,
                 QUANTILE_DISC(me, 0.80)     AS nyse_p80
             FROM self
-            WHERE  crsp_exchcd = 1
+            WHERE  {nyse_filter}
                 AND obs_main   = 1
                 AND exch_main  = 1
                 AND primary_sec= 1
@@ -2891,7 +3416,13 @@ def add_ret_exc_wins(
         )
         .drop(drop_cols)
     )
-    result.collect(streaming=(freq == "d")).write_parquet(data_path)
+    tmp_path = data_path.with_name(f"{data_path.stem}_ret_exc_wins.parquet")
+    tmp_path.unlink(missing_ok=True)
+    output = result.collect(streaming=(freq == "d"))
+    del result, data, cutoffs
+    output.write_parquet(tmp_path)
+    del output
+    os.replace(tmp_path, data_path)
 
 
 def load_mkt_returns_params(freq):
@@ -6334,74 +6865,60 @@ def market_chars_monthly(paths: DataPaths, data_path, market_ret_path, local_cur
 
 
 @measure_time
-def firm_age(paths: DataPaths, data_path):
+def firm_age(paths: DataPaths, data_path, bypass_crsp: bool = False):
     """
     Description:
-        Compute firm age in months using earliest of CRSP, Compustat accounting, or Compustat returns dates.
+        Compute firm age in months using the full-history Compustat age anchor,
+        optional CRSP history, and the first row in the working stock panel.
 
     Steps:
-        1) Load identifiers/dates from inputs; get earliest dates per gvkey/permco.
-        2) Join earliest sources to each (id, eom); also get first observed eom per id.
-        3) Age = months between eom and min(first_obs, first_alt). Write result.
+        1) Load the compact, unfiltered Compustat age anchor produced during download.
+        2) When CRSP is enabled, get its earliest date per permco; bypass mode
+           never reads a CRSP file.
+        3) Join earliest sources to each (id, eom); also get first observed eom per id.
+        4) Age = months between eom and min(first_obs, first_alt). Write result.
 
     Output:
         'firm_age.parquet' with [id, eom, age].
     """
     con = ibis.duckdb.connect(threads=os.cpu_count())
     data = con.read_parquet(data_path).select(["gvkey", "permco", "id", "eom"])
-    comp_secm = con.read_parquet(paths.raw_tables_dir / "comp_secm.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_gsecm = (
-        con.read_parquet(paths.raw_tables_dir / "comp_g_secd.parquet")
-        .filter(_.monthend == 1)
-        .select(["gvkey", "datadate"])
-    )
-    comp_ret_age = (
-        comp_secm.union(comp_gsecm)
-        .group_by("gvkey")
-        .agg(comp_ret_first=_.datadate.min())
-        .mutate(
-            comp_ret_first=(
-                (_.comp_ret_first - ibis.interval(years=1)).year().cast("string") + "-12-31"
-            ).cast("date")
-        )
-    )
-    comp_funda = con.read_parquet(paths.raw_tables_dir / "comp_funda.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_gfunda = con.read_parquet(paths.raw_tables_dir / "comp_g_funda.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_acc_age = (
-        comp_funda.union(comp_gfunda)
-        .group_by("gvkey")
-        .agg(comp_acc_first=_.datadate.min())
-        .mutate(
-            comp_acc_first=(
-                (_.comp_acc_first - ibis.interval(years=1)).year().cast("string") + "-12-31"
-            ).cast("date")
-        )
-    )
-    crsp_age = (
-        con.read_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
-        .group_by("permco")
-        .agg(crsp_first=_.mthcaldt.min())
-    )
     con.create_table("data", data.to_polars())
-    con.create_table("comp_ret_age", comp_ret_age.to_polars())
-    con.create_table("comp_acc_age", comp_acc_age.to_polars())
-    con.create_table("crsp_age", crsp_age.to_polars())
+    con.create_table(
+        "comp_age_anchor",
+        con.read_parquet(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+    )
+    if bypass_crsp:
+        con.raw_sql("""
+            CREATE TABLE crsp_age (
+                permco BIGINT,
+                crsp_first DATE
+            );
+        """)
+    else:
+        crsp_age = (
+            con.read_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
+            .group_by("permco")
+            .agg(crsp_first=_.mthcaldt.min())
+        )
+        con.create_table("crsp_age", crsp_age.to_polars())
     sql_query = """
                     CREATE TABLE age1 AS
                     SELECT
                         a.id,
                         a.eom,
-                        LEAST(b.crsp_first, c.comp_acc_first, d.comp_ret_first) AS first_obs
+                        LEAST(
+                            b.crsp_first,
+                            CASE WHEN c.comp_acc_first IS NULL THEN NULL ELSE
+                              MAKE_DATE(YEAR(c.comp_acc_first) - 1, 12, 31)
+                            END,
+                            CASE WHEN c.comp_ret_first IS NULL THEN NULL ELSE
+                              MAKE_DATE(YEAR(c.comp_ret_first) - 1, 12, 31)
+                            END
+                        ) AS first_obs
                     FROM data AS a
                     LEFT JOIN crsp_age AS b ON a.permco = b.permco
-                    LEFT JOIN comp_acc_age AS c ON a.gvkey = c.gvkey
-                    LEFT JOIN comp_ret_age AS d ON a.gvkey = d.gvkey;
+                    LEFT JOIN comp_age_anchor AS c ON a.gvkey = c.gvkey;
 
                     CREATE TABLE age2 AS
                     SELECT  *, MIN(eom) OVER (PARTITION BY id) AS first_alt
@@ -6736,7 +7253,9 @@ def prep_data_factor_regs(
 
 
 @measure_time
-def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min):
+def market_beta(
+    paths: DataPaths, output_path, data_path, fcts_path, __n, __min, end_date: date = END_DATE
+):
     """
     Description:
         Estimate rolling CAPM betas and idiosyncratic vol for each stock.
@@ -6751,7 +7270,7 @@ def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min)
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n)
+    aux_maps = gen_aux_maps(__n, end_date=end_date)
     df = pl.concat(
         [process_map_chunks(base_data, mapping, "capm", __n, __min) for mapping in aux_maps]
     ).collect()
@@ -6782,7 +7301,17 @@ def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min)
 
 
 @measure_time
-def residual_momentum(paths: DataPaths, output_path, data_path, fcts_path, __n, __min, incl, skip):
+def residual_momentum(
+    paths: DataPaths,
+    output_path,
+    data_path,
+    fcts_path,
+    __n,
+    __min,
+    incl,
+    skip,
+    end_date: date = END_DATE,
+):
     """
     Description:
         Compute residual momentum from FF3 regressions with rolling windows and skip/inclusion rules.
@@ -6799,7 +7328,7 @@ def residual_momentum(paths: DataPaths, output_path, data_path, fcts_path, __n, 
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n)
+    aux_maps = gen_aux_maps(__n, end_date=end_date)
     df = pl.concat(
         [
             process_map_chunks(base_data, mapping, "res_mom", __n, __min, incl, skip)
@@ -7925,12 +8454,15 @@ def save_main_data(paths: DataPaths) -> None:
 def save_output_files(paths: DataPaths):
     """
     Description:
-        Copy main market returns and cutoff files to Output folder.
+        Copy main market returns and cutoff files to Python output folders and
+        emit SAS-compatible CSV copies.
 
     Steps:
         1) Copy parquet outputs from interim/ to other_output/.
         2) Includes market returns (monthly/daily) and cutoff files.
-        3) Interim files are preserved for downstream steps.
+        3) Write the five CSV files exported by the modified SAS main.sas to
+           processed/output/.
+        4) Interim files are preserved for downstream steps.
 
     Output:
         Files copied into 'other_output/' directory.
@@ -7946,6 +8478,18 @@ def save_output_files(paths: DataPaths):
         "ap_factors_daily.parquet",
     ):
         shutil.copy2(paths.interim_dir / name, other_output / name)
+
+    for name in (
+        "market_returns_daily",
+        "market_returns",
+        "nyse_cutoffs",
+        "return_cutoffs",
+        "return_cutoffs_daily",
+    ):
+        _write_sas_csv(
+            pl.scan_parquet(paths.interim_dir / f"{name}.parquet"),
+            paths.sas_output_dir / f"{name}.csv",
+        )
 
 
 @measure_time
@@ -8056,29 +8600,30 @@ def save_monthly_ret(paths: DataPaths):
         Save monthly returns for world securities.
 
     Steps:
-        1) Load world_msf_output.parquet and select relevant columns.
+        1) Load world_msf_output.parquet and select the SAS monthly-return columns.
         2) Shrink dtypes and collect results.
-        3) Write to return_data/world_ret_monthly.parquet.
+        3) Write to return_data/world_ret_monthly.parquet and
+           output/world_ret_monthly.csv.
 
     Output:
         Parquet file with monthly returns by country/security.
     """
     data = pl.scan_parquet(paths.interim_dir / "world_msf_output.parquet").select(
-        ["excntry", "id", "source_crsp", "eom", "me", "ret_exc", "ret", "ret_local", "ret_exc_wins"]
+        ["excntry", "id", "source_crsp", "eom", "ret_exc", "ret", "ret_local"]
     )
-    data.select(pl.all().shrink_dtype()).collect().write_parquet(
-        paths.processed_dir / "return_data" / "world_ret_monthly.parquet"
-    )
+    monthly = data.select(pl.all().shrink_dtype()).collect()
+    monthly.write_parquet(paths.processed_dir / "return_data" / "world_ret_monthly.parquet")
+    _write_sas_csv(monthly, paths.sas_output_dir / "world_ret_monthly.csv")
 
 
 @measure_time
-def merge_roll_apply_daily_results(paths: DataPaths):
+def merge_roll_apply_daily_results(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Merge rolling regression daily results into one dataset.
 
     Steps:
-        1) Build date index from earliest to END_DATE month.
+        1) Build date index from earliest to the runtime end-date month.
         2) Load id_int mapping and all '__roll*' parquet files (sorted for
            deterministic join order).
         3) Outer join them on (id_int, aux_date).
@@ -8088,7 +8633,7 @@ def merge_roll_apply_daily_results(paths: DataPaths):
     Output:
         'roll_apply_daily.parquet' with merged roll regression results.
     """
-    date_idx = END_DATE.month + END_DATE.year * 12
+    date_idx = end_date.month + end_date.year * 12
     df_dates = pl.DataFrame(
         {
             "aux_date": [i + 1 for i in range(23112, date_idx + 1)],
@@ -8177,7 +8722,7 @@ def merge_qmj_to_world_data(paths: DataPaths):
 
 
 @measure_time
-def merge_industry_to_world_msf(paths: DataPaths):
+def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
     """
     Description:
         Merge industry codes into world MSF dataset.
@@ -8188,33 +8733,40 @@ def merge_industry_to_world_msf(paths: DataPaths):
         3) Coalesce SIC/NAICS from both sources.
         4) Drop redundant columns.
 
+    When ``bypass_crsp`` is True there is no CRSP industry file, so SIC/NAICS come
+    from Compustat only (no crsp_ind join), mirroring the SAS bypass path
+    (``coalesce(b.sic, .)``). See config.BYPASS_CRSP.
+
     Output:
         '__msf_world2.parquet' with industry codes appended.
     """
     __msf_world = pl.scan_parquet(paths.interim_dir / "__msf_world.parquet")
     comp_ind = pl.scan_parquet(paths.interim_dir / "comp_ind.parquet")
-    crsp_ind = pl.scan_parquet(paths.interim_dir / "crsp_ind.parquet").rename(
-        {"sic": "sic_crsp", "naics": "naics_crsp"}
+    __msf_world = __msf_world.join(
+        comp_ind, how="left", left_on=["gvkey", "eom"], right_on=["gvkey", "date"]
     )
-    __msf_world = (
-        __msf_world.join(comp_ind, how="left", left_on=["gvkey", "eom"], right_on=["gvkey", "date"])
-        .join(
-            crsp_ind,
-            how="left",
-            left_on=["permco", "permno", "eom"],
-            right_on=["permco", "permno", "date"],
+    if not bypass_crsp:
+        crsp_ind = pl.scan_parquet(paths.interim_dir / "crsp_ind.parquet").rename(
+            {"sic": "sic_crsp", "naics": "naics_crsp"}
         )
-        .with_columns(
-            sic=pl.coalesce(["sic", "sic_crsp"]),
-            naics=pl.coalesce(["naics", "naics_crsp"]),
+        __msf_world = (
+            __msf_world.join(
+                crsp_ind,
+                how="left",
+                left_on=["permco", "permno", "eom"],
+                right_on=["permco", "permno", "date"],
+            )
+            .with_columns(
+                sic=pl.coalesce(["sic", "sic_crsp"]),
+                naics=pl.coalesce(["naics", "naics_crsp"]),
+            )
+            .drop(["sic_crsp", "naics_crsp"])
         )
-        .drop(["sic_crsp", "naics_crsp"])
-    )
     __msf_world.collect().write_parquet(paths.interim_dir / "__msf_world2.parquet")
 
 
 @measure_time
-def roll_apply_daily(paths: DataPaths, stats, sfx, __min):
+def roll_apply_daily(paths: DataPaths, stats, sfx, __min, end_date: date = END_DATE):
     """
     Description:
         Run rolling daily-stat calculations over grouped date windows and save results.
@@ -8229,7 +8781,7 @@ def roll_apply_daily(paths: DataPaths, stats, sfx, __min):
         Parquet with per-(id_int, group_number) rolling metrics for `stats`.
     """
     print(f"Processing {stats} - {sfx.replace('_', '')} - {__min}", flush=True)
-    aux_maps = gen_aux_maps(sfx)
+    aux_maps = gen_aux_maps(sfx, end_date=end_date)
     base_data = prepare_base_data(paths, stat=stats)
     results = pl.concat(
         [process_map_chunks(base_data, mapping, stats, sfx, __min) for mapping in aux_maps]
@@ -8492,21 +9044,21 @@ def res_mom(df, sfx, __min, incl, skip):
     return df
 
 
-def gen_aux_maps(sfx):
+def gen_aux_maps(sfx, end_date: date = END_DATE):
     """
     Description:
         Build date-group maps from suffix window length.
 
     Steps:
         1) Map suffix to k: {'_21d':1,'_126d':6,'_252d':12,'_1260d':60} or int(sfx).
-        2) Build aux_date range from start index to END_DATE month index.
+        2) Build aux_date range from start index to the runtime end-date month.
         3) Create grouped mappings via group_mapping_dfs(date_idx, k).
 
     Output:
         List of {'group_map','date_map'} mappings.
     """
     parameter_mapping = {"_21d": 1, "_126d": 6, "_252d": 12, "_1260d": 60}
-    date_aux = END_DATE.month + END_DATE.year * 12
+    date_aux = end_date.month + end_date.year * 12
     if sfx in parameter_mapping:
         date_idx = list(range(23113 - parameter_mapping[sfx], date_aux + 1))
         aux_maps = group_mapping_dfs(date_idx, parameter_mapping[sfx])

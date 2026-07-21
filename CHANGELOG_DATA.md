@@ -3,6 +3,10 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 28-06-2026
+__Changes__:
+- Added a CRSP-bypass build mode (`config.BYPASS_CRSP`, `jkp build --bypass-crsp`) that constructs the dataset from Compustat only, mirroring the SAS `bypass_crsp=1` path. When enabled: security files contain Compustat rows only (`source_crsp=0`); excess returns use the Fama-French risk-free rate with a last-available-month fallback instead of the CRSP 30-year T-bill; NYSE size breakpoints are identified via Compustat `exchg=11` instead of CRSP `exchcd=1`; SIC/NAICS industry codes come from Compustat only; and factor portfolios are built from Compustat (`PORTFOLIO_SETTINGS["source"]=["COMPUSTAT"]`). This mode is the new default.
+
 ## 27-04-2026
 __Changes__:
 - Added `mkt_vw_cap_exc` (cap-weighted excess market return) to market returns output ([#81](https://github.com/bkelly-lab/jkp-data/pull/81))

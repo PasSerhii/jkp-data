@@ -63,6 +63,43 @@ def _date_subclass_returning(today_value: _dt.date) -> type:
 class TestCompHgics:
     """Tests for `comp_hgics`."""
 
+    def test_empty_input_writes_empty_typed_output(self, test_paths: DataPaths) -> None:
+        raw_data_dfs = test_paths.interim_dir / "raw_data_dfs"
+        pl.DataFrame(
+            schema={
+                "gvkey": pl.String,
+                "indfrom": pl.Date,
+                "indthru": pl.Date,
+                "gics": pl.Int64,
+            }
+        ).write_parquet(raw_data_dfs / "comp_hgics_gl.parquet")
+
+        comp_hgics(test_paths, "global")
+
+        out = pl.read_parquet(test_paths.interim_dir / "g_hgics.parquet")
+        assert out.is_empty()
+        assert out.schema == {"gvkey": pl.String, "date": pl.Date, "gics": pl.Int64}
+
+    def test_runtime_end_date_closes_open_interval(self, test_paths: DataPaths) -> None:
+        raw_data_dfs = test_paths.interim_dir / "raw_data_dfs"
+        pl.DataFrame(
+            {
+                "gvkey": ["001000"],
+                "indfrom": [_dt.date(2026, 7, 29)],
+                "indthru": [None],
+                "gics": [10101010],
+            }
+        ).write_parquet(raw_data_dfs / "comp_hgics_na.parquet")
+
+        comp_hgics(test_paths, "national", end_date=_dt.date(2026, 7, 31))
+
+        out = pl.read_parquet(test_paths.interim_dir / "na_hgics.parquet")
+        assert out["date"].to_list() == [
+            _dt.date(2026, 7, 29),
+            _dt.date(2026, 7, 30),
+            _dt.date(2026, 7, 31),
+        ]
+
     @pytest.mark.regression
     def test_independent_of_wall_clock(
         self, test_paths: DataPaths, monkeypatch: pytest.MonkeyPatch

@@ -1,4 +1,6 @@
+import copy
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any as _Any
 
@@ -62,7 +64,13 @@ def __dir__() -> list[str]:
     return sorted(set(__all__) | standard_dunders)
 
 
-def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
+def run_portfolio(
+    *,
+    output_format: str = "parquet",
+    output_dir: Path,
+    countries: list[str] | tuple[str, ...] | None = None,
+    end_date: date | None = None,
+) -> None:
     """Run JKP portfolio generation.
 
     Description:
@@ -86,6 +94,7 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
         _stack_outputs,
         _write_filtered,
         _write_split_by_key,
+        normalize_country_filter,
         portfolios,
     )
 
@@ -97,10 +106,23 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
     configure_output_format(output_format)
 
     # Get list of countries from characteristics files
-    countries = sorted(p.stem for p in chars_dir.glob("*.parquet") if "world" not in p.stem)
+    available_countries = sorted(p.stem.upper() for p in chars_dir.glob("*.parquet") if "world" not in p.stem)
+    country_filter = normalize_country_filter(countries)
+    if country_filter is None:
+        countries = available_countries
+    else:
+        countries = [c for c in available_countries if c in country_filter]
+        missing = sorted(set(country_filter) - set(countries))
+        if missing:
+            raise ValueError(
+                f"Portfolio country filter {tuple(missing)!r} has no matching "
+                "characteristics file."
+            )
 
     chars = PORTFOLIO_CHARS
-    settings = PORTFOLIO_SETTINGS
+    settings = copy.deepcopy(PORTFOLIO_SETTINGS)
+    if end_date is not None:
+        settings["end_date"] = end_date
 
     print(
         f"Start          : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}",
@@ -137,6 +159,8 @@ def run_portfolio(*, output_format: str = "parquet", output_dir: Path) -> None:
         (pl.col("excntry").is_not_null())
         & (~pl.col("excntry").is_in(settings["regional_pfs"]["country_excl"]))
     )
+    if country_filter is not None:
+        country_classification = country_classification.filter(pl.col("excntry").is_in(countries))
 
     # Creating the regions DataFrame
     regions = pl.DataFrame(

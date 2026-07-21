@@ -1,6 +1,7 @@
 """Tests for the JKP CLI entry point."""
 
 import re
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,6 +9,8 @@ from typer.testing import CliRunner
 
 from jkp.data import __version__
 from jkp.data.cli import app
+from jkp.data.config import BYPASS_CRSP, PRODUCTION_OUTPUT
+from jkp.data.database_sources import CompustatSource
 
 runner = CliRunner()
 
@@ -35,7 +38,11 @@ class TestCliHelp:
     def test_build_help(self):
         result = runner.invoke(app, ["build", "--help"])
         assert result.exit_code == 0
-        assert "--persistent-connection" in _strip_ansi(result.output)
+        assert "--persistent-co" in _strip_ansi(result.output)
+        assert "--country" in _strip_ansi(result.output)
+        assert "--start-date" in _strip_ansi(result.output)
+        assert "--end-date" in _strip_ansi(result.output)
+        assert "--compustat-sou" in _strip_ansi(result.output)
         assert "OUTPUT_DIR" in _strip_ansi(result.output)
 
     def test_portfolio_help(self):
@@ -83,19 +90,139 @@ class TestBuildCommand:
     def test_build_calls_run_pipeline(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path)])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=False, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path), "--persistent-connection"])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=True, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=True,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection_short(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path), "-p"])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=True, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=True,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_bypass_crsp_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--bypass-crsp"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_no_bypass_crsp_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--no-bypass-crsp"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=False,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_no_production_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--no-production"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=False,
+            countries=None,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_country_filter(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--country", "usa", "-c", "ISR"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            countries=["usa", "ISR"],
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_date_filter(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "build",
+                str(tmp_path),
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-12-31",
+            ],
+        )
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            countries=None,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            compustat_source=CompustatSource.xpressfeed,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_wrds_source(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(
+            app, ["build", str(tmp_path), "--compustat-source", "wrds"]
+        )
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["compustat_source"] is CompustatSource.wrds
 
     def test_build_missing_output_dir(self):
         result = runner.invoke(app, ["build"])
@@ -110,13 +237,33 @@ class TestPortfolioCommand:
     def test_portfolio_calls_run_portfolio(self, mock_run_portfolio, tmp_path):
         result = runner.invoke(app, ["portfolio", str(tmp_path)])
         assert result.exit_code == 0
-        mock_run_portfolio.assert_called_once_with(output_format="parquet", output_dir=tmp_path)
+        mock_run_portfolio.assert_called_once_with(
+            output_format="parquet", output_dir=tmp_path, countries=None, end_date=None
+        )
 
     @patch("jkp.data.portfolio.run_portfolio")
     def test_portfolio_csv_format(self, mock_run_portfolio, tmp_path):
         result = runner.invoke(app, ["portfolio", str(tmp_path), "--output-format", "csv"])
         assert result.exit_code == 0
-        mock_run_portfolio.assert_called_once_with(output_format="csv", output_dir=tmp_path)
+        mock_run_portfolio.assert_called_once_with(
+            output_format="csv", output_dir=tmp_path, countries=None, end_date=None
+        )
+
+    @patch("jkp.data.portfolio.run_portfolio")
+    def test_portfolio_country_filter(self, mock_run_portfolio, tmp_path):
+        result = runner.invoke(app, ["portfolio", str(tmp_path), "--country", "usa"])
+        assert result.exit_code == 0
+        mock_run_portfolio.assert_called_once_with(
+            output_format="parquet", output_dir=tmp_path, countries=["usa"], end_date=None
+        )
+
+    @patch("jkp.data.portfolio.run_portfolio")
+    def test_portfolio_end_date(self, mock_run_portfolio, tmp_path):
+        result = runner.invoke(
+            app, ["portfolio", str(tmp_path), "--end-date", "2026-07-31"]
+        )
+        assert result.exit_code == 0
+        assert mock_run_portfolio.call_args.kwargs["end_date"] == date(2026, 7, 31)
 
     def test_portfolio_missing_output_dir(self):
         result = runner.invoke(app, ["portfolio"])

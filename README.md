@@ -12,7 +12,11 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
 
 ### Prerequisites
 
-- Obtain your WRDS credentials.
+- For the production Compustat-only build, put the licensed XpressFeed RDS URL
+  in `COMPUSTAT` in the repository `.env` file. SQLAlchemy URLs such as
+  `postgresql+psycopg2://...` are accepted and normalized automatically.
+- WRDS credentials are needed only for `--compustat-source wrds` comparison
+  runs or for workflows that do not bypass CRSP.
 - Ensure you have [uv](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer) installed on your system.
 
 ### Steps
@@ -23,7 +27,36 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
      ```sh
      git clone https://github.com/bkelly-lab/jkp-data.git
      ```
-2. **Input WRDS credentials**
+2. **Configure the data source**
+
+   The default build reads the WRDS-compatible `comp.*` views and
+   `ff.factors_monthly` from XpressFeed RDS. The `.env` file is read without
+   exporting its values into the process environment, and connection secrets
+   are not logged.
+
+   ```sh
+   jkp build data/ --compustat-source xpressfeed --bypass-crsp
+   ```
+
+   `--start-date` is a calculation-history bound, not just an output filter.
+   The production default of `2000-01-01` retains more than the longest bounded
+   lookback (20 years) needed for current 2026 characteristics. Firm age is the
+   lifetime-history exception: each download therefore also creates a compact
+   `comp_age_anchor.parquet` from indexed full-history minima rather than
+   downloading pre-2000 daily rows. Very early output rows still require their
+   normal lookback warm-up and should not be interpreted as a full-history
+   replication.
+
+   A command-line `--end-date` is propagated through downloads, industry
+   histories, rolling monthly/daily calculations, and production exports. If
+   portfolio outputs are generated separately, pass the same date there:
+
+   ```sh
+   jkp portfolio data/ --end-date 2026-07-31
+   ```
+
+   To run a deliberate WRDS regression comparison instead, configure WRDS
+   credentials and select it explicitly:
 
    - To save your WRDS credentials, navigate to the `jkp-data/` folder and run:
      ```sh
@@ -56,7 +89,7 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
 
      In an interactive session, run:
      ```sh
-     jkp build data/
+     jkp build data/ --compustat-source xpressfeed --bypass-crsp
      ```
      to create the stock returns and firm characteristics, and
      ```sh
