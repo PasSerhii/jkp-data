@@ -115,6 +115,7 @@ def _write_daily(paths: DataPaths) -> None:
             }
         )
     df = pl.DataFrame(rows).cast({"date": pl.Date}).with_columns(eom=pl.col("date").dt.month_end())
+    df.write_parquet(paths.interim_dir / "world_dsf.parquet")
     df.write_parquet(paths.interim_dir / "world_dsf_output.parquet")
 
 
@@ -146,6 +147,25 @@ def test_market_min_price_trailing_window(tmp_path: Path) -> None:
     assert feb["min_prc"][0] == pytest.approx(4.0)  # min over all four days
     jan = out.filter(pl.col("eom") == date(2020, 1, 31))
     assert jan["min_prc"][0] == pytest.approx(8.0)  # min over January only
+
+
+def test_trailing_analytics_use_pre_filter_daily_history(tmp_path: Path) -> None:
+    """Earlier non-main days still belong to a later main issue's trailing window."""
+    paths = _make_paths(tmp_path)
+    _write_fx(paths)
+    _write_daily(paths)
+
+    # Model an issue becoming eligible only on the final day.  The production
+    # output panel has one row, while the pre-filter panel retains its history.
+    filtered = pl.read_parquet(paths.interim_dir / "world_dsf_output.parquet").tail(1)
+    filtered.write_parquet(paths.interim_dir / "world_dsf_output.parquet")
+
+    volumes = market_volumes(paths, 2).filter(pl.col("eom") == date(2020, 2, 29))
+    assert volumes["avgdolvol"][0] == pytest.approx((100 + 200 + 300 + 500) / 4)
+    assert volumes["mediandolvol"][0] == pytest.approx(250.0)
+
+    prices = market_min_price(paths, 2).filter(pl.col("eom") == date(2020, 2, 29))
+    assert prices["min_prc"][0] == pytest.approx(4.0)
 
 
 def _write_monthly_and_ids(paths: DataPaths) -> None:

@@ -17,7 +17,6 @@ from .aux_functions import (
     ff_ind_class,
     filter_dsf,
     filter_msf,
-    filter_security_files_by_country,
     filter_world,
     finish_daily_chars,
     firm_age,
@@ -30,7 +29,6 @@ from .aux_functions import (
     merge_roll_apply_daily_results,
     merge_world_data_prelim,
     mispricing_factors,
-    normalize_country_filter,
     nyse_size_cutoffs,
     prepare_comp_sf,
     prepare_crsp_sf,
@@ -49,16 +47,15 @@ from .aux_functions import (
     standardized_accounting_data,
 )
 from .config import (
-    ACCOUNTING_START_DATE,
+    ACCOUNTING_START_DATE as DEFAULT_ACCOUNTING_START_DATE,
+)
+from .config import (
     BYPASS_CRSP,
     PRODUCTION_OUTPUT,
     ROLLING_DAILY_SPECS,
 )
 from .config import (
     END_DATE as DEFAULT_END_DATE,
-)
-from .config import (
-    START_DATE as DEFAULT_START_DATE,
 )
 from .database_sources import CompustatSource, get_xpressfeed_connection_info
 from .paths import DataPaths
@@ -72,7 +69,6 @@ def run_pipeline(
     output_dir: Path,
     bypass_crsp: bool = BYPASS_CRSP,
     production_output: bool = PRODUCTION_OUTPUT,
-    countries: list[str] | tuple[str, ...] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
@@ -105,8 +101,9 @@ def run_pipeline(
         raw_schema = "comp"
         username = creds.username
         password = creds.password
-    country_filter = normalize_country_filter(countries)
-    effective_start_date = DEFAULT_START_DATE if start_date is None else start_date
+    effective_start_date = (
+        DEFAULT_ACCOUNTING_START_DATE if start_date is None else start_date
+    )
     effective_end_date = DEFAULT_END_DATE if end_date is None else end_date
     if (
         effective_start_date is not None
@@ -131,7 +128,6 @@ def run_pipeline(
         persistent_connection=persistent_connection,
         bypass_crsp=bypass_crsp,
         start_date=effective_start_date,
-        countries=country_filter,
     )
     gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
     prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)
@@ -150,8 +146,6 @@ def run_pipeline(
     return_cutoffs(paths, "d", 0)
     add_ret_exc_wins(paths, "m")
     add_ret_exc_wins(paths, "d")
-    if country_filter is not None:
-        filter_security_files_by_country(paths, country_filter)
     market_returns(
         paths,
         interim / "world_dsf.parquet",
@@ -169,7 +163,7 @@ def run_pipeline(
         interim / "nyse_cutoffs.parquet",
     )
     standardized_accounting_data(
-        paths, "world", 1, interim / "world_msf.parquet", 1, ACCOUNTING_START_DATE
+        paths, "world", 1, interim / "world_msf.parquet", 1, effective_start_date
     )
     create_acc_chars(
         paths,

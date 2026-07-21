@@ -130,45 +130,6 @@ def _write_sas_csv(df: pl.DataFrame | pl.LazyFrame, path: Path) -> None:
     df.write_csv(path, quote_style="non_numeric", null_value="")
 
 
-def normalize_country_filter(countries: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
-    """Normalize an optional country filter to uppercase ISO-3 codes."""
-    if not countries:
-        return None
-    normalized = tuple(dict.fromkeys(c.strip().upper() for c in countries if c.strip()))
-    invalid = [c for c in normalized if not re.fullmatch(r"[A-Z]{3}", c)]
-    if invalid:
-        raise ValueError(f"Country codes must be ISO-3 alphabetic codes, got {invalid!r}")
-    return normalized or None
-
-
-@measure_time
-def filter_security_files_by_country(paths: DataPaths, countries: tuple[str, ...]) -> None:
-    """Restrict world_msf/world_dsf to selected countries for downstream debugging/builds."""
-    outputs: list[tuple[Path, Path]] = []
-    for filename in ("world_msf.parquet", "world_dsf.parquet"):
-        path = paths.interim_dir / filename
-        tmp_path = paths.interim_dir / f"{path.stem}_country_filter.parquet"
-        tmp_path.unlink(missing_ok=True)
-        (
-            pl.scan_parquet(path)
-            .filter(pl.col("excntry").is_in(countries))
-            .sink_parquet(tmp_path)
-        )
-
-        if pl.scan_parquet(tmp_path).select(pl.len()).collect().item() == 0:
-            for _, created_tmp in outputs:
-                created_tmp.unlink(missing_ok=True)
-            tmp_path.unlink(missing_ok=True)
-            raise ValueError(
-                f"Country filter {countries!r} produced no rows in {filename}. "
-                "Use ISO-3 country codes from the `excntry` column, e.g. USA."
-            )
-        outputs.append((path, tmp_path))
-
-    for path, tmp_path in outputs:
-        os.replace(tmp_path, path)
-
-
 def sic_naics_aux(filename):
     """
     Description:
@@ -770,19 +731,13 @@ def download_wrds_table_attached(
     date_column: str | None = None,
     end_date: date | None = None,
     start_date: date | None = None,
-    country_filter: tuple[str, ...] | None = None,
 ):
     """Download a WRDS table using an attached persistent connection."""
     lib, table = table_name.split(".")
     cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
     projection = build_projection(cols)
 
-    def table_ref(name: str) -> str:
-        ref_lib, ref_table = name.split(".")
-        return f"{db_alias}.{ref_lib}.{ref_table}"
-
-    country_condition = _country_filter_condition(table_name, country_filter, table_ref)
-    where_clause = _where_clause(date_column, start_date, end_date, country_condition)
+    where_clause = _where_clause(date_column, start_date, end_date)
 
     duckdb_conn.execute(f"""
         COPY (
@@ -811,9 +766,8 @@ def _where_clause(
     date_column: str | None,
     start_date: date | None = None,
     end_date: date | None = None,
-    extra_condition: str | None = None,
 ) -> str:
-    """Build a WHERE clause from optional date bounds and an extra predicate."""
+    """Build a WHERE clause from optional date bounds."""
     if not date_column:
         conditions = []
     else:
@@ -822,16 +776,9 @@ def _where_clause(
             conditions.append(f"{date_column} >= '{start_date}'")
         if end_date:
             conditions.append(f"{date_column} <= '{end_date}'")
-    if extra_condition:
-        conditions.append(extra_condition)
     if not conditions:
         return ""
     return "WHERE " + " AND ".join(conditions)
-
-
-def _country_sql_list(country_filter: tuple[str, ...]) -> str:
-    """Return a quoted SQL IN-list for validated ISO-3 country codes."""
-    return ", ".join(f"'{country}'" for country in country_filter)
 
 
 def _sql_literal(value: str) -> str:
@@ -842,67 +789,6 @@ def _sql_literal(value: str) -> str:
 def _pg_ident(value: str) -> str:
     """Quote a PostgreSQL identifier."""
     return '"' + value.replace('"', '""') + '"'
-
-
-def _country_filter_condition(
-    table_name: str,
-    country_filter: tuple[str, ...] | None,
-    table_ref,
-) -> str | None:
-    """Return a table-specific Compustat country predicate for WRDS download SQL."""
-    if not country_filter:
-        return None
-
-    countries = _country_sql_list(country_filter)
-    national_security = table_ref("comp.security")
-    global_security = table_ref("comp.g_security")
-
-    direct_country_tables = {
-        "comp.security",
-        "comp.g_security",
-    }
-    national_gvkey_tables = {
-        "comp.secd",
-        "comp.secm",
-        "comp.sec_history",
-        "comp.company",
-        "comp.funda",
-        "comp.fundq",
-        "comp.co_hgic",
-    }
-    global_gvkey_tables = {
-        "comp.g_secd",
-        "comp.g_sec_history",
-        "comp.g_company",
-        "comp.g_funda",
-        "comp.g_fundq",
-        "comp.g_co_hgic",
-    }
-
-    if table_name in direct_country_tables:
-        return f"excntry IN ({countries})"
-    if table_name in national_gvkey_tables:
-        return (
-            "gvkey IN ("
-            f"SELECT DISTINCT gvkey FROM {national_security} WHERE excntry IN ({countries})"
-            ")"
-        )
-    if table_name in global_gvkey_tables:
-        return (
-            "gvkey IN ("
-            f"SELECT DISTINCT gvkey FROM {global_security} WHERE excntry IN ({countries})"
-            ")"
-        )
-
-    return None
-
-
-def _remote_country_filter_condition(
-    table_name: str,
-    country_filter: tuple[str, ...] | None,
-) -> str | None:
-    """Return a WRDS PostgreSQL-side country predicate for postgres_query."""
-    return _country_filter_condition(table_name, country_filter, lambda name: name)
 
 
 def build_projection(cols):
@@ -922,23 +808,6 @@ def build_projection(cols):
         return "*"
 
 
-def build_postgres_projection(cols):
-    """Build a PostgreSQL-compatible projection matching build_projection casts."""
-    integer_cast_cols = {"permno", "permco", "sic", "sich"}
-    projection = []
-    for col_name in cols:
-        ident = _pg_ident(col_name)
-        if col_name in integer_cast_cols:
-            projection.append(
-                "CASE WHEN "
-                f"{ident}::text ~ '^-?[0-9]+$' THEN {ident}::bigint ELSE NULL END "
-                f"AS {ident}"
-            )
-        else:
-            projection.append(ident)
-    return ", ".join(projection)
-
-
 def download_wrds_table(
     conninfo: str,
     duckdb_conn: duckdb.DuckDBPyConnection,
@@ -947,46 +816,12 @@ def download_wrds_table(
     date_column: str | None = None,
     end_date: date | None = None,
     start_date: date | None = None,
-    country_filter: tuple[str, ...] | None = None,
 ) -> None:
     lib, table = table_name.split(".")
     cols = get_columns(duckdb_conn, conninfo, lib, table)
     projection = build_projection(cols)
 
-    def table_ref(name: str) -> str:
-        ref_lib, ref_table = name.split(".")
-        return f"postgres_scan({_sql_literal(conninfo)}, '{ref_lib}', '{ref_table}')"
-
-    country_condition = _country_filter_condition(table_name, country_filter, table_ref)
-    where_clause = _where_clause(date_column, start_date, end_date, country_condition)
-    remote_country_condition = _remote_country_filter_condition(table_name, country_filter)
-    if remote_country_condition:
-        remote_alias = f"wrds_query_{lib}_{table}"
-        remote_where_clause = _where_clause(
-            date_column,
-            start_date,
-            end_date,
-            remote_country_condition,
-        )
-        remote_sql = (
-            f"SELECT {build_postgres_projection(cols)} "
-            f"FROM {lib}.{table} "
-            f"{remote_where_clause}"
-        )
-        duckdb_conn.execute(
-            f"ATTACH {_sql_literal(conninfo)} AS {remote_alias} (TYPE postgres, READ_ONLY)"
-        )
-        try:
-            duckdb_conn.execute(f"""
-                COPY (
-                  SELECT *
-                  FROM postgres_query({_sql_literal(remote_alias)}, {_sql_literal(remote_sql)})
-                )
-                TO {_sql_literal(filename)} (FORMAT PARQUET);
-            """)
-        finally:
-            duckdb_conn.execute(f"DETACH {remote_alias}")
-        return
+    where_clause = _where_clause(date_column, start_date, end_date)
 
     duckdb_conn.execute(f"""
         COPY (
@@ -1109,7 +944,6 @@ def download_raw_data_tables(
     persistent_connection: bool = False,
     bypass_crsp: bool = False,
     start_date: date | None = None,
-    countries: list[str] | tuple[str, ...] | None = None,
     connection_info: str | None = None,
     source_label: str = "WRDS",
     raw_schema: str = "comp",
@@ -1171,12 +1005,7 @@ def download_raw_data_tables(
         "comp.g_secd",
     ]
 
-    country_filter = normalize_country_filter(countries)
-
-    # In CRSP-bypass mode, or when a country filter excludes USA, no CRSP source
-    # tables are needed. CRSP is a US database; non-US selected countries are
-    # represented by Compustat only.
-    if bypass_crsp or (country_filter is not None and "USA" not in country_filter):
+    if bypass_crsp:
         table_names = [t for t in table_names if not t.startswith("crsp.")]
 
     # Tables with a known date column are filtered to end_date during download.
@@ -1219,28 +1048,15 @@ def download_raw_data_tables(
                 filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
                 print(f"Downloading {source_label} table {table}...", flush=True)
                 try:
-                    if _remote_country_filter_condition(table, country_filter):
-                        download_wrds_table(
-                            source_connection_info,
-                            con,
-                            table,
-                            filename,
-                            date_column=date_columns.get(table),
-                            end_date=end_date,
-                            start_date=start_date,
-                            country_filter=country_filter,
-                        )
-                    else:
-                        download_wrds_table_attached(
-                            con,
-                            "source_db",
-                            table,
-                            filename,
-                            date_column=date_columns.get(table),
-                            end_date=end_date,
-                            start_date=start_date,
-                            country_filter=country_filter,
-                        )
+                    download_wrds_table_attached(
+                        con,
+                        "source_db",
+                        table,
+                        filename,
+                        date_column=date_columns.get(table),
+                        end_date=end_date,
+                        start_date=start_date,
+                    )
                 except Exception as e:
                     if e.__class__.__name__ != "OutOfMemoryException":
                         _raise_redacted_source_error(source_label, f"download of {table}", e)
@@ -1258,7 +1074,6 @@ def download_raw_data_tables(
                             date_column=date_columns.get(table),
                             end_date=end_date,
                             start_date=start_date,
-                            country_filter=country_filter,
                         )
                     except Exception as retry_error:
                         _raise_redacted_source_error(
@@ -1289,7 +1104,6 @@ def download_raw_data_tables(
                     date_column=date_columns.get(table),
                     end_date=end_date,
                     start_date=start_date,
-                    country_filter=country_filter,
                 )
             except Exception as e:
                 _raise_redacted_source_error(source_label, f"download of {table}", e)
@@ -3769,6 +3583,9 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     c1 = (col("indfmt").is_in(["INDL", "FS"])) if mode == 1 else (col("indfmt") == "INDL")
     datafmt_val = "HIST_STD" if mode == 1 else "STD"
     popsrc_val = "I" if mode == 1 else "D"
+    accounting_start = (
+        pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
+    )
     df = (
         pl.scan_parquet(filename)
         .with_row_index("n")
@@ -3777,7 +3594,7 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
             & (col("datafmt") == datafmt_val)
             & (col("popsrc") == popsrc_val)
             & (col("consol") == "C")
-            & (col("datadate") >= start_date)
+            & (col("datadate") >= accounting_start)
         )
         .with_columns(source=pl.lit(source_str))
     )
@@ -6959,6 +6776,24 @@ def char_pf_rets():
     return [lms, smb]
 
 
+def _ensure_ff_portfolio_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Add empty FF size-by-characteristic buckets omitted by an eager pivot."""
+    required = (
+        "small_low",
+        "small_mid",
+        "small_high",
+        "big_low",
+        "big_mid",
+        "big_high",
+    )
+    missing = [
+        pl.lit(None, dtype=pl.Float64).alias(column)
+        for column in required
+        if column not in df.columns
+    ]
+    return df.with_columns(missing) if missing else df
+
+
 def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
     """
     Description:
@@ -7030,6 +6865,7 @@ def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
         )
         .collect()
         .pivot(values="ret_exc", index=["excntry", date_col], on="combined_pf")
+        .pipe(_ensure_ff_portfolio_columns)
         .select(["excntry", date_col, *char_pf_rets()])
         .sort(["excntry", date_col])
     )

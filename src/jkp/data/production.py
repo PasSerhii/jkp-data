@@ -142,11 +142,13 @@ def market_volumes(paths: DataPaths, n: int) -> pl.DataFrame:
 
     Mirrors %market_volumes: for each target month-end T, aggregate the daily
     ``dolvol`` over the window (T-n months, T]. A daily observation in month m
-    contributes to targets m..m+n-1.
+    contributes to targets m..m+n-1.  Use the pre-filter daily panel: historical
+    observations must remain available when an issue only becomes the company's
+    primary/main security at the target month-end.
     """
     fx = _ils_fx(paths).lazy()
     daily = (
-        pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
+        pl.scan_parquet(paths.interim_dir / "world_dsf.parquet")
         .select("id", "date", "eom", "dolvol")
         .join(fx, on="date", how="left")
         .with_columns(
@@ -170,9 +172,14 @@ def market_volumes(paths: DataPaths, n: int) -> pl.DataFrame:
 
 @measure_time
 def market_min_price(paths: DataPaths, n: int) -> pl.DataFrame:
-    """Per (id, eom) trailing ``n``-month minimum daily price (USD). Mirrors %market_min_price."""
+    """Per (id, eom) trailing ``n``-month minimum daily price (USD).
+
+    Mirrors %market_min_price and deliberately uses the pre-filter daily panel.
+    Filtering to main/primary observations first can discard valid earlier days
+    in the trailing window, especially around listings and primary-issue changes.
+    """
     daily = (
-        pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
+        pl.scan_parquet(paths.interim_dir / "world_dsf.parquet")
         .select("id", "eom", "prc")
         .with_columns(_m=_month_index("eom"))
         .with_columns(_t=pl.int_ranges(pl.col("_m"), pl.col("_m") + n))

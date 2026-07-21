@@ -8,6 +8,36 @@ from unittest.mock import MagicMock
 import jkp.data.main as pipeline
 
 
+def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) -> None:
+    download = MagicMock()
+    monkeypatch.setattr(pipeline, "download_raw_data_tables", download)
+    monkeypatch.setattr(pipeline, "setup_folder_structure", MagicMock())
+    monkeypatch.setattr(
+        pipeline,
+        "gen_raw_data_dfs",
+        MagicMock(side_effect=RuntimeError("stop after download")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_xpressfeed_connection_info",
+        MagicMock(return_value="postgresql://private-rds"),
+    )
+
+    try:
+        pipeline.run_pipeline(
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=False,
+            compustat_source="xpressfeed",
+        )
+    except RuntimeError as error:
+        assert str(error) == "stop after download"
+    else:
+        raise AssertionError("pipeline should have stopped after the download step")
+
+    assert download.call_args.kwargs["start_date"] == date(1949, 12, 31)
+
+
 def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) -> None:
     step_names = (
         "setup_folder_structure",
@@ -81,6 +111,7 @@ def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) ->
     assert download_kwargs["end_date"] == runtime_end
     assert download_kwargs["raw_schema"] == "public"
     assert download_kwargs["connection_info"] == "postgresql://private-rds"
+    assert mocks["standardized_accounting_data"].call_args.args[-1] == runtime_start
 
     assert mocks["comp_industry"].call_args.kwargs["end_date"] == runtime_end
     assert mocks["firm_age"].call_args.kwargs["bypass_crsp"] is True

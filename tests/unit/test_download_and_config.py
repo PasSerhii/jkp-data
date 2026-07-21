@@ -33,7 +33,7 @@ from jkp.data.config import (
     REGIONAL_MONTHS_MIN,
     REGIONAL_STOCKS_MIN,
     ROLLING_DAILY_SPECS,
-    START_DATE,
+    _previous_month_end,
 )
 
 # =============================================================================
@@ -56,6 +56,19 @@ class TestConfig:
             f"END_DATE ({END_DATE}) is not the last day of its month (expected day {last_day})"
         )
 
+    @pytest.mark.parametrize(
+        ("today", "expected"),
+        [
+            (date(2026, 7, 21), date(2026, 6, 30)),
+            (date(2026, 8, 1), date(2026, 7, 31)),
+            (date(2026, 3, 1), date(2026, 2, 28)),
+            (date(2024, 3, 1), date(2024, 2, 29)),
+            (date(2026, 1, 1), date(2025, 12, 31)),
+        ],
+    )
+    def test_previous_month_end(self, today, expected):
+        assert _previous_month_end(today) == expected
+
     def test_main_filters_is_dict(self):
         """MAIN_FILTERS should be a dict."""
         assert isinstance(MAIN_FILTERS, dict), (
@@ -74,22 +87,36 @@ class TestConfig:
         for k, v in MAIN_FILTERS.items():
             assert v == 1, f"MAIN_FILTERS['{k}'] should be 1, got {v}"
 
-    def test_accounting_start_date_is_polars_expr(self):
-        """ACCOUNTING_START_DATE should be a Polars expression (consumed inline)."""
-        assert isinstance(ACCOUNTING_START_DATE, pl.Expr), (
-            f"ACCOUNTING_START_DATE should be pl.Expr, got {type(ACCOUNTING_START_DATE)}"
+    def test_accounting_start_date_is_date(self):
+        """ACCOUNTING_START_DATE is the shared source/accounting lower bound."""
+        assert isinstance(ACCOUNTING_START_DATE, date), (
+            f"ACCOUNTING_START_DATE should be date, got {type(ACCOUNTING_START_DATE)}"
         )
 
     def test_accounting_start_date_value(self):
         """ACCOUNTING_START_DATE should evaluate to 1949-12-31."""
-        evaluated = pl.select(ACCOUNTING_START_DATE).item()
-        assert evaluated.date() == date(1949, 12, 31), (
-            f"ACCOUNTING_START_DATE should be 1949-12-31, got {evaluated}"
+        assert date(1949, 12, 31) == ACCOUNTING_START_DATE, (
+            f"ACCOUNTING_START_DATE should be 1949-12-31, got {ACCOUNTING_START_DATE}"
         )
 
-    def test_start_date_matches_modified_sas_update_mode(self):
-        """START_DATE should mirror the modified SAS update_mode=1 start_date."""
-        assert date(2000, 1, 1) == START_DATE
+    def test_none_accounting_bound_falls_back_to_original_floor(self, tmp_path):
+        """A None override retains the original accounting-only 1949 floor."""
+        from jkp.data.aux_functions import load_raw_fund_table_and_filter
+
+        path = tmp_path / "funda.parquet"
+        pl.DataFrame(
+            {
+                "datadate": [date(1949, 12, 30), date(1949, 12, 31)],
+                "indfmt": ["INDL", "INDL"],
+                "datafmt": ["STD", "STD"],
+                "popsrc": ["D", "D"],
+                "consol": ["C", "C"],
+            }
+        ).write_parquet(path)
+
+        result = load_raw_fund_table_and_filter(path, None, "NA", 2).collect()
+
+        assert result["datadate"].to_list() == [date(1949, 12, 31)]
 
     def test_collect_chunk_size_is_positive_int(self):
         """COLLECT_CHUNK_SIZE must be a positive int (used as a slice step)."""
@@ -247,7 +274,6 @@ class TestDownloadWrdsTable:
         self,
         date_column: str | None = None,
         end_date: date | None = None,
-        country_filter: tuple[str, ...] | None = None,
         table_name: str = "comp.funda",
     ) -> str:
         """Call download_wrds_table with a mock conn and return the executed SQL."""
@@ -261,7 +287,6 @@ class TestDownloadWrdsTable:
             filename="out.parquet",
             date_column=date_column,
             end_date=end_date,
-            country_filter=country_filter,
         )
         return "\n".join(
             str(c.args[0]) for c in mock_conn.execute.call_args_list if c.args
@@ -306,24 +331,6 @@ class TestDownloadWrdsTable:
         """SQL COPY should target the provided filename."""
         sql = self._run()
         assert "'out.parquet'" in sql, f"Expected filename in SQL, got: {sql}"
-
-    def test_country_filter_on_direct_country_table(self):
-        """Country-filtered security tables should filter directly on excntry."""
-        sql = self._run(table_name="comp.security", country_filter=("USA", "CAN"))
-        assert "postgres_query" in sql
-        assert "FROM comp.security WHERE excntry IN (''USA'', ''CAN'')" in sql
-
-    def test_country_filter_on_gvkey_table(self):
-        """Country-filtered accounting tables should restrict gvkeys from security."""
-        sql = self._run(
-            table_name="comp.funda",
-            date_column="datadate",
-            end_date=date(2025, 12, 31),
-            country_filter=("USA", "CAN"),
-        )
-        assert "postgres_query" in sql
-        assert "WHERE datadate <= ''2025-12-31'' AND gvkey IN" in sql
-        assert "FROM comp.security WHERE excntry IN (''USA'', ''CAN'')" in sql
 
 
 # =============================================================================
@@ -416,8 +423,8 @@ class TestDownloadRawDataTables:
         expected_subset = {"comp.funda", "crsp.msf_v2", "crsp.dsf_v2", "comp.secd"}
         assert expected_subset <= downloaded, f"Missing tables: {expected_subset - downloaded}"
 
-    def test_country_filter_without_usa_skips_crsp_tables(self, test_paths):
-        """CRSP downloads should be skipped when selected countries exclude USA."""
+    def test_bypass_crsp_skips_crsp_tables(self, test_paths):
+        """CRSP downloads should be skipped in Compustat-only mode."""
         with (
             patch("jkp.data.aux_functions.gen_wrds_connection_info", return_value="host=test"),
             patch("jkp.data.aux_functions.duckdb") as mock_duckdb,
@@ -432,7 +439,7 @@ class TestDownloadRawDataTables:
                 "user",
                 "pass",
                 end_date=date(2025, 12, 31),
-                countries=("CAN",),
+                bypass_crsp=True,
             )
 
         downloaded = {
@@ -442,8 +449,6 @@ class TestDownloadRawDataTables:
         assert downloaded
         assert not any(t.startswith("crsp.") for t in downloaded)
         assert "comp.funda" in downloaded
-        for c in mock_download.call_args_list:
-            assert c.kwargs.get("country_filter") == ("CAN",)
 
 
 # =============================================================================
@@ -609,52 +614,6 @@ class TestSaveOutputFiles:
         ):
             assert (test_paths.sas_output_dir / f"{name}.csv").exists()
             assert (test_paths.processed_dir / "other_output" / f"{name}.parquet").exists()
-
-
-class TestCountryFilter:
-    """Tests for optional country-only pipeline builds."""
-
-    def test_normalize_country_filter(self):
-        from jkp.data.aux_functions import normalize_country_filter
-
-        assert normalize_country_filter(None) is None
-        assert normalize_country_filter([]) is None
-        assert normalize_country_filter([" usa ", "ISR", "usa"]) == ("USA", "ISR")
-        with pytest.raises(ValueError, match="ISO-3"):
-            normalize_country_filter(["US"])
-
-    def test_filter_security_files_by_country(self, test_paths):
-        from jkp.data.aux_functions import filter_security_files_by_country
-
-        for filename in ("world_msf.parquet", "world_dsf.parquet"):
-            pl.DataFrame(
-                {
-                    "id": [1, 2, 3],
-                    "excntry": ["USA", "ISR", "FRA"],
-                    "eom": [date(2020, 1, 31)] * 3,
-                }
-            ).write_parquet(test_paths.interim_dir / filename)
-
-        filter_security_files_by_country(test_paths, ("USA", "ISR"))
-
-        for filename in ("world_msf.parquet", "world_dsf.parquet"):
-            out = pl.read_parquet(test_paths.interim_dir / filename)
-            assert out["excntry"].to_list() == ["USA", "ISR"]
-
-    def test_filter_security_files_by_country_raises_on_no_match(self, test_paths):
-        from jkp.data.aux_functions import filter_security_files_by_country
-
-        for filename in ("world_msf.parquet", "world_dsf.parquet"):
-            pl.DataFrame(
-                {
-                    "id": [1],
-                    "excntry": ["USA"],
-                    "eom": [date(2020, 1, 31)],
-                }
-            ).write_parquet(test_paths.interim_dir / filename)
-
-        with pytest.raises(ValueError, match="produced no rows"):
-            filter_security_files_by_country(test_paths, ("ZZZ",))
 
 
 # =============================================================================

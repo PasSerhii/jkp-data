@@ -180,7 +180,6 @@ class TestDownloadRawDataTablesBranching:
                 "pass",
                 persistent_connection=True,
                 bypass_crsp=True,
-                countries=("USA",),
                 start_date=date(2024, 1, 1),
                 end_date=date(2024, 1, 31),
             )

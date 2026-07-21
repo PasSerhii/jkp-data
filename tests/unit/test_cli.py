@@ -39,7 +39,6 @@ class TestCliHelp:
         result = runner.invoke(app, ["build", "--help"])
         assert result.exit_code == 0
         assert "--persistent-co" in _strip_ansi(result.output)
-        assert "--country" in _strip_ansi(result.output)
         assert "--start-date" in _strip_ansi(result.output)
         assert "--end-date" in _strip_ansi(result.output)
         assert "--compustat-sou" in _strip_ansi(result.output)
@@ -95,7 +94,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -110,7 +108,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -125,7 +122,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -140,7 +136,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=True,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -155,7 +150,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=False,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -170,22 +164,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=False,
-            countries=None,
-            start_date=None,
-            end_date=None,
-            compustat_source=CompustatSource.xpressfeed,
-        )
-
-    @patch("jkp.data.main.run_pipeline")
-    def test_build_country_filter(self, mock_run_pipeline, tmp_path):
-        result = runner.invoke(app, ["build", str(tmp_path), "--country", "usa", "-c", "ISR"])
-        assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(
-            persistent_connection=False,
-            output_dir=tmp_path,
-            bypass_crsp=BYPASS_CRSP,
-            production_output=PRODUCTION_OUTPUT,
-            countries=["usa", "ISR"],
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -210,7 +188,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            countries=None,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             compustat_source=CompustatSource.xpressfeed,
@@ -228,6 +205,10 @@ class TestBuildCommand:
         result = runner.invoke(app, ["build"])
         assert result.exit_code != 0
 
+    def test_build_country_option_is_not_supported(self, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--country", "ISR"])
+        assert result.exit_code != 0
+
 
 @pytest.mark.unit
 class TestPortfolioCommand:
@@ -238,7 +219,7 @@ class TestPortfolioCommand:
         result = runner.invoke(app, ["portfolio", str(tmp_path)])
         assert result.exit_code == 0
         mock_run_portfolio.assert_called_once_with(
-            output_format="parquet", output_dir=tmp_path, countries=None, end_date=None
+            output_format="parquet", output_dir=tmp_path, end_date=None
         )
 
     @patch("jkp.data.portfolio.run_portfolio")
@@ -246,15 +227,7 @@ class TestPortfolioCommand:
         result = runner.invoke(app, ["portfolio", str(tmp_path), "--output-format", "csv"])
         assert result.exit_code == 0
         mock_run_portfolio.assert_called_once_with(
-            output_format="csv", output_dir=tmp_path, countries=None, end_date=None
-        )
-
-    @patch("jkp.data.portfolio.run_portfolio")
-    def test_portfolio_country_filter(self, mock_run_portfolio, tmp_path):
-        result = runner.invoke(app, ["portfolio", str(tmp_path), "--country", "usa"])
-        assert result.exit_code == 0
-        mock_run_portfolio.assert_called_once_with(
-            output_format="parquet", output_dir=tmp_path, countries=["usa"], end_date=None
+            output_format="csv", output_dir=tmp_path, end_date=None
         )
 
     @patch("jkp.data.portfolio.run_portfolio")
@@ -267,6 +240,10 @@ class TestPortfolioCommand:
 
     def test_portfolio_missing_output_dir(self):
         result = runner.invoke(app, ["portfolio"])
+        assert result.exit_code != 0
+
+    def test_portfolio_country_option_is_not_supported(self, tmp_path):
+        result = runner.invoke(app, ["portfolio", str(tmp_path), "--country", "ISR"])
         assert result.exit_code != 0
 
 

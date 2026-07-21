@@ -14,11 +14,37 @@ import polars as pl
 import pytest
 
 from jkp.data.aux_functions import (
+    _ensure_ff_portfolio_columns,
     aug_msf_v2,
     gen_crsp_sf,
     merge_roll_apply_daily_results,
     prepare_daily,
 )
+
+
+def test_ff_portfolio_pivot_adds_missing_buckets_as_typed_nulls() -> None:
+    """Sparse country samples must not fail when a size/characteristic bucket is absent."""
+    pivoted = pl.DataFrame(
+        {
+            "excntry": ["ISR"],
+            "big_low": [0.01],
+            "big_mid": [0.02],
+            "big_high": [0.03],
+        }
+    )
+
+    result = _ensure_ff_portfolio_columns(pivoted)
+
+    assert {
+        "small_low",
+        "small_mid",
+        "small_high",
+        "big_low",
+        "big_mid",
+        "big_high",
+    }.issubset(result.columns)
+    assert result.schema["small_high"] == pl.Float64
+    assert result["small_high"].to_list() == [None]
 
 
 def _write_lookup_tables(raw_tables: Path) -> None:

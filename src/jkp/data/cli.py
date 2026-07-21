@@ -81,18 +81,11 @@ def build(
         help="Also emit the alpha-beta production CSVs (per-country monthly + daily). "
         "Defaults to config.PRODUCTION_OUTPUT when not specified.",
     ),
-    country: list[str] | None = typer.Option(
-        None,
-        "--country",
-        "-c",
-        help="Restrict downstream build outputs to one ISO-3 country code. "
-        "Repeat for multiple countries, e.g. -c USA -c ISR.",
-    ),
     start_date: str | None = typer.Option(
         None,
         "--start-date",
         help="Earliest database source date to download, as YYYY-MM-DD. "
-        "Defaults to config.START_DATE.",
+        "Defaults to config.ACCOUNTING_START_DATE.",
     ),
     end_date: str | None = typer.Option(
         None,
@@ -121,7 +114,6 @@ def build(
         output_dir=output_dir,
         bypass_crsp=BYPASS_CRSP if bypass_crsp is None else bypass_crsp,
         production_output=PRODUCTION_OUTPUT if production_output is None else production_output,
-        countries=country,
         start_date=_parse_iso_date(start_date, "--start-date"),
         end_date=_parse_iso_date(end_date, "--end-date"),
         compustat_source=compustat_source,
@@ -138,13 +130,6 @@ def portfolio(
         "--output-format",
         help="Output file format.",
     ),
-    country: list[str] | None = typer.Option(
-        None,
-        "--country",
-        "-c",
-        help="Restrict portfolio generation to one ISO-3 country code. "
-        "Repeat for multiple countries.",
-    ),
     end_date: str | None = typer.Option(
         None,
         "--end-date",
@@ -157,7 +142,6 @@ def portfolio(
     run_portfolio(
         output_format=output_format.value,
         output_dir=output_dir,
-        countries=country,
         end_date=_parse_iso_date(end_date, "--end-date"),
     )
 

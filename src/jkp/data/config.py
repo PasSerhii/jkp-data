@@ -1,18 +1,21 @@
-from datetime import date
+from datetime import date, timedelta
 
-import polars as pl
 
-# Last calendar date kept in pipeline outputs.
-END_DATE = date(2026, 5, 31)
+def _previous_month_end(today: date | None = None) -> date:
+    """Return the final calendar day of the month before ``today``."""
+    current_date = date.today() if today is None else today
+    return current_date.replace(day=1) - timedelta(days=1)
 
-# Earliest calendar date to download from WRDS (filters date-bearing source
-# tables to `>= START_DATE`). None means no lower bound (full history, ~1950).
-# Mirrors the modified SAS `update_mode=1` start_date.
-START_DATE: date | None = date(2000, 1, 1)
 
-# Earliest fiscal-period-end date kept when building the standardized
-# accounting panel; rows with `datadate` before this are dropped.
-ACCOUNTING_START_DATE = pl.datetime(1949, 12, 31)
+# Last completed calendar month kept in pipeline outputs. This is evaluated
+# once when the process starts so every stage of a run uses the same cutoff.
+END_DATE = _previous_month_end()
+
+# Single lower bound for date-bearing source downloads and the standardized
+# accounting panel. ``None`` downloads complete source history; the accounting
+# loader still falls back to the original 1949-12-31 floor in that case.
+# Use ``--start-date 2000-01-01`` to override this default for a bounded run.
+ACCOUNTING_START_DATE: date | None = date(1949, 12, 31)
 
 # Bypass CRSP entirely and build the dataset from Compustat only. When True the
 # pipeline skips all CRSP downloads/processing and mirrors the SAS `bypass_crsp=1`
