@@ -156,6 +156,7 @@ class PipelineRunMonitor:
                 "bypass_crsp",
                 "production_output",
                 "compustat_source",
+                "reuse_raw",
             )
             self._history_compatible = bool(history_config) and all(
                 history_config.get(key) == self._config.get(key) for key in compatibility_keys

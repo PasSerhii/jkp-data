@@ -98,6 +98,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -113,6 +114,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -128,6 +130,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -143,6 +146,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -158,6 +162,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -173,6 +178,7 @@ class TestBuildCommand:
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -198,7 +204,14 @@ class TestBuildCommand:
             end_date=date(2024, 12, 31),
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
+            reuse_raw=False,
         )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_reuses_raw_downloads(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--reuse-raw"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["reuse_raw"] is True
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_wrds_source(self, mock_run_pipeline, tmp_path):

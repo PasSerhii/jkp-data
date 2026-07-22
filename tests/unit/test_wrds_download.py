@@ -374,3 +374,50 @@ class TestDailyCompustatBatching:
         assert "gvkey = '001234' AND iid = '01'" in copy_sql[0]
         assert "gvkey = '005678' AND iid = '02'" in copy_sql[0]
         assert (tmp_path / "comp_secd_parts").is_dir()
+
+
+class TestReusableRawValidation:
+    """Recovery runs must reject incomplete daily batch datasets."""
+
+    @staticmethod
+    def _write_complete_fixture(tmp_path, monkeypatch):
+        import polars as pl
+
+        import jkp.data.aux_functions as aux
+        from jkp.data.paths import DataPaths
+
+        paths = DataPaths(base_dir=tmp_path)
+        paths.raw_tables_dir.mkdir(parents=True)
+        monkeypatch.setattr(aux, "DAILY_COMPUSTAT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            ("comp.security", "comp.g_security", "comp.secd", "comp.g_secd"),
+        )
+        header = pl.DataFrame(
+            {"gvkey": ["001", "002", "003"], "iid": ["01", "01", "02"]}
+        )
+        for table in ("comp_security", "comp_g_security"):
+            header.write_parquet(paths.raw_tables_dir / f"{table}.parquet")
+        for table in ("comp_secd", "comp_g_secd"):
+            parts_dir = paths.raw_tables_dir / f"{table}_parts"
+            parts_dir.mkdir()
+            for number in (1, 2):
+                (parts_dir / f"part-{number:06d}.parquet").write_bytes(b"data")
+        (paths.raw_tables_dir / "comp_age_anchor.parquet").write_bytes(b"data")
+        return paths
+
+    def test_complete_daily_parts_are_reusable(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_missing_daily_part_is_rejected(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        (paths.raw_tables_dir / "comp_secd_parts" / "part-000002.parquet").unlink()
+
+        with pytest.raises(RuntimeError, match="comp.secd has 1 parts; expected 2"):
+            validate_reusable_raw_data(paths, bypass_crsp=True)

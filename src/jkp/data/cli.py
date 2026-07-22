@@ -69,6 +69,11 @@ def build(
         "-f",
         help="Overwrite existing data in output directory without prompting.",
     ),
+    reuse_raw: bool = typer.Option(
+        False,
+        "--reuse-raw",
+        help="Validate and reuse existing raw Parquets, skipping source downloads.",
+    ),
     bypass_crsp: bool | None = typer.Option(
         None,
         "--bypass-crsp/--no-bypass-crsp",
@@ -124,6 +129,7 @@ def build(
         end_date=_parse_iso_date(end_date, "--end-date"),
         compustat_source=compustat_source,
         metrics_interval_seconds=metrics_interval_seconds,
+        reuse_raw=reuse_raw,
     )
 
 

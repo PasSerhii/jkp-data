@@ -45,6 +45,7 @@ from .aux_functions import (
     save_output_files,
     setup_folder_structure,
     standardized_accounting_data,
+    validate_reusable_raw_data,
 )
 from .config import (
     ACCOUNTING_START_DATE as DEFAULT_ACCOUNTING_START_DATE,
@@ -75,6 +76,7 @@ def run_pipeline(
     end_date: date | None = None,
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
     metrics_interval_seconds: float = 60.0,
+    reuse_raw: bool = False,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -128,6 +130,7 @@ def run_pipeline(
         compustat_source=source.value,
         persistent_connection=persistent_connection,
         metrics_interval_seconds=metrics_interval_seconds,
+        reuse_raw=reuse_raw,
     )
 
     interim = paths.interim_dir
@@ -135,18 +138,22 @@ def run_pipeline(
     monitor.set_phase("initialization")
     setup_folder_structure(paths)
     monitor.set_phase("source_download")
-    download_raw_data_tables(
-        paths,
-        username=username,
-        password=password,
-        connection_info=source_connection_info,
-        source_label=source_label,
-        raw_schema=raw_schema,
-        end_date=effective_end_date,
-        persistent_connection=persistent_connection,
-        bypass_crsp=bypass_crsp,
-        start_date=effective_start_date,
-    )
+    if reuse_raw:
+        monitor.note("Validating and reusing existing raw source downloads")
+        validate_reusable_raw_data(paths, bypass_crsp=bypass_crsp)
+    else:
+        download_raw_data_tables(
+            paths,
+            username=username,
+            password=password,
+            connection_info=source_connection_info,
+            source_label=source_label,
+            raw_schema=raw_schema,
+            end_date=effective_end_date,
+            persistent_connection=persistent_connection,
+            bypass_crsp=bypass_crsp,
+            start_date=effective_start_date,
+        )
     monitor.set_phase("security_panels")
     gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
     prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)

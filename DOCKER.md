@@ -188,6 +188,14 @@ cat "/mnt/jkp-data/run_logs/$RUN_ID/run_summary.json"
 docker rm jkp-monthly
 ```
 
+If a run fails after `download_raw_data_tables` completed, retain the `raw/`
+directory, remove or archive the partial `interim/` and `processed/`
+directories, and restart with `--reuse-raw --force`. The recovery option
+validates all required source files and verifies that the `secd` and `g_secd`
+part sequences match their complete security-pair universes before it skips
+the database download. It fails closed when any input or daily part is
+missing or empty.
+
 The EC2 security group must be allowed to reach the XpressFeed RDS on port
 5432. No VPN is required when routing and security groups permit private VPC
 access.

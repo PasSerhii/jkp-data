@@ -38,6 +38,42 @@ def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) ->
     assert download.call_args.kwargs["start_date"] == date(1949, 12, 31)
 
 
+def test_reuse_raw_validates_inputs_and_skips_download(monkeypatch, tmp_path) -> None:
+    download = MagicMock()
+    validate = MagicMock()
+    monkeypatch.setattr(pipeline, "download_raw_data_tables", download)
+    monkeypatch.setattr(pipeline, "validate_reusable_raw_data", validate)
+    monkeypatch.setattr(pipeline, "setup_folder_structure", MagicMock())
+    monkeypatch.setattr(
+        pipeline,
+        "gen_raw_data_dfs",
+        MagicMock(side_effect=RuntimeError("stop after raw validation")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_xpressfeed_connection_info",
+        MagicMock(return_value="postgresql://private-rds"),
+    )
+
+    try:
+        pipeline.run_pipeline(
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=False,
+            compustat_source="xpressfeed",
+            reuse_raw=True,
+        )
+    except RuntimeError as error:
+        assert str(error) == "stop after raw validation"
+    else:
+        raise AssertionError("pipeline should have stopped after raw validation")
+
+    validate.assert_called_once_with(
+        pipeline.DataPaths(base_dir=tmp_path.resolve()), bypass_crsp=True
+    )
+    download.assert_not_called()
+
+
 def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) -> None:
     step_names = (
         "setup_folder_structure",

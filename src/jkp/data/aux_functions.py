@@ -105,6 +105,38 @@ DAILY_COMPUSTAT_PAIR_HEADERS = {
 }
 DAILY_COMPUSTAT_BATCH_SIZE = 250
 
+REUSABLE_COMPUSTAT_TABLES: tuple[str, ...] = (
+    "comp.exrt_dly",
+    "ff.factors_monthly",
+    "comp.g_security",
+    "comp.security",
+    "comp.r_ex_codes",
+    "comp.g_sec_history",
+    "comp.sec_history",
+    "comp.company",
+    "comp.g_company",
+    "comp.funda",
+    "comp.fundq",
+    "comp.secm",
+    "comp.g_co_hgic",
+    "comp.g_funda",
+    "comp.co_hgic",
+    "comp.g_fundq",
+    "comp.secd",
+    "comp.g_secd",
+)
+
+REUSABLE_CRSP_TABLES: tuple[str, ...] = (
+    "crsp.stksecurityinfohist",
+    "crsp.stkissuerinfohist",
+    "crsp.ccmxpf_lnkhist",
+    "crsp.stkdelists",
+    "crsp.indmthseriesdata_ind",
+    "crsp.indseriesinfohdr_ind",
+    "crsp.msf_v2",
+    "crsp.dsf_v2",
+)
+
 
 def fl_none():
     return pl.lit(None).cast(pl.Float64)
@@ -966,6 +998,66 @@ def load_security_pairs(
         ORDER BY 1, 2
     """).fetchall()
     return [(str(gvkey).rstrip(), str(iid).rstrip()) for gvkey, iid in rows]
+
+
+@measure_time
+def validate_reusable_raw_data(paths: DataPaths, *, bypass_crsp: bool) -> None:
+    """Reject incomplete raw inputs before a recovery run skips downloading.
+
+    Daily Compustat datasets receive an additional completeness check: their
+    sequential part count must equal the distinct security-pair universe at
+    the downloader's frozen batch size.
+    """
+    required_tables = list(REUSABLE_COMPUSTAT_TABLES)
+    if not bypass_crsp:
+        required_tables.extend(REUSABLE_CRSP_TABLES)
+
+    problems: list[str] = []
+    for table in required_tables:
+        source = paths.raw_table_source(table)
+        if isinstance(source, Path):
+            if not source.is_file() or source.stat().st_size == 0:
+                problems.append(f"missing or empty {source.name}")
+            continue
+
+        parts = sorted(Path(source).parent.glob(Path(source).name))
+        if not parts:
+            problems.append(f"missing parts for {table}")
+        elif any(part.stat().st_size == 0 for part in parts):
+            problems.append(f"empty part for {table}")
+
+    age_anchor = paths.raw_tables_dir / "comp_age_anchor.parquet"
+    if not age_anchor.is_file() or age_anchor.stat().st_size == 0:
+        problems.append(f"missing or empty {age_anchor.name}")
+
+    con = duckdb.connect(":memory:")
+    try:
+        for table, header in DAILY_COMPUSTAT_PAIR_HEADERS.items():
+            header_source = paths.raw_table_source(header)
+            if not isinstance(header_source, Path) or not header_source.is_file():
+                continue
+            pair_count = len(load_security_pairs(con, header_source))
+            expected_count = (pair_count + DAILY_COMPUSTAT_BATCH_SIZE - 1) // (
+                DAILY_COMPUSTAT_BATCH_SIZE
+            )
+            parts_dir = paths.raw_tables_dir / f"{table.replace('.', '_')}_parts"
+            actual_parts = sorted(parts_dir.glob("part-*.parquet"))
+            expected_names = [
+                f"part-{number:06d}.parquet" for number in range(1, expected_count + 1)
+            ]
+            if [part.name for part in actual_parts] != expected_names:
+                problems.append(
+                    f"{table} has {len(actual_parts):,} parts; expected "
+                    f"{expected_count:,} complete sequential parts"
+                )
+    finally:
+        con.close()
+
+    if problems:
+        details = "; ".join(problems)
+        raise RuntimeError(
+            "Cannot reuse raw downloads because validation failed: " + details
+        )
 
 
 def _pair_where_clause(
