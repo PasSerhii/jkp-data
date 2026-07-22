@@ -42,6 +42,25 @@ class TestBuildProjection:
         assert "TRY_CAST(sic AS BIGINT) AS sic" in result
         assert "TRY_CAST(sich AS BIGINT) AS sich" in result
 
+    def test_selected_columns_are_projected_in_contract_order(self):
+        """A selected projection should omit every unused source column."""
+        from jkp.data.aux_functions import build_projection
+
+        result = build_projection(
+            ["gvkey", "iid", "datadate", "unused"],
+            ("gvkey", "iid", "datadate"),
+        )
+
+        assert result == '"gvkey", "iid", "datadate"'
+        assert "unused" not in result
+
+    def test_selected_columns_must_exist(self):
+        """A source schema change should fail before a partial download starts."""
+        from jkp.data.aux_functions import build_projection
+
+        with pytest.raises(RuntimeError, match="missing required columns: trfd"):
+            build_projection(["gvkey", "iid"], ("gvkey", "iid", "trfd"))
+
 
 class TestGenWrdsConnectionInfo:
     """Tests for gen_wrds_connection_info() function."""
@@ -60,6 +79,34 @@ class TestGenWrdsConnectionInfo:
         assert "sslmode=require" in result
 
 
+class TestStatementTimeoutConnectionInfo:
+    """Tests for applying the RDS session guardrail at connection startup."""
+
+    def test_adds_encoded_option_to_uri(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db")
+        assert result.endswith("?options=-c%20statement_timeout%3D300000")
+
+    def test_preserves_existing_uri_query(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db?sslmode=require")
+        assert "&options=-c%20statement_timeout%3D300000" in result
+
+    def test_adds_option_to_keyword_dsn(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("host=example dbname=wrds")
+        assert result.endswith(" options='-c statement_timeout=300000'")
+
+    def test_does_not_replace_existing_options(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        original = "postgresql://example/db?options=-c%20statement_timeout%3D120000"
+        assert with_pg_statement_timeout(original) == original
+
+
 class TestDownloadRawDataTablesBranching:
     """Tests for download_raw_data_tables() branching logic.
 
@@ -70,11 +117,22 @@ class TestDownloadRawDataTablesBranching:
     @pytest.fixture
     def mock_duckdb(self):
         """Create a mock DuckDB connection."""
-        with patch("jkp.data.aux_functions.duckdb") as mock:
+        from jkp.data.aux_functions import LARGE_COMPUSTAT_COLUMNS
+
+        available_columns = sorted(
+            {column for columns in LARGE_COMPUSTAT_COLUMNS.values() for column in columns}
+        )
+        with (
+            patch("jkp.data.aux_functions.duckdb") as mock,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
+        ):
             mock_conn = MagicMock()
             mock.connect.return_value = mock_conn
             mock_result = MagicMock()
-            mock_result.description = [("col1",), ("col2",)]
+            mock_result.description = [(column,) for column in available_columns]
             mock_conn.execute.return_value = mock_result
             yield mock, mock_conn
 
@@ -244,3 +302,71 @@ class TestDownloadWrdsTableAttached:
         assert "wrds.crsp.msf" in copy_sql
         assert "/tmp/test.parquet" in copy_sql
         assert "FORMAT PARQUET" in copy_sql
+
+    def test_selected_columns_replace_wildcard(self):
+        """Large-table downloads should transfer only their frozen contract."""
+        from jkp.data.aux_functions import download_wrds_table_attached
+
+        mock_conn = MagicMock()
+        mock_result = MagicMock()
+        mock_result.description = [("gvkey",), ("iid",), ("datadate",), ("unused",)]
+        mock_conn.execute.return_value = mock_result
+
+        download_wrds_table_attached(
+            mock_conn,
+            "source",
+            "comp.secm",
+            "/tmp/secm.parquet",
+            selected_columns=("gvkey", "iid", "datadate"),
+        )
+
+        copy_sql = [
+            call.args[0] for call in mock_conn.execute.call_args_list if "COPY" in call.args[0]
+        ][0]
+        assert 'SELECT "gvkey", "iid", "datadate"' in copy_sql
+        assert "unused" not in copy_sql
+
+
+class TestDailyCompustatBatching:
+    """Tests for pair-indexed daily view extraction."""
+
+    def test_pair_clause_uses_scalar_predicates_and_dates(self):
+        from jkp.data.aux_functions import _pair_where_clause
+
+        result = _pair_where_clause(
+            [("001234", "01"), ("005678", "02W")],
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+        )
+
+        assert "gvkey = '001234' AND iid = '01'" in result
+        assert "gvkey = '005678' AND iid = '02W'" in result
+        assert "datadate >= '2000-01-01'" in result
+        assert "datadate <= '2026-06-30'" in result
+        assert "IN (" not in result
+
+    def test_download_writes_one_part_per_pair_batch(self, tmp_path):
+        from jkp.data.aux_functions import _download_pair_batches
+
+        conn = MagicMock()
+        filename = str(tmp_path / "comp_secd.parquet")
+        _download_pair_batches(
+            conn,
+            "source_db.comp.secd",
+            '"gvkey", "iid", "datadate"',
+            [("001234", "01"), ("005678", "02"), ("009999", "01")],
+            filename,
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+            batch_size=2,
+        )
+
+        copy_sql = [call.args[0] for call in conn.execute.call_args_list]
+        assert len(copy_sql) == 2
+        assert "part-000001.parquet" in copy_sql[0]
+        assert "part-000002.parquet" in copy_sql[1]
+        assert "009999" not in copy_sql[0]
+        assert "009999" in copy_sql[1]
+        assert (tmp_path / "comp_secd_parts").is_dir()

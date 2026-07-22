@@ -1,0 +1,34 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.claude
+.debug-output
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+
+# Licensed/generated data must never enter the image or ECR build context.
+data
+raw
+interim
+processed
+*.parquet
+*.csv
+*.ddb
+
+# Development and validation material is not required at runtime.
+tests
+sql
+documentation
+slurm
+*.md
+!README.md
+Dockerfile*
+!Dockerfile
+compose*.yml
+compose*.yaml

@@ -102,6 +102,12 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
 When the code is finished, you can find the output in the `processed/` subdirectory of your output directory (e.g. `data/processed/`).
 Please see the release notes (`documentation/release_notes.html`) for a description of the output files and a comparison between the output of the SAS/R codebase and the new Python codebase.
 
+### Docker and AWS
+
+For a reproducible container build, mounted-output layout, and Amazon ECR/EC2
+commands, see [DOCKER.md](DOCKER.md). Credentials and licensed/generated data
+are excluded from the image and Docker build context.
+
 ## Notes
 - By default, output files are written in Parquet format. To output CSV files instead (with quoted strings to preserve leading zeros in identifiers like `gvkey`), run:
   ```sh

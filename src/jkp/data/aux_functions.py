@@ -23,6 +23,87 @@ from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
 from .output_writer import write_dataframe
 from .paths import DataPaths
 
+# Frozen pipeline input contract for the three largest Compustat downloads.
+# Keeping the projection here makes the production downloader independent of
+# validation scripts and prevents unused WRDS-compatibility columns from being
+# transferred to every run.
+LARGE_COMPUSTAT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "comp.secd": (
+        "ajexdi",
+        "conm",
+        "cshoc",
+        "cshtrd",
+        "curcdd",
+        "curcddv",
+        "cusip",
+        "datadate",
+        "div",
+        "divd",
+        "divsp",
+        "exchg",
+        "gvkey",
+        "iid",
+        "prccd",
+        "prchd",
+        "prcld",
+        "prcod",
+        "prcstd",
+        "tpci",
+        "trfd",
+    ),
+    "comp.g_secd": (
+        "ajexdi",
+        "conm",
+        "cshoc",
+        "cshtrd",
+        "curcdd",
+        "curcddv",
+        "datadate",
+        "div",
+        "divd",
+        "divsp",
+        "exchg",
+        "gvkey",
+        "iid",
+        "isin",
+        "monthend",
+        "prccd",
+        "prchd",
+        "prcld",
+        "prcod",
+        "prcstd",
+        "qunit",
+        "sedol",
+        "tpci",
+        "trfd",
+    ),
+    "comp.secm": (
+        "ajexm",
+        "csfsm",
+        "cshom",
+        "cshoq",
+        "cshtrm",
+        "curcddvm",
+        "curcdm",
+        "datadate",
+        "dvpsxm",
+        "exchg",
+        "gvkey",
+        "iid",
+        "prccm",
+        "prchm",
+        "prclm",
+        "tpci",
+        "trfm",
+    ),
+}
+
+DAILY_COMPUSTAT_PAIR_HEADERS = {
+    "comp.secd": "comp.security",
+    "comp.g_secd": "comp.g_security",
+}
+DAILY_COMPUSTAT_BATCH_SIZE = 250
+
 
 def fl_none():
     return pl.lit(None).cast(pl.Float64)
@@ -704,6 +785,17 @@ def gen_wrds_connection_info(user, password):
     )
 
 
+def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 300_000) -> str:
+    """Add a PostgreSQL startup timeout without exposing or reparsing credentials."""
+    if re.search(r"(^|[?&\s])options=", conninfo):
+        return conninfo
+    option = f"-c%20statement_timeout%3D{timeout_ms}"
+    if "://" in conninfo:
+        separator = "&" if "?" in conninfo else "?"
+        return f"{conninfo}{separator}options={option}"
+    return f"{conninfo} options='-c statement_timeout={timeout_ms}'"
+
+
 def get_columns(conn, conninfo, lib, table):
     cols = conn.execute(f"""
         SELECT *
@@ -731,11 +823,12 @@ def download_wrds_table_attached(
     date_column: str | None = None,
     end_date: date | None = None,
     start_date: date | None = None,
+    selected_columns: tuple[str, ...] | None = None,
 ):
     """Download a WRDS table using an attached persistent connection."""
     lib, table = table_name.split(".")
     cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
-    projection = build_projection(cols)
+    projection = build_projection(cols, selected_columns)
 
     where_clause = _where_clause(date_column, start_date, end_date)
 
@@ -791,7 +884,14 @@ def _pg_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def build_projection(cols):
+def build_projection(cols, selected_columns: tuple[str, ...] | None = None):
+    """Build a DuckDB projection, optionally limited to required columns."""
+    if selected_columns is not None:
+        missing = [column for column in selected_columns if column not in cols]
+        if missing:
+            raise RuntimeError(f"Source table is missing required columns: {', '.join(missing)}")
+        return ", ".join(_pg_ident(column) for column in selected_columns)
+
     casts = []
     if "permno" in cols:
         casts.append("TRY_CAST(permno AS BIGINT) AS permno")
@@ -816,10 +916,11 @@ def download_wrds_table(
     date_column: str | None = None,
     end_date: date | None = None,
     start_date: date | None = None,
+    selected_columns: tuple[str, ...] | None = None,
 ) -> None:
     lib, table = table_name.split(".")
     cols = get_columns(duckdb_conn, conninfo, lib, table)
-    projection = build_projection(cols)
+    projection = build_projection(cols, selected_columns)
 
     where_clause = _where_clause(date_column, start_date, end_date)
 
@@ -831,6 +932,145 @@ def download_wrds_table(
         )
         TO '{filename}' (FORMAT PARQUET);
     """)
+
+
+def load_security_pairs(
+    duckdb_conn: duckdb.DuckDBPyConnection, header_source: Path | str
+) -> list[tuple[str, str]]:
+    """Load the complete distinct security-pair universe from a local header Parquet."""
+    rows = duckdb_conn.execute(f"""
+        SELECT DISTINCT CAST(gvkey AS VARCHAR), CAST(iid AS VARCHAR)
+        FROM read_parquet({_sql_literal(str(header_source))})
+        WHERE gvkey IS NOT NULL AND iid IS NOT NULL
+        ORDER BY 1, 2
+    """).fetchall()
+    return [(str(gvkey).rstrip(), str(iid).rstrip()) for gvkey, iid in rows]
+
+
+def _pair_where_clause(
+    pairs: list[tuple[str, str]],
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+) -> str:
+    """Build scalar pair predicates that PostgreSQL can push into raw key indexes."""
+    pair_predicate = " OR ".join(
+        f"(gvkey = {_sql_literal(gvkey)} AND iid = {_sql_literal(iid)})" for gvkey, iid in pairs
+    )
+    conditions = [f"({pair_predicate})"]
+    date_filter = _where_clause(date_column, start_date, end_date)
+    if date_filter:
+        conditions.append(date_filter.removeprefix("WHERE "))
+    return "WHERE " + " AND ".join(conditions)
+
+
+def _prepare_batch_directory(filename: str) -> Path:
+    """Create a clean Parquet-parts directory beside the legacy single file."""
+    legacy_file = Path(filename)
+    parts_dir = legacy_file.with_name(f"{legacy_file.stem}_parts")
+    if legacy_file.exists():
+        legacy_file.unlink()
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True)
+    return parts_dir
+
+
+def _download_pair_batches(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    relation: str,
+    projection: str,
+    pairs: list[tuple[str, str]],
+    filename: str,
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+    batch_size: int,
+) -> None:
+    """Copy pair-filtered remote relation batches to a local Parquet dataset."""
+    if not pairs:
+        raise RuntimeError("No security pairs were found for the daily Compustat download")
+    parts_dir = _prepare_batch_directory(filename)
+    total_batches = (len(pairs) + batch_size - 1) // batch_size
+    for offset in range(0, len(pairs), batch_size):
+        batch = pairs[offset : offset + batch_size]
+        batch_number = offset // batch_size + 1
+        where_clause = _pair_where_clause(batch, date_column, start_date, end_date)
+        part_file = parts_dir / f"part-{batch_number:06d}.parquet"
+        duckdb_conn.execute(f"""
+            COPY (
+              SELECT {projection}
+              FROM {relation}
+              {where_clause}
+            )
+            TO {_sql_literal(str(part_file))} (FORMAT PARQUET);
+        """)
+        if batch_number == 1 or batch_number % 25 == 0 or batch_number == total_batches:
+            print(
+                f"  completed daily batch {batch_number:,}/{total_batches:,}",
+                flush=True,
+            )
+
+
+def download_wrds_daily_table_batched_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    table_name: str,
+    filename: str,
+    pairs: list[tuple[str, str]],
+    selected_columns: tuple[str, ...],
+    date_column: str = "datadate",
+    start_date: date | None = None,
+    end_date: date | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+) -> None:
+    """Download a daily Compustat view in pair-indexed batches via ATTACH."""
+    lib, table = table_name.split(".")
+    cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
+    projection = build_projection(cols, selected_columns)
+    _download_pair_batches(
+        duckdb_conn,
+        f"{db_alias}.{lib}.{table}",
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+    )
+
+
+def download_wrds_daily_table_batched(
+    conninfo: str,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    filename: str,
+    pairs: list[tuple[str, str]],
+    selected_columns: tuple[str, ...],
+    date_column: str = "datadate",
+    start_date: date | None = None,
+    end_date: date | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+) -> None:
+    """Download a daily Compustat view in pair-indexed postgres_scan batches."""
+    lib, table = table_name.split(".")
+    cols = get_columns(duckdb_conn, conninfo, lib, table)
+    projection = build_projection(cols, selected_columns)
+    relation = (
+        f"postgres_scan({_sql_literal(conninfo)}, {_sql_literal(lib)}, {_sql_literal(table)})"
+    )
+    _download_pair_batches(
+        duckdb_conn,
+        relation,
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+    )
 
 
 def build_compustat_age_anchor_query(raw_schema: str) -> str:
@@ -957,7 +1197,8 @@ def download_raw_data_tables(
            list of library.tables.
         2) For each table: download to raw_tables/lib_table.parquet, applying date filtering
            to [start_date, end_date] (either bound optional) when the table has a known
-           date column.
+           date column. SECD/G_SECD are pair-batched into Parquet datasets; the three
+           large Compustat tables transfer only pipeline-consumed columns.
         3) If persistent_connection: ATTACH a single postgres connection and download all tables.
            Otherwise: use postgres_scan() which creates a new connection per query.
         4) Disconnect.
@@ -1024,10 +1265,13 @@ def download_raw_data_tables(
 
     if connection_info is None:
         if not username or not password:
-            raise ValueError("WRDS username and password are required when connection_info is absent")
+            raise ValueError(
+                "WRDS username and password are required when connection_info is absent"
+            )
         source_connection_info = gen_wrds_connection_info(username, password)
     else:
         source_connection_info = connection_info
+    source_connection_info = with_pg_statement_timeout(source_connection_info)
     con = duckdb.connect(":memory:")
     con.execute("INSTALL postgres; LOAD postgres;")
 
@@ -1047,16 +1291,35 @@ def download_raw_data_tables(
             for table in table_names:
                 filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
                 print(f"Downloading {source_label} table {table}...", flush=True)
+                selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
+                pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
+                pairs: list[tuple[str, str]] | None = None
                 try:
-                    download_wrds_table_attached(
-                        con,
-                        "source_db",
-                        table,
-                        filename,
-                        date_column=date_columns.get(table),
-                        end_date=end_date,
-                        start_date=start_date,
-                    )
+                    if pair_header is not None:
+                        assert selected_columns is not None
+                        pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
+                        download_wrds_daily_table_batched_attached(
+                            con,
+                            "source_db",
+                            table,
+                            filename,
+                            pairs,
+                            selected_columns,
+                            date_column=date_columns[table],
+                            end_date=end_date,
+                            start_date=start_date,
+                        )
+                    else:
+                        download_wrds_table_attached(
+                            con,
+                            "source_db",
+                            table,
+                            filename,
+                            date_column=date_columns.get(table),
+                            end_date=end_date,
+                            start_date=start_date,
+                            selected_columns=selected_columns,
+                        )
                 except Exception as e:
                     if e.__class__.__name__ != "OutOfMemoryException":
                         _raise_redacted_source_error(source_label, f"download of {table}", e)
@@ -1066,15 +1329,34 @@ def download_raw_data_tables(
                         "retrying with postgres_scan."
                     )
                     try:
-                        download_wrds_table(
-                            source_connection_info,
-                            con,
-                            table,
-                            filename,
-                            date_column=date_columns.get(table),
-                            end_date=end_date,
-                            start_date=start_date,
-                        )
+                        if pair_header is not None:
+                            assert selected_columns is not None
+                            if pairs is None:
+                                pairs = load_security_pairs(
+                                    con, paths.raw_table_source(pair_header)
+                                )
+                            download_wrds_daily_table_batched(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                pairs,
+                                selected_columns,
+                                date_column=date_columns[table],
+                                end_date=end_date,
+                                start_date=start_date,
+                            )
+                        else:
+                            download_wrds_table(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                date_column=date_columns.get(table),
+                                end_date=end_date,
+                                start_date=start_date,
+                                selected_columns=selected_columns,
+                            )
                     except Exception as retry_error:
                         _raise_redacted_source_error(
                             source_label, f"fallback download of {table}", retry_error
@@ -1095,16 +1377,35 @@ def download_raw_data_tables(
         # Use postgres_scan() which creates a new connection per query (default)
         for table in table_names:
             print(f"Downloading {source_label} table {table}...", flush=True)
+            filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
+            selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
+            pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
             try:
-                download_wrds_table(
-                    source_connection_info,
-                    con,
-                    table,
-                    str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet")),
-                    date_column=date_columns.get(table),
-                    end_date=end_date,
-                    start_date=start_date,
-                )
+                if pair_header is not None:
+                    assert selected_columns is not None
+                    pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
+                    download_wrds_daily_table_batched(
+                        source_connection_info,
+                        con,
+                        table,
+                        filename,
+                        pairs,
+                        selected_columns,
+                        date_column=date_columns[table],
+                        end_date=end_date,
+                        start_date=start_date,
+                    )
+                else:
+                    download_wrds_table(
+                        source_connection_info,
+                        con,
+                        table,
+                        filename,
+                        date_column=date_columns.get(table),
+                        end_date=end_date,
+                        start_date=start_date,
+                        selected_columns=selected_columns,
+                    )
             except Exception as e:
                 _raise_redacted_source_error(source_label, f"download of {table}", e)
 
@@ -1386,11 +1687,11 @@ def gen_comp_dsf(paths: DataPaths):
     con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_dsf.ddb"), threads=os.cpu_count())
 
     compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
-    con.create_table("comp_g_secd", con.read_parquet(paths.raw_tables_dir / "comp_g_secd.parquet"))
+    con.create_table("comp_g_secd", con.read_parquet(paths.raw_table_source("comp.g_secd")))
     con.create_table(
         "__firm_shares2", con.read_parquet(paths.interim_dir / "__firm_shares2.parquet")
     )
-    con.create_table("comp_secd", con.read_parquet(paths.raw_tables_dir / "comp_secd.parquet"))
+    con.create_table("comp_secd", con.read_parquet(paths.raw_table_source("comp.secd")))
     con.create_table("fx", con.read_parquet(paths.interim_dir / "fx_data.parquet"))
 
     con.raw_sql("""
@@ -3583,9 +3884,7 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     c1 = (col("indfmt").is_in(["INDL", "FS"])) if mode == 1 else (col("indfmt") == "INDL")
     datafmt_val = "HIST_STD" if mode == 1 else "STD"
     popsrc_val = "I" if mode == 1 else "D"
-    accounting_start = (
-        pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
-    )
+    accounting_start = pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
     df = (
         pl.scan_parquet(filename)
         .with_row_index("n")

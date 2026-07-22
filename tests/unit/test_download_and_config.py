@@ -288,9 +288,7 @@ class TestDownloadWrdsTable:
             date_column=date_column,
             end_date=end_date,
         )
-        return "\n".join(
-            str(c.args[0]) for c in mock_conn.execute.call_args_list if c.args
-        )
+        return "\n".join(str(c.args[0]) for c in mock_conn.execute.call_args_list if c.args)
 
     def test_no_date_filter_when_params_absent(self):
         """SQL should have no WHERE clause when date_column and end_date are None."""
@@ -353,6 +351,13 @@ class TestDownloadRawDataTables:
             patch("jkp.data.aux_functions.gen_wrds_connection_info", return_value="host=test"),
             patch("jkp.data.aux_functions.duckdb") as mock_duckdb,
             patch("jkp.data.aux_functions.download_wrds_table") as mock_download,
+            patch(
+                "jkp.data.aux_functions.download_wrds_daily_table_batched"
+            ) as mock_daily_download,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
         ):
             mock_conn = MagicMock()
             mock_duckdb.connect.return_value = mock_conn
@@ -365,7 +370,8 @@ class TestDownloadRawDataTables:
                 "pass",
                 end_date=date(2025, 12, 31),
             )
-            yield mock_download.call_args_list
+            all_calls = mock_download.call_args_list + mock_daily_download.call_args_list
+            yield all_calls
 
     def test_date_filtered_tables_get_date_column(self, captured_calls):
         """Tables with known date columns should receive the date_column kwarg."""
@@ -429,6 +435,13 @@ class TestDownloadRawDataTables:
             patch("jkp.data.aux_functions.gen_wrds_connection_info", return_value="host=test"),
             patch("jkp.data.aux_functions.duckdb") as mock_duckdb,
             patch("jkp.data.aux_functions.download_wrds_table") as mock_download,
+            patch(
+                "jkp.data.aux_functions.download_wrds_daily_table_batched"
+            ) as mock_daily_download,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
         ):
             mock_duckdb.connect.return_value = MagicMock()
 
@@ -444,7 +457,7 @@ class TestDownloadRawDataTables:
 
         downloaded = {
             c.args[2] if len(c.args) > 2 else c.kwargs.get("table_name")
-            for c in mock_download.call_args_list
+            for c in mock_download.call_args_list + mock_daily_download.call_args_list
         }
         assert downloaded
         assert not any(t.startswith("crsp.") for t in downloaded)

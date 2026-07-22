@@ -40,6 +40,19 @@ class DataPaths:
         """SAS-compatible CSV output directory under processed/."""
         return self.processed_dir / "output"
 
+    def raw_table_source(self, table_name: str) -> Path | str:
+        """Return a file or Parquet glob for a downloaded source table.
+
+        Most source tables are stored as one ``<schema>_<table>.parquet``
+        file.  The very large daily Compustat tables are downloaded in
+        restart-sized parts and exposed to DuckDB/Polars as one glob.
+        """
+        stem = table_name.replace(".", "_")
+        parts_dir = self.raw_tables_dir / f"{stem}_parts"
+        if parts_dir.is_dir():
+            return str(parts_dir / "part-*.parquet")
+        return self.raw_tables_dir / f"{stem}.parquet"
+
 
 def _resource_path(filename: str) -> Path:
     """Return a filesystem Path to a bundled resource file.

@@ -204,7 +204,7 @@ def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
     comp.g_secd. Mirrors the joins in the SAS production macros.
     """
     secd = (
-        pl.scan_parquet(paths.raw_tables_dir / "comp_secd.parquet")
+        pl.scan_parquet(paths.raw_table_source("comp.secd"))
         .select(
             "gvkey",
             "iid",
@@ -216,7 +216,7 @@ def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
         .unique(["gvkey", "iid", "comp_exchg", "date"])
     )
     gsecd = (
-        pl.scan_parquet(paths.raw_tables_dir / "comp_g_secd.parquet")
+        pl.scan_parquet(paths.raw_table_source("comp.g_secd"))
         .select(
             "gvkey",
             "iid",
