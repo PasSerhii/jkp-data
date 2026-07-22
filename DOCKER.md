@@ -141,6 +141,53 @@ docker run --rm --name jkp-monthly \
   --start-date 2000-01-01
 ```
 
+For the first full run, keep the stopped container available for inspection and
+follow its progress from a second SSH session:
+
+```bash
+docker run -d --name jkp-monthly \
+  --env-file /secure/jkp.env \
+  --mount type=bind,source=/mnt/jkp-data,target=/data \
+  "$IMAGE" \
+  build /data \
+  --compustat-source xpressfeed \
+  --bypass-crsp \
+  --persistent-connection \
+  --start-date 2000-01-01 \
+  --metrics-interval 60
+
+docker logs --follow jkp-monthly
+```
+
+The build writes durable monitoring artifacts beneath
+`/mnt/jkp-data/run_logs/<run-id>/`:
+
+- `pipeline.log` records eight major phases, individual step start/end times,
+  overall elapsed time, and a resource heartbeat every sampling interval.
+- `resource_metrics.csv` records host and process CPU, CPU I/O wait, thread
+  count, load average, RAM, process RSS, swap, disk capacity, process/system
+  disk I/O, and network traffic.
+- `step_timings.csv` contains one row for every completed or failed timed step.
+- `run_summary.json` records status, configuration, phase durations, peak
+  resources, failure details, and host sizing.
+
+`run_logs/latest_run.txt` identifies the current run. A successful run also
+updates `run_logs/timing_history.json`. The next comparable run uses those
+phase durations to print an estimated remaining time. During the first run the
+ETA is explicitly shown as unavailable because no defensible history exists.
+The CSV and text files are flushed continuously, so the observations written
+before an out-of-memory termination remain on the mounted EBS volume.
+
+After the container exits, inspect its exit code and the final summary before
+removing it:
+
+```bash
+docker inspect jkp-monthly --format '{{.State.Status}} exit={{.State.ExitCode}}'
+RUN_ID=$(cat /mnt/jkp-data/run_logs/latest_run.txt)
+cat "/mnt/jkp-data/run_logs/$RUN_ID/run_summary.json"
+docker rm jkp-monthly
+```
+
 The EC2 security group must be allowed to reach the XpressFeed RDS on port
 5432. No VPN is required when routing and security groups permit private VPC
 access.

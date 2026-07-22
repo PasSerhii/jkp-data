@@ -97,6 +97,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -111,6 +112,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -125,6 +127,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -139,6 +142,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -153,6 +157,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -167,6 +172,7 @@ class TestBuildCommand:
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -191,6 +197,7 @@ class TestBuildCommand:
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
         )
 
     @patch("jkp.data.main.run_pipeline")

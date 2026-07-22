@@ -98,6 +98,12 @@ def build(
         "--compustat-source",
         help="Compustat source: XpressFeed RDS (default) or WRDS for regression runs.",
     ),
+    metrics_interval_seconds: float = typer.Option(
+        60.0,
+        "--metrics-interval",
+        min=1.0,
+        help="Seconds between persistent CPU, memory, disk, I/O, and network samples.",
+    ),
 ) -> None:
     """Run the full data generation pipeline."""
     from .config import BYPASS_CRSP, PRODUCTION_OUTPUT
@@ -117,6 +123,7 @@ def build(
         start_date=_parse_iso_date(start_date, "--start-date"),
         end_date=_parse_iso_date(end_date, "--end-date"),
         compustat_source=compustat_source,
+        metrics_interval_seconds=metrics_interval_seconds,
     )
 
 

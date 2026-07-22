@@ -34,6 +34,7 @@ dependencies = [
     "polars>=1.40",
     "polars-ds>=0.11.2",
     "polars-ols>=0.3.5",
+    "psutil>=5.9.0",
     "pyarrow>=16.1.0",
     "pycryptodomex>=3.23.0",
     "sqlalchemy>=1.4.49",

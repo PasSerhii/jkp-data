@@ -22,6 +22,7 @@ from polars import col
 from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
 from .output_writer import write_dataframe
 from .paths import DataPaths
+from .runtime_monitor import get_active_monitor
 
 # Frozen pipeline input contract for the three largest Compustat downloads.
 # Keeping the projection here makes the production downloader independent of
@@ -129,14 +130,25 @@ def measure_time(func):
     """
 
     def wrapper(*args, **kwargs):
+        monitor = get_active_monitor()
+        step_token = monitor.step_started(func.__name__) if monitor is not None else None
         start_time = time.time()
-        print(f"Function       : {func.__name__.upper()}", flush=True)
-        print(
-            f"Start          : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}",
-            flush=True,
-        )
-        result = func(*args, **kwargs)
+        if monitor is None:
+            print(f"Function       : {func.__name__.upper()}", flush=True)
+            print(
+                f"Start          : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}",
+                flush=True,
+            )
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as error:
+            if monitor is not None and step_token is not None:
+                monitor.step_finished(step_token, error)
+            raise
         end_time = time.time()
+        if monitor is not None and step_token is not None:
+            monitor.step_finished(step_token)
+            return result
         print(
             f"End            : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}",
             flush=True,
@@ -151,6 +163,15 @@ def measure_time(func):
         return result
 
     return wrapper
+
+
+def _report_progress(message: str) -> None:
+    """Write progress to the durable run log when a monitored build is active."""
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.note(message)
+    else:
+        print(message, flush=True)
 
 
 @measure_time
@@ -1006,10 +1027,7 @@ def _download_pair_batches(
             TO {_sql_literal(str(part_file))} (FORMAT PARQUET);
         """)
         if batch_number == 1 or batch_number % 25 == 0 or batch_number == total_batches:
-            print(
-                f"  completed daily batch {batch_number:,}/{total_batches:,}",
-                flush=True,
-            )
+            _report_progress(f"completed daily batch {batch_number:,}/{total_batches:,}")
 
 
 def download_wrds_daily_table_batched_attached(
@@ -1290,7 +1308,7 @@ def download_raw_data_tables(
         try:
             for table in table_names:
                 filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
-                print(f"Downloading {source_label} table {table}...", flush=True)
+                _report_progress(f"Downloading {source_label} table {table}")
                 selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
                 pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
                 pairs: list[tuple[str, str]] | None = None
@@ -1324,7 +1342,7 @@ def download_raw_data_tables(
                     if e.__class__.__name__ != "OutOfMemoryException":
                         _raise_redacted_source_error(source_label, f"download of {table}", e)
                     Path(filename).unlink(missing_ok=True)
-                    print(
+                    _report_progress(
                         f"Attached {source_label} download ran out of memory on {table}; "
                         "retrying with postgres_scan."
                     )
@@ -1361,7 +1379,7 @@ def download_raw_data_tables(
                         _raise_redacted_source_error(
                             source_label, f"fallback download of {table}", retry_error
                         )
-            print(f"Downloading {source_label} full-history age anchor...", flush=True)
+            _report_progress(f"Downloading {source_label} full-history age anchor")
             try:
                 download_compustat_age_anchor_attached(
                     con,
@@ -1376,7 +1394,7 @@ def download_raw_data_tables(
     else:
         # Use postgres_scan() which creates a new connection per query (default)
         for table in table_names:
-            print(f"Downloading {source_label} table {table}...", flush=True)
+            _report_progress(f"Downloading {source_label} table {table}")
             filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
             selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
             pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
@@ -1409,7 +1427,7 @@ def download_raw_data_tables(
             except Exception as e:
                 _raise_redacted_source_error(source_label, f"download of {table}", e)
 
-        print(f"Downloading {source_label} full-history age anchor...", flush=True)
+        _report_progress(f"Downloading {source_label} full-history age anchor")
         anchor_alias = "age_anchor_source"
         try:
             con.execute(
@@ -8915,7 +8933,7 @@ def roll_apply_daily(paths: DataPaths, stats, sfx, __min, end_date: date = END_D
     Output:
         Parquet with per-(id_int, group_number) rolling metrics for `stats`.
     """
-    print(f"Processing {stats} - {sfx.replace('_', '')} - {__min}", flush=True)
+    _report_progress(f"Processing {stats} - {sfx.replace('_', '')} - {__min}")
     aux_maps = gen_aux_maps(sfx, end_date=end_date)
     base_data = prepare_base_data(paths, stat=stats)
     results = pl.concat(

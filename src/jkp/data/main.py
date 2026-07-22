@@ -60,9 +60,11 @@ from .config import (
 from .database_sources import CompustatSource, get_xpressfeed_connection_info
 from .paths import DataPaths
 from .production import export_production
+from .runtime_monitor import get_active_monitor, monitor_pipeline
 from .wrds_credentials import get_wrds_credentials
 
 
+@monitor_pipeline
 def run_pipeline(
     *,
     persistent_connection: bool = False,
@@ -72,6 +74,7 @@ def run_pipeline(
     start_date: date | None = None,
     end_date: date | None = None,
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
+    metrics_interval_seconds: float = 60.0,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -114,9 +117,24 @@ def run_pipeline(
             f"start_date ({effective_start_date}) must be on or before end_date ({effective_end_date})"
         )
 
+    monitor = get_active_monitor()
+    if monitor is None:  # pragma: no cover - run_pipeline always installs one
+        raise RuntimeError("pipeline runtime monitor was not initialized")
+    monitor.configure(
+        start_date=effective_start_date,
+        end_date=effective_end_date,
+        bypass_crsp=bypass_crsp,
+        production_output=production_output,
+        compustat_source=source.value,
+        persistent_connection=persistent_connection,
+        metrics_interval_seconds=metrics_interval_seconds,
+    )
+
     interim = paths.interim_dir
 
+    monitor.set_phase("initialization")
     setup_folder_structure(paths)
+    monitor.set_phase("source_download")
     download_raw_data_tables(
         paths,
         username=username,
@@ -129,6 +147,7 @@ def run_pipeline(
         bypass_crsp=bypass_crsp,
         start_date=effective_start_date,
     )
+    monitor.set_phase("security_panels")
     gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
     prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)
     if not bypass_crsp:
@@ -137,6 +156,7 @@ def run_pipeline(
     combine_crsp_comp_sf(paths, bypass_crsp=bypass_crsp)
     if not bypass_crsp:
         crsp_industry(paths)
+    monitor.set_phase("market_returns")
     comp_industry(paths, end_date=effective_end_date)
     merge_industry_to_world_msf(paths, bypass_crsp=bypass_crsp)
     ff_ind_class(paths, interim / "__msf_world2.parquet")
@@ -162,6 +182,7 @@ def run_pipeline(
         interim / "return_cutoffs.parquet",
         interim / "nyse_cutoffs.parquet",
     )
+    monitor.set_phase("accounting_characteristics")
     standardized_accounting_data(
         paths, "world", 1, interim / "world_msf.parquet", 1, effective_start_date
     )
@@ -200,6 +221,7 @@ def run_pipeline(
         interim / "acc_chars_world.parquet",
         interim / "world_data_prelim.parquet",
     )
+    monitor.set_phase("factor_models")
     ap_factors(
         paths,
         interim / "ap_factors_daily.parquet",
@@ -253,6 +275,7 @@ def run_pipeline(
         1,
         end_date=effective_end_date,
     )
+    monitor.set_phase("daily_characteristics")
     bidask_hl(
         paths,
         interim / "corwin_schultz.parquet",
@@ -266,6 +289,7 @@ def run_pipeline(
             roll_apply_daily(paths, var, sfx, min_obs, end_date=effective_end_date)
     merge_roll_apply_daily_results(paths, end_date=effective_end_date)
     finish_daily_chars(paths, interim / "market_chars_d.parquet")
+    monitor.set_phase("final_outputs")
     merge_world_data_prelim(paths)
     quality_minus_junk(paths, interim / "world_data_-1.parquet", 10)
     merge_qmj_to_world_data(paths)
