@@ -1016,13 +1016,21 @@ def _download_pair_batches(
     for offset in range(0, len(pairs), batch_size):
         batch = pairs[offset : offset + batch_size]
         batch_number = offset // batch_size + 1
-        where_clause = _pair_where_clause(batch, date_column, start_date, end_date)
+        # A single WHERE clause containing hundreds of pair predicates makes
+        # PostgreSQL choose a plan that scans the large compatibility view and
+        # can exceed the five-minute statement timeout.  Separate UNION ALL
+        # branches retain one output file per batch while keeping every branch
+        # as an index-driven lookup on (gvkey, iid, datadate).
+        batch_query = "\nUNION ALL\n".join(
+            f"""SELECT {projection}
+              FROM {relation}
+              {_pair_where_clause([pair], date_column, start_date, end_date)}"""
+            for pair in batch
+        )
         part_file = parts_dir / f"part-{batch_number:06d}.parquet"
         duckdb_conn.execute(f"""
             COPY (
-              SELECT {projection}
-              FROM {relation}
-              {where_clause}
+              {batch_query}
             )
             TO {_sql_literal(str(part_file))} (FORMAT PARQUET);
         """)

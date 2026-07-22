@@ -369,4 +369,8 @@ class TestDailyCompustatBatching:
         assert "part-000002.parquet" in copy_sql[1]
         assert "009999" not in copy_sql[0]
         assert "009999" in copy_sql[1]
+        assert "UNION ALL" in copy_sql[0]
+        assert copy_sql[0].count("FROM source_db.comp.secd") == 2
+        assert "gvkey = '001234' AND iid = '01'" in copy_sql[0]
+        assert "gvkey = '005678' AND iid = '02'" in copy_sql[0]
         assert (tmp_path / "comp_secd_parts").is_dir()
