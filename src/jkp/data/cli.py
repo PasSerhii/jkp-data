@@ -95,8 +95,7 @@ def build(
     end_date: str | None = typer.Option(
         None,
         "--end-date",
-        help="Latest database source date to download, as YYYY-MM-DD. "
-        "Defaults to config.END_DATE.",
+        help="Latest database source date to download, as YYYY-MM-DD. Defaults to config.END_DATE.",
     ),
     compustat_source: CompustatSource = typer.Option(
         CompustatSource.xpressfeed,
@@ -108,6 +107,13 @@ def build(
         "--metrics-interval",
         min=1.0,
         help="Seconds between persistent CPU, memory, disk, I/O, and network samples.",
+    ),
+    daily_download_workers: int = typer.Option(
+        2,
+        "--daily-download-workers",
+        min=1,
+        max=4,
+        help="Shared parallel workers for indexed SECD/G_SECD batch downloads.",
     ),
 ) -> None:
     """Run the full data generation pipeline."""
@@ -130,6 +136,7 @@ def build(
         compustat_source=compustat_source,
         metrics_interval_seconds=metrics_interval_seconds,
         reuse_raw=reuse_raw,
+        daily_download_workers=daily_download_workers,
     )
 
 

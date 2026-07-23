@@ -45,6 +45,20 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
    age can begin before that floor, so each download also creates a compact
    `comp_age_anchor.parquet` from indexed full-history minima.
 
+   `comp.secd` and `comp.g_secd` are downloaded in deterministic 250-security
+   parts by a shared two-worker pool. Each worker owns its database connection,
+   and interrupted runs reuse parts whose Parquet data and manifest still match
+   the requested pairs, columns, and date bounds. Use
+   `--daily-download-workers 1` for a serial comparison; values above 4 are
+   rejected. A failed batch is retried up to three times with a fresh connection
+   and 5, 10, then 20 seconds of backoff. Keep the production default at 2 until
+   database monitoring shows that a higher setting is safe.
+
+   Download timing and throughput are written to
+   `run_logs/<run-id>/download_telemetry.csv`, including table/batch rows,
+   compressed bytes, rows/second, MiB/second, retries, timeouts, worker number,
+   and cumulative completion percentages.
+
    By default, the end date is calculated once at process startup as the final
    calendar day of the previous month. A command-line `--end-date` overrides
    that default and is propagated through downloads, industry histories,

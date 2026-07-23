@@ -82,6 +82,7 @@ class PipelineRunMonitor:
         self.pipeline_log_path = self.run_dir / "pipeline.log"
         self.metrics_path = self.run_dir / "resource_metrics.csv"
         self.steps_path = self.run_dir / "step_timings.csv"
+        self.downloads_path = self.run_dir / "download_telemetry.csv"
         self.summary_path = self.run_dir / "run_summary.json"
         self.history_path = self.logs_root / "timing_history.json"
         self.latest_path = self.logs_root / "latest_run.txt"
@@ -157,14 +158,12 @@ class PipelineRunMonitor:
                 "production_output",
                 "compustat_source",
                 "reuse_raw",
+                "daily_download_workers",
             )
             self._history_compatible = bool(history_config) and all(
                 history_config.get(key) == self._config.get(key) for key in compatibility_keys
             )
-        self._log(
-            "RUN CONFIG "
-            + " ".join(f"{key}={value}" for key, value in serializable.items())
-        )
+        self._log("RUN CONFIG " + " ".join(f"{key}={value}" for key, value in serializable.items()))
         if not self._history_compatible:
             self._log("ETA unavailable until a comparable run completes successfully")
         self._write_summary()
@@ -188,6 +187,62 @@ class PipelineRunMonitor:
     def note(self, message: str) -> None:
         """Persist a human-readable progress event and mirror it to stdout."""
         self._log(f"PROGRESS {message}")
+
+    def record_download(
+        self,
+        *,
+        event_type: str,
+        table: str,
+        status: str,
+        started_at_utc: str,
+        duration_seconds: float,
+        batch_number: int | None = None,
+        total_batches: int | None = None,
+        worker_id: int | None = None,
+        pair_count: int = 0,
+        row_count: int = 0,
+        bytes_written: int = 0,
+        retries: int = 0,
+        timeouts: int = 0,
+        completed_batches: int | None = None,
+        table_completion_percent: float | None = None,
+        overall_completion_percent: float | None = None,
+        error_type: str = "",
+    ) -> None:
+        """Append one durable table/batch download telemetry event."""
+        mib_written = bytes_written / (1024**2)
+        mib_per_second = mib_written / duration_seconds if duration_seconds > 0 else 0.0
+        rows_per_second = row_count / duration_seconds if duration_seconds > 0 else 0.0
+        row = (
+            _utc_now().isoformat(),
+            event_type,
+            table,
+            status,
+            started_at_utc,
+            round(duration_seconds, 3),
+            batch_number if batch_number is not None else "",
+            total_batches if total_batches is not None else "",
+            worker_id if worker_id is not None else "",
+            pair_count,
+            row_count,
+            bytes_written,
+            round(mib_written, 3),
+            round(mib_per_second, 3),
+            round(rows_per_second, 3),
+            retries,
+            timeouts,
+            completed_batches if completed_batches is not None else "",
+            (round(table_completion_percent, 3) if table_completion_percent is not None else ""),
+            (
+                round(overall_completion_percent, 3)
+                if overall_completion_percent is not None
+                else ""
+            ),
+            error_type,
+        )
+        with self._lock, self.downloads_path.open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow(row)
+            handle.flush()
 
     def step_started(self, name: str) -> int:
         with self._lock:
@@ -240,9 +295,7 @@ class PipelineRunMonitor:
     def _log(self, message: str) -> None:
         timestamp = _utc_now().isoformat(timespec="seconds")
         line = f"{timestamp} elapsed={_format_duration(self.elapsed_seconds)} {message}"
-        with self._lock, self.pipeline_log_path.open(
-            "a", encoding="utf-8", newline=""
-        ) as handle:
+        with self._lock, self.pipeline_log_path.open("a", encoding="utf-8", newline="") as handle:
             handle.write(line + "\n")
             handle.flush()
         print(line, flush=True)
@@ -294,6 +347,32 @@ class PipelineRunMonitor:
                     "status",
                     "error_type",
                     "error_message",
+                )
+            )
+        with self.downloads_path.open("w", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow(
+                (
+                    "timestamp_utc",
+                    "event_type",
+                    "table",
+                    "status",
+                    "started_at_utc",
+                    "duration_seconds",
+                    "batch_number",
+                    "total_batches",
+                    "worker_id",
+                    "pair_count",
+                    "row_count",
+                    "bytes_written",
+                    "mib_written",
+                    "mib_per_second",
+                    "rows_per_second",
+                    "retries",
+                    "timeouts",
+                    "completed_batches",
+                    "table_completion_percent",
+                    "overall_completion_percent",
+                    "error_type",
                 )
             )
 
@@ -485,6 +564,7 @@ class PipelineRunMonitor:
                     "pipeline_log": str(self.pipeline_log_path),
                     "resource_metrics": str(self.metrics_path),
                     "step_timings": str(self.steps_path),
+                    "download_telemetry": str(self.downloads_path),
                 },
             }
 
@@ -522,7 +602,9 @@ def monitor_pipeline(func: _F) -> _F:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         output_dir = kwargs.get("output_dir")
         if output_dir is None:
-            raise TypeError("monitored pipeline calls must provide output_dir as a keyword argument")
+            raise TypeError(
+                "monitored pipeline calls must provide output_dir as a keyword argument"
+            )
         interval = float(kwargs.get("metrics_interval_seconds", 60.0))
         monitor = PipelineRunMonitor(Path(output_dir), interval)
         monitor.start()

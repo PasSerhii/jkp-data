@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
+import itertools
+import json
 import operator
 import os
+import queue
 import re
 import shutil
+import threading
 import time
-from datetime import date
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from math import exp, sqrt
 from pathlib import Path
 
@@ -105,6 +111,9 @@ DAILY_COMPUSTAT_PAIR_HEADERS = {
     "comp.g_secd": "comp.g_security",
 }
 DAILY_COMPUSTAT_BATCH_SIZE = 250
+MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS = 4
+DAILY_COMPUSTAT_BATCH_MAX_RETRIES = 3
+DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0)
 
 REUSABLE_COMPUSTAT_TABLES: tuple[str, ...] = (
     "comp.exrt_dly",
@@ -1076,16 +1085,342 @@ def _pair_where_clause(
     return "WHERE " + " AND ".join(conditions)
 
 
+@dataclass(frozen=True)
+class _DailyBatchTask:
+    table_name: str
+    projection: str
+    pairs: tuple[tuple[str, str], ...]
+    date_column: str | None
+    start_date: date | None
+    end_date: date | None
+    batch_number: int
+    total_batches: int
+    part_file: Path
+    manifest_file: Path
+
+
+@dataclass(frozen=True)
+class _DailyBatchResult:
+    task: _DailyBatchTask
+    status: str
+    started_at_utc: str
+    duration_seconds: float
+    worker_id: int | None
+    row_count: int
+    bytes_written: int
+    retries: int
+    timeouts: int
+
+
+class _DailyBatchDownloadError(RuntimeError):
+    """Credential-safe daily batch failure propagated from a worker thread."""
+
+
 def _prepare_batch_directory(filename: str) -> Path:
-    """Create a clean Parquet-parts directory beside the legacy single file."""
+    """Create or reopen a resumable Parquet-parts directory."""
     legacy_file = Path(filename)
     parts_dir = legacy_file.with_name(f"{legacy_file.stem}_parts")
-    if legacy_file.exists():
-        legacy_file.unlink()
-    if parts_dir.exists():
-        shutil.rmtree(parts_dir)
-    parts_dir.mkdir(parents=True)
+    legacy_file.unlink(missing_ok=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for incomplete in parts_dir.glob("incomplete-*.parquet"):
+        incomplete.unlink(missing_ok=True)
     return parts_dir
+
+
+def _batch_contract(task: _DailyBatchTask) -> dict[str, object]:
+    pairs_payload = json.dumps(task.pairs, separators=(",", ":"), ensure_ascii=True)
+    return {
+        "format_version": 1,
+        "table": task.table_name,
+        "batch_number": task.batch_number,
+        "total_batches": task.total_batches,
+        "pair_count": len(task.pairs),
+        "pairs_sha256": hashlib.sha256(pairs_payload.encode("ascii")).hexdigest(),
+        "projection_sha256": hashlib.sha256(task.projection.encode("utf-8")).hexdigest(),
+        "date_column": task.date_column,
+        "start_date": task.start_date.isoformat() if task.start_date else None,
+        "end_date": task.end_date.isoformat() if task.end_date else None,
+    }
+
+
+def _load_reusable_batch(task: _DailyBatchTask) -> _DailyBatchResult | None:
+    """Return validated atomic-download metadata, or None when it must be rebuilt."""
+    if not task.part_file.is_file() or not task.manifest_file.is_file():
+        return None
+    try:
+        manifest = json.loads(task.manifest_file.read_text(encoding="utf-8"))
+        contract = _batch_contract(task)
+        if any(manifest.get(key) != value for key, value in contract.items()):
+            return None
+        size = task.part_file.stat().st_size
+        if size < 8 or manifest.get("bytes_written") != size:
+            return None
+        with task.part_file.open("rb") as handle:
+            if handle.read(4) != b"PAR1":
+                return None
+            handle.seek(-4, os.SEEK_END)
+            if handle.read(4) != b"PAR1":
+                return None
+        row_count = int(manifest["row_count"])
+        if row_count < 0:
+            return None
+        observed_rows = pl.scan_parquet(task.part_file).select(pl.len()).collect().item()
+        if observed_rows != row_count:
+            return None
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        json.JSONDecodeError,
+        pl.exceptions.PolarsError,
+    ):
+        return None
+    return _DailyBatchResult(
+        task=task,
+        status="reused",
+        started_at_utc=datetime.now(UTC).isoformat(),
+        duration_seconds=0.0,
+        worker_id=None,
+        row_count=row_count,
+        bytes_written=size,
+        retries=0,
+        timeouts=0,
+    )
+
+
+def _write_batch_manifest(task: _DailyBatchTask, result: _DailyBatchResult) -> None:
+    payload = {
+        **_batch_contract(task),
+        "row_count": result.row_count,
+        "bytes_written": result.bytes_written,
+        "retries": result.retries,
+        "timeouts": result.timeouts,
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+    }
+    temporary = task.manifest_file.with_suffix(".manifest.json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, task.manifest_file)
+
+
+def _build_daily_batch_query(task: _DailyBatchTask, relation: str) -> str:
+    return "\nUNION ALL\n".join(
+        f"""SELECT {task.projection}
+          FROM {relation}
+          {_pair_where_clause([pair], task.date_column, task.start_date, task.end_date)}"""
+        for pair in task.pairs
+    )
+
+
+def _parquet_row_count(connection: duckdb.DuckDBPyConnection, path: Path) -> int:
+    result = connection.execute(
+        f"SELECT COUNT(*) FROM read_parquet({_sql_literal(str(path))})"
+    ).fetchone()
+    if result is None:
+        raise RuntimeError(f"Could not read completed Parquet metadata for {path.name}")
+    return int(result[0])
+
+
+def _record_single_table_download(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+    filename: str,
+    *,
+    started_at_utc: str,
+    started_monotonic: float,
+    retries: int = 0,
+    timeouts: int = 0,
+) -> None:
+    """Record one non-batched table after its Parquet file is durable."""
+    path = Path(filename)
+    if not path.is_file():
+        return  # mocked/unit-test download
+    duration = time.monotonic() - started_monotonic
+    bytes_written = path.stat().st_size
+    try:
+        row_count = _parquet_row_count(connection, path)
+    except Exception as error:
+        row_count = 0
+        _report_progress(
+            f"download telemetry row count failed for {table_name} "
+            f"error_type={type(error).__name__}"
+        )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.record_download(
+            event_type="table",
+            table=table_name,
+            status="completed",
+            started_at_utc=started_at_utc,
+            duration_seconds=duration,
+            row_count=row_count,
+            bytes_written=bytes_written,
+            retries=retries,
+            timeouts=timeouts,
+            table_completion_percent=100.0,
+            overall_completion_percent=100.0,
+        )
+    _report_progress(
+        f"completed {table_name} table rows={row_count:,} "
+        f"size_mib={bytes_written / (1024**2):.1f} duration={duration:.1f}s "
+        f"retries={retries} timeouts={timeouts}"
+    )
+
+
+def _record_table_download_failure(
+    table_name: str,
+    *,
+    started_at_utc: str,
+    started_monotonic: float,
+    error: BaseException,
+    retries: int = 0,
+    timeouts: int = 0,
+) -> None:
+    """Record a credential-safe failed table event before propagating it."""
+    monitor = get_active_monitor()
+    if monitor is None:
+        return
+    monitor.record_download(
+        event_type="table",
+        table=table_name,
+        status="failed",
+        started_at_utc=started_at_utc,
+        duration_seconds=time.monotonic() - started_monotonic,
+        retries=retries,
+        timeouts=timeouts,
+        error_type=type(error).__name__,
+    )
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    text = f"{type(error).__name__} {error}".lower()
+    return "timeout" in text or "timed out" in text or "canceling statement" in text
+
+
+def _download_daily_batch_once(
+    connection: duckdb.DuckDBPyConnection,
+    relation: str,
+    task: _DailyBatchTask,
+    worker_id: int,
+    retry_number: int,
+    prior_timeouts: int,
+) -> _DailyBatchResult:
+    started_at = datetime.now(UTC).isoformat()
+    started = time.monotonic()
+    temporary = task.part_file.with_name(
+        f"incomplete-{task.batch_number:06d}-worker-{worker_id}-try-{retry_number}.parquet"
+    )
+    temporary.unlink(missing_ok=True)
+    batch_query = _build_daily_batch_query(task, relation)
+    connection.execute(f"""
+        COPY (
+          {batch_query}
+        )
+        TO {_sql_literal(str(temporary))} (FORMAT PARQUET);
+    """)
+    row_count = _parquet_row_count(connection, temporary)
+    bytes_written = temporary.stat().st_size
+    os.replace(temporary, task.part_file)
+    result = _DailyBatchResult(
+        task=task,
+        status="completed",
+        started_at_utc=started_at,
+        duration_seconds=time.monotonic() - started,
+        worker_id=worker_id,
+        row_count=row_count,
+        bytes_written=bytes_written,
+        retries=retry_number,
+        timeouts=prior_timeouts,
+    )
+    _write_batch_manifest(task, result)
+    return result
+
+
+def _make_daily_batch_tasks(
+    table_name: str,
+    projection: str,
+    pairs: list[tuple[str, str]],
+    filename: str,
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+    batch_size: int,
+) -> list[_DailyBatchTask]:
+    if not pairs:
+        raise RuntimeError(f"No security pairs were found for {table_name}")
+    parts_dir = _prepare_batch_directory(filename)
+    total_batches = (len(pairs) + batch_size - 1) // batch_size
+    tasks: list[_DailyBatchTask] = []
+    for offset in range(0, len(pairs), batch_size):
+        batch_number = offset // batch_size + 1
+        tasks.append(
+            _DailyBatchTask(
+                table_name=table_name,
+                projection=projection,
+                pairs=tuple(pairs[offset : offset + batch_size]),
+                date_column=date_column,
+                start_date=start_date,
+                end_date=end_date,
+                batch_number=batch_number,
+                total_batches=total_batches,
+                part_file=parts_dir / f"part-{batch_number:06d}.parquet",
+                manifest_file=parts_dir / f"part-{batch_number:06d}.manifest.json",
+            )
+        )
+
+    expected = {task.part_file.name for task in tasks} | {task.manifest_file.name for task in tasks}
+    for stale in parts_dir.iterdir():
+        if (
+            stale.is_file()
+            and (stale.name.startswith("part-") or stale.name.startswith("incomplete-"))
+            and stale.name not in expected
+        ):
+            stale.unlink(missing_ok=True)
+    return tasks
+
+
+def _record_download_result(
+    result: _DailyBatchResult,
+    *,
+    monitor,
+    completed_batches: int,
+    table_completed_batches: int,
+    overall_total_batches: int,
+) -> None:
+    task = result.task
+    table_percent = table_completed_batches / task.total_batches * 100
+    overall_percent = completed_batches / overall_total_batches * 100
+    if monitor is not None:
+        monitor.record_download(
+            event_type="batch",
+            table=task.table_name,
+            status=result.status,
+            started_at_utc=result.started_at_utc,
+            duration_seconds=result.duration_seconds,
+            batch_number=task.batch_number,
+            total_batches=task.total_batches,
+            worker_id=result.worker_id,
+            pair_count=len(task.pairs),
+            row_count=result.row_count,
+            bytes_written=result.bytes_written,
+            retries=result.retries,
+            timeouts=result.timeouts,
+            completed_batches=table_completed_batches,
+            table_completion_percent=table_percent,
+            overall_completion_percent=overall_percent,
+        )
+    message = (
+        f"{result.status} {task.table_name} batch {task.batch_number:,}/"
+        f"{task.total_batches:,} worker={result.worker_id or 0} pairs={len(task.pairs):,} "
+        f"rows={result.row_count:,} size_mib={result.bytes_written / (1024**2):.1f} "
+        f"duration={result.duration_seconds:.1f}s retries={result.retries} "
+        f"timeouts={result.timeouts} table_complete={table_percent:.1f}% "
+        f"overall_complete={overall_percent:.1f}%"
+    )
+    if monitor is not None:
+        monitor.note(message)
+    else:
+        print(message, flush=True)
 
 
 def _download_pair_batches(
@@ -1098,35 +1433,56 @@ def _download_pair_batches(
     start_date: date | None,
     end_date: date | None,
     batch_size: int,
+    *,
+    table_name: str | None = None,
 ) -> None:
-    """Copy pair-filtered remote relation batches to a local Parquet dataset."""
-    if not pairs:
-        raise RuntimeError("No security pairs were found for the daily Compustat download")
-    parts_dir = _prepare_batch_directory(filename)
-    total_batches = (len(pairs) + batch_size - 1) // batch_size
-    for offset in range(0, len(pairs), batch_size):
-        batch = pairs[offset : offset + batch_size]
-        batch_number = offset // batch_size + 1
-        # A single WHERE clause containing hundreds of pair predicates makes
-        # PostgreSQL choose a plan that scans the large compatibility view and
-        # can exceed the five-minute statement timeout.  Separate UNION ALL
-        # branches retain one output file per batch while keeping every branch
-        # as an index-driven lookup on (gvkey, iid, datadate).
-        batch_query = "\nUNION ALL\n".join(
-            f"""SELECT {projection}
-              FROM {relation}
-              {_pair_where_clause([pair], date_column, start_date, end_date)}"""
-            for pair in batch
-        )
-        part_file = parts_dir / f"part-{batch_number:06d}.parquet"
-        duckdb_conn.execute(f"""
-            COPY (
-              {batch_query}
+    """Copy one table's pair-filtered batches serially with atomic resume metadata."""
+    resolved_table_name = table_name or ".".join(relation.split(".")[-2:])
+    tasks = _make_daily_batch_tasks(
+        resolved_table_name,
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+    )
+    monitor = get_active_monitor()
+    table_started_at = datetime.now(UTC).isoformat()
+    table_started = time.monotonic()
+    table_results: list[_DailyBatchResult] = []
+    for completed, task in enumerate(tasks, start=1):
+        result = _load_reusable_batch(task)
+        if result is None:
+            result = _download_daily_batch_once(
+                duckdb_conn, relation, task, worker_id=1, retry_number=0, prior_timeouts=0
             )
-            TO {_sql_literal(str(part_file))} (FORMAT PARQUET);
-        """)
-        if batch_number == 1 or batch_number % 25 == 0 or batch_number == total_batches:
-            _report_progress(f"completed daily batch {batch_number:,}/{total_batches:,}")
+        table_results.append(result)
+        _record_download_result(
+            result,
+            monitor=monitor,
+            completed_batches=completed,
+            table_completed_batches=completed,
+            overall_total_batches=len(tasks),
+        )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.record_download(
+            event_type="table",
+            table=resolved_table_name,
+            status="completed",
+            started_at_utc=table_started_at,
+            duration_seconds=time.monotonic() - table_started,
+            pair_count=len(pairs),
+            row_count=sum(result.row_count for result in table_results),
+            bytes_written=sum(result.bytes_written for result in table_results),
+            retries=sum(result.retries for result in table_results),
+            timeouts=sum(result.timeouts for result in table_results),
+            completed_batches=len(table_results),
+            table_completion_percent=100.0,
+            overall_completion_percent=100.0,
+        )
 
 
 def download_wrds_daily_table_batched_attached(
@@ -1155,6 +1511,7 @@ def download_wrds_daily_table_batched_attached(
         start_date,
         end_date,
         batch_size,
+        table_name=table_name,
     )
 
 
@@ -1187,7 +1544,258 @@ def download_wrds_daily_table_batched(
         start_date,
         end_date,
         batch_size,
+        table_name=table_name,
     )
+
+
+def _open_daily_worker_connection(
+    conninfo: str, worker_id: int
+) -> tuple[duckdb.DuckDBPyConnection, str]:
+    """Open one isolated DuckDB/PostgreSQL connection for a download worker."""
+    connection = duckdb.connect(":memory:")
+    alias = f"daily_source_w{worker_id}"
+    try:
+        connection.execute("LOAD postgres")
+        connection.execute(f"ATTACH {_sql_literal(conninfo)} AS {alias} (TYPE postgres, READ_ONLY)")
+    except Exception:
+        connection.close()
+        raise
+    return connection, alias
+
+
+def download_wrds_daily_tables_parallel(
+    conninfo: str,
+    planning_connection: duckdb.DuckDBPyConnection,
+    paths: DataPaths,
+    table_names: tuple[str, ...],
+    date_columns: dict[str, str],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+    worker_count: int,
+    planning_db_alias: str | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+) -> None:
+    """Download SECD/G_SECD through one shared, bounded worker queue.
+
+    Every worker owns one DuckDB connection and one PostgreSQL attachment. Tasks
+    from both daily tables are interleaved, written atomically, and skipped only
+    when their manifest exactly matches the current pair/date/projection contract.
+    """
+    if not 1 <= worker_count <= MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS:
+        raise ValueError(
+            "daily Compustat download workers must be between 1 and "
+            f"{MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS}"
+        )
+
+    table_tasks: dict[str, list[_DailyBatchTask]] = {}
+    table_pair_counts: dict[str, int] = {}
+    for table_name in table_names:
+        lib, table = table_name.split(".")
+        if planning_db_alias is None:
+            columns = get_columns(planning_connection, conninfo, lib, table)
+        else:
+            columns = get_columns_attached(planning_connection, planning_db_alias, lib, table)
+        selected_columns = LARGE_COMPUSTAT_COLUMNS[table_name]
+        projection = build_projection(columns, selected_columns)
+        header = DAILY_COMPUSTAT_PAIR_HEADERS[table_name]
+        pairs = load_security_pairs(planning_connection, paths.raw_table_source(header))
+        table_pair_counts[table_name] = len(pairs)
+        filename = str(paths.raw_tables_dir / f"{table_name.replace('.', '_')}.parquet")
+        table_tasks[table_name] = _make_daily_batch_tasks(
+            table_name,
+            projection,
+            pairs,
+            filename,
+            date_columns[table_name],
+            start_date,
+            end_date,
+            batch_size,
+        )
+
+    interleaved: list[_DailyBatchTask] = []
+    for group in itertools.zip_longest(*(table_tasks[name] for name in table_names)):
+        interleaved.extend(task for task in group if task is not None)
+
+    monitor = get_active_monitor()
+    total_batches = len(interleaved)
+    completed_batches = 0
+    completed_by_table = dict.fromkeys(table_names, 0)
+    results_by_table: dict[str, list[_DailyBatchResult]] = {name: [] for name in table_names}
+    progress_lock = threading.Lock()
+    pending: queue.Queue[_DailyBatchTask] = queue.Queue()
+    table_started = {name: time.monotonic() for name in table_names}
+    table_started_at = {name: datetime.now(UTC).isoformat() for name in table_names}
+
+    def accept_result(result: _DailyBatchResult) -> None:
+        nonlocal completed_batches
+        with progress_lock:
+            completed_batches += 1
+            completed_by_table[result.task.table_name] += 1
+            results_by_table[result.task.table_name].append(result)
+            _record_download_result(
+                result,
+                monitor=monitor,
+                completed_batches=completed_batches,
+                table_completed_batches=completed_by_table[result.task.table_name],
+                overall_total_batches=total_batches,
+            )
+
+    for task in interleaved:
+        reusable = _load_reusable_batch(task)
+        if reusable is None:
+            pending.put(task)
+        else:
+            accept_result(reusable)
+
+    if pending.empty():
+        if monitor is not None:
+            monitor.note("reused every completed daily Compustat batch")
+    else:
+        errors: queue.Queue[_DailyBatchDownloadError] = queue.Queue()
+        stop_event = threading.Event()
+
+        def worker(worker_id: int) -> None:
+            connection: duckdb.DuckDBPyConnection | None = None
+            alias = ""
+            try:
+                while not stop_event.is_set():
+                    try:
+                        task = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    retry_number = 0
+                    timeouts = 0
+                    while retry_number <= DAILY_COMPUSTAT_BATCH_MAX_RETRIES:
+                        attempt_started_at = datetime.now(UTC).isoformat()
+                        attempt_started = time.monotonic()
+                        try:
+                            if connection is None:
+                                connection, alias = _open_daily_worker_connection(
+                                    conninfo, worker_id
+                                )
+                            relation = f"{alias}.{task.table_name}"
+                            result = _download_daily_batch_once(
+                                connection,
+                                relation,
+                                task,
+                                worker_id,
+                                retry_number,
+                                timeouts,
+                            )
+                        except Exception as error:
+                            timeouts += int(_is_timeout_error(error))
+                            for incomplete in task.part_file.parent.glob(
+                                f"incomplete-{task.batch_number:06d}-worker-{worker_id}-*.parquet"
+                            ):
+                                incomplete.unlink(missing_ok=True)
+                            if connection is not None:
+                                connection.close()
+                                connection = None
+                            if retry_number < DAILY_COMPUSTAT_BATCH_MAX_RETRIES:
+                                retry_number += 1
+                                retry_delay = DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS[
+                                    retry_number - 1
+                                ]
+                                if monitor is not None:
+                                    monitor.note(
+                                        f"retrying {task.table_name} batch "
+                                        f"{task.batch_number:,}/{task.total_batches:,} "
+                                        f"worker={worker_id} retry={retry_number} "
+                                        f"delay_seconds={retry_delay:g} "
+                                        f"timeout={bool(timeouts)} error_type={type(error).__name__}"
+                                    )
+                                if stop_event.wait(retry_delay):
+                                    break
+                                continue
+                            if monitor is not None:
+                                monitor.record_download(
+                                    event_type="batch",
+                                    table=task.table_name,
+                                    status="failed",
+                                    started_at_utc=attempt_started_at,
+                                    duration_seconds=time.monotonic() - attempt_started,
+                                    batch_number=task.batch_number,
+                                    total_batches=task.total_batches,
+                                    worker_id=worker_id,
+                                    pair_count=len(task.pairs),
+                                    retries=retry_number,
+                                    timeouts=timeouts,
+                                    error_type=type(error).__name__,
+                                )
+                            errors.put(
+                                _DailyBatchDownloadError(
+                                    f"daily download failed for {task.table_name} batch "
+                                    f"{task.batch_number}/{task.total_batches} after "
+                                    f"{retry_number} retries; error details were redacted"
+                                )
+                            )
+                            stop_event.set()
+                            break
+                        else:
+                            accept_result(result)
+                            break
+                    pending.task_done()
+            except Exception as error:
+                errors.put(
+                    _DailyBatchDownloadError(
+                        f"daily download worker {worker_id} failed "
+                        f"({type(error).__name__}); error details were redacted"
+                    )
+                )
+                stop_event.set()
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(worker_id,),
+                name=f"jkp-daily-download-{worker_id}",
+            )
+            for worker_id in range(1, worker_count + 1)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if not errors.empty():
+            raise errors.get()
+
+    for table_name in table_names:
+        results = results_by_table[table_name]
+        duration = time.monotonic() - table_started[table_name]
+        row_count = sum(result.row_count for result in results)
+        bytes_written = sum(result.bytes_written for result in results)
+        retries = sum(result.retries for result in results)
+        timeouts = sum(result.timeouts for result in results)
+        if monitor is not None:
+            monitor.record_download(
+                event_type="table",
+                table=table_name,
+                status="completed",
+                started_at_utc=table_started_at[table_name],
+                duration_seconds=duration,
+                pair_count=table_pair_counts[table_name],
+                row_count=row_count,
+                bytes_written=bytes_written,
+                retries=retries,
+                timeouts=timeouts,
+                completed_batches=len(results),
+                table_completion_percent=100.0,
+                overall_completion_percent=100.0,
+            )
+        message = (
+            f"completed {table_name} table pairs={table_pair_counts[table_name]:,} "
+            f"batches={len(results):,} rows={row_count:,} "
+            f"size_gib={bytes_written / (1024**3):.2f} duration={duration:.1f}s "
+            f"retries={retries} timeouts={timeouts}"
+        )
+        if monitor is not None:
+            monitor.note(message)
+        else:
+            print(message, flush=True)
 
 
 def build_compustat_age_anchor_query(raw_schema: str) -> str:
@@ -1304,6 +1912,7 @@ def download_raw_data_tables(
     connection_info: str | None = None,
     source_label: str = "WRDS",
     raw_schema: str = "comp",
+    daily_download_workers: int = 1,
 ) -> None:
     """
     Description:
@@ -1330,6 +1939,8 @@ def download_raw_data_tables(
         persistent_connection: If True, use a single persistent connection via ATTACH.
             This reduces MFA prompts on systems with NAT IP rotation (e.g., Yale Bouchet).
             If False (default), use postgres_scan() which creates a new connection per query.
+        daily_download_workers: Shared SECD/G_SECD batch workers. Values 1-4;
+            production CLI runs default to 2 while direct library calls remain serial.
 
     Output:
         Parquet files under raw_tables/ (Compustat, CRSP, FF, etc.).
@@ -1389,6 +2000,10 @@ def download_raw_data_tables(
     else:
         source_connection_info = connection_info
     source_connection_info = with_pg_statement_timeout(source_connection_info)
+    if not 1 <= daily_download_workers <= MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS:
+        raise ValueError(
+            f"daily_download_workers must be between 1 and {MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS}"
+        )
     con = duckdb.connect(":memory:")
     con.execute("INSTALL postgres; LOAD postgres;")
 
@@ -1406,11 +2021,17 @@ def download_raw_data_tables(
             _raise_redacted_source_error(source_label, "connection", e)
         try:
             for table in table_names:
+                if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
+                    continue
                 filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
                 _report_progress(f"Downloading {source_label} table {table}")
                 selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
                 pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
                 pairs: list[tuple[str, str]] | None = None
+                table_started_at = datetime.now(UTC).isoformat()
+                table_started = time.monotonic()
+                retries = 0
+                timeouts = 0
                 try:
                     if pair_header is not None:
                         assert selected_columns is not None
@@ -1439,7 +2060,17 @@ def download_raw_data_tables(
                         )
                 except Exception as e:
                     if e.__class__.__name__ != "OutOfMemoryException":
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=e,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(e)),
+                        )
                         _raise_redacted_source_error(source_label, f"download of {table}", e)
+                    retries = 1
+                    timeouts += int(_is_timeout_error(e))
                     Path(filename).unlink(missing_ok=True)
                     _report_progress(
                         f"Attached {source_label} download ran out of memory on {table}; "
@@ -1475,28 +2106,88 @@ def download_raw_data_tables(
                                 selected_columns=selected_columns,
                             )
                     except Exception as retry_error:
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=retry_error,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(retry_error)),
+                        )
                         _raise_redacted_source_error(
                             source_label, f"fallback download of {table}", retry_error
                         )
+                if pair_header is None:
+                    _record_single_table_download(
+                        con,
+                        table,
+                        filename,
+                        started_at_utc=table_started_at,
+                        started_monotonic=table_started,
+                        retries=retries,
+                        timeouts=timeouts,
+                    )
+            if daily_download_workers > 1:
+                _report_progress(
+                    f"Downloading {source_label} daily Compustat tables with "
+                    f"{daily_download_workers} shared workers"
+                )
+                try:
+                    download_wrds_daily_tables_parallel(
+                        source_connection_info,
+                        con,
+                        paths,
+                        tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
+                        date_columns,
+                        start_date=start_date,
+                        end_date=end_date,
+                        worker_count=daily_download_workers,
+                        planning_db_alias="source_db",
+                    )
+                except Exception as error:
+                    if isinstance(error, _DailyBatchDownloadError):
+                        raise
+                    _raise_redacted_source_error(source_label, "parallel daily download", error)
             _report_progress(f"Downloading {source_label} full-history age anchor")
+            anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
+            anchor_started_at = datetime.now(UTC).isoformat()
+            anchor_started = time.monotonic()
             try:
                 download_compustat_age_anchor_attached(
                     con,
                     "source_db",
-                    str(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+                    anchor_filename,
                     raw_schema,
                 )
             except Exception as e:
+                _record_table_download_failure(
+                    "comp.age_anchor",
+                    started_at_utc=anchor_started_at,
+                    started_monotonic=anchor_started,
+                    error=e,
+                    timeouts=int(_is_timeout_error(e)),
+                )
                 _raise_redacted_source_error(source_label, "age-anchor download", e)
+            _record_single_table_download(
+                con,
+                "comp.age_anchor",
+                anchor_filename,
+                started_at_utc=anchor_started_at,
+                started_monotonic=anchor_started,
+            )
         finally:
             con.execute("DETACH source_db")
     else:
         # Use postgres_scan() which creates a new connection per query (default)
         for table in table_names:
+            if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
+                continue
             _report_progress(f"Downloading {source_label} table {table}")
             filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
             selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
             pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
+            table_started_at = datetime.now(UTC).isoformat()
+            table_started = time.monotonic()
             try:
                 if pair_header is not None:
                     assert selected_columns is not None
@@ -1524,10 +2215,49 @@ def download_raw_data_tables(
                         selected_columns=selected_columns,
                     )
             except Exception as e:
+                _record_table_download_failure(
+                    table,
+                    started_at_utc=table_started_at,
+                    started_monotonic=table_started,
+                    error=e,
+                    timeouts=int(_is_timeout_error(e)),
+                )
                 _raise_redacted_source_error(source_label, f"download of {table}", e)
+            if pair_header is None:
+                _record_single_table_download(
+                    con,
+                    table,
+                    filename,
+                    started_at_utc=table_started_at,
+                    started_monotonic=table_started,
+                )
+
+        if daily_download_workers > 1:
+            _report_progress(
+                f"Downloading {source_label} daily Compustat tables with "
+                f"{daily_download_workers} shared workers"
+            )
+            try:
+                download_wrds_daily_tables_parallel(
+                    source_connection_info,
+                    con,
+                    paths,
+                    tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
+                    date_columns,
+                    start_date=start_date,
+                    end_date=end_date,
+                    worker_count=daily_download_workers,
+                )
+            except Exception as error:
+                if isinstance(error, _DailyBatchDownloadError):
+                    raise
+                _raise_redacted_source_error(source_label, "parallel daily download", error)
 
         _report_progress(f"Downloading {source_label} full-history age anchor")
         anchor_alias = "age_anchor_source"
+        anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
+        anchor_started_at = datetime.now(UTC).isoformat()
+        anchor_started = time.monotonic()
         try:
             con.execute(
                 f"ATTACH {_sql_literal(source_connection_info)} AS {anchor_alias} "
@@ -1536,14 +2266,28 @@ def download_raw_data_tables(
             download_compustat_age_anchor_attached(
                 con,
                 anchor_alias,
-                str(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+                anchor_filename,
                 raw_schema,
             )
         except Exception as e:
+            _record_table_download_failure(
+                "comp.age_anchor",
+                started_at_utc=anchor_started_at,
+                started_monotonic=anchor_started,
+                error=e,
+                timeouts=int(_is_timeout_error(e)),
+            )
             _raise_redacted_source_error(source_label, "age-anchor download", e)
         finally:
             with contextlib.suppress(Exception):
                 con.execute(f"DETACH {anchor_alias}")
+        _record_single_table_download(
+            con,
+            "comp.age_anchor",
+            anchor_filename,
+            started_at_utc=anchor_started_at,
+            started_monotonic=anchor_started,
+        )
 
     con.close()
 

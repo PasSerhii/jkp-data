@@ -147,17 +147,16 @@ def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) ->
     assert download_kwargs["end_date"] == runtime_end
     assert download_kwargs["raw_schema"] == "public"
     assert download_kwargs["connection_info"] == "postgresql://private-rds"
+    assert download_kwargs["daily_download_workers"] == 2
     assert mocks["standardized_accounting_data"].call_args.args[-1] == runtime_start
 
     assert mocks["comp_industry"].call_args.kwargs["end_date"] == runtime_end
     assert mocks["firm_age"].call_args.kwargs["bypass_crsp"] is True
     assert mocks["market_beta"].call_args.kwargs["end_date"] == runtime_end
     assert all(
-        call.kwargs["end_date"] == runtime_end
-        for call in mocks["residual_momentum"].call_args_list
+        call.kwargs["end_date"] == runtime_end for call in mocks["residual_momentum"].call_args_list
     )
     assert all(
-        call.kwargs["end_date"] == runtime_end
-        for call in mocks["roll_apply_daily"].call_args_list
+        call.kwargs["end_date"] == runtime_end for call in mocks["roll_apply_daily"].call_args_list
     )
     assert mocks["merge_roll_apply_daily_results"].call_args.kwargs["end_date"] == runtime_end

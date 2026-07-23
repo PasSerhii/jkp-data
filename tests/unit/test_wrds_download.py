@@ -128,6 +128,8 @@ class TestDownloadRawDataTablesBranching:
                 "jkp.data.aux_functions.load_security_pairs",
                 return_value=[("001234", "01")],
             ),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched"),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched_attached"),
         ):
             mock_conn = MagicMock()
             mock.connect.return_value = mock_conn
@@ -347,9 +349,28 @@ class TestDailyCompustatBatching:
         assert "IN (" not in result
 
     def test_download_writes_one_part_per_pair_batch(self, tmp_path):
+        import re
+
+        import polars as pl
+
         from jkp.data.aux_functions import _download_pair_batches
 
         conn = MagicMock()
+
+        def execute(sql):
+            if "COPY (" in sql:
+                output = re.search(r"TO '([^']+)'", sql)
+                assert output is not None
+                pl.DataFrame(
+                    {"gvkey": ["001234"], "iid": ["01"], "datadate": [date(2020, 1, 1)]}
+                ).write_parquet(output.group(1))
+            elif "SELECT COUNT(*)" in sql:
+                result = MagicMock()
+                result.fetchone.return_value = (1,)
+                return result
+            return conn
+
+        conn.execute.side_effect = execute
         filename = str(tmp_path / "comp_secd.parquet")
         _download_pair_batches(
             conn,
@@ -363,10 +384,12 @@ class TestDailyCompustatBatching:
             batch_size=2,
         )
 
-        copy_sql = [call.args[0] for call in conn.execute.call_args_list]
+        copy_sql = [
+            call.args[0] for call in conn.execute.call_args_list if "COPY (" in call.args[0]
+        ]
         assert len(copy_sql) == 2
-        assert "part-000001.parquet" in copy_sql[0]
-        assert "part-000002.parquet" in copy_sql[1]
+        assert "incomplete-000001-worker-1-try-0.parquet" in copy_sql[0]
+        assert "incomplete-000002-worker-1-try-0.parquet" in copy_sql[1]
         assert "009999" not in copy_sql[0]
         assert "009999" in copy_sql[1]
         assert "UNION ALL" in copy_sql[0]
@@ -374,6 +397,9 @@ class TestDailyCompustatBatching:
         assert "gvkey = '001234' AND iid = '01'" in copy_sql[0]
         assert "gvkey = '005678' AND iid = '02'" in copy_sql[0]
         assert (tmp_path / "comp_secd_parts").is_dir()
+        assert (tmp_path / "comp_secd_parts" / "part-000001.parquet").is_file()
+        assert (tmp_path / "comp_secd_parts" / "part-000002.parquet").is_file()
+        assert len(list((tmp_path / "comp_secd_parts").glob("*.manifest.json"))) == 2
 
 
 class TestReusableRawValidation:
@@ -394,9 +420,7 @@ class TestReusableRawValidation:
             "REUSABLE_COMPUSTAT_TABLES",
             ("comp.security", "comp.g_security", "comp.secd", "comp.g_secd"),
         )
-        header = pl.DataFrame(
-            {"gvkey": ["001", "002", "003"], "iid": ["01", "01", "02"]}
-        )
+        header = pl.DataFrame({"gvkey": ["001", "002", "003"], "iid": ["01", "01", "02"]})
         for table in ("comp_security", "comp_g_security"):
             header.write_parquet(paths.raw_tables_dir / f"{table}.parquet")
         for table in ("comp_secd", "comp_g_secd"):

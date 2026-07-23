@@ -77,6 +77,7 @@ def run_pipeline(
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
     metrics_interval_seconds: float = 60.0,
     reuse_raw: bool = False,
+    daily_download_workers: int = 2,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -106,9 +107,7 @@ def run_pipeline(
         raw_schema = "comp"
         username = creds.username
         password = creds.password
-    effective_start_date = (
-        DEFAULT_ACCOUNTING_START_DATE if start_date is None else start_date
-    )
+    effective_start_date = DEFAULT_ACCOUNTING_START_DATE if start_date is None else start_date
     effective_end_date = DEFAULT_END_DATE if end_date is None else end_date
     if (
         effective_start_date is not None
@@ -131,6 +130,7 @@ def run_pipeline(
         persistent_connection=persistent_connection,
         metrics_interval_seconds=metrics_interval_seconds,
         reuse_raw=reuse_raw,
+        daily_download_workers=daily_download_workers,
     )
 
     interim = paths.interim_dir
@@ -153,6 +153,7 @@ def run_pipeline(
             persistent_connection=persistent_connection,
             bypass_crsp=bypass_crsp,
             start_date=effective_start_date,
+            daily_download_workers=daily_download_workers,
         )
     monitor.set_phase("security_panels")
     gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)

@@ -42,6 +42,7 @@ class TestCliHelp:
         assert "--start-date" in _strip_ansi(result.output)
         assert "--end-date" in _strip_ansi(result.output)
         assert "--compustat-sou" in _strip_ansi(result.output)
+        assert "--daily-downloa" in _strip_ansi(result.output)
         assert "OUTPUT_DIR" in _strip_ansi(result.output)
 
     def test_portfolio_help(self):
@@ -99,6 +100,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -115,6 +117,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -131,6 +134,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -147,6 +151,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -163,6 +168,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -179,6 +185,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -205,6 +212,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
+            daily_download_workers=2,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -214,10 +222,18 @@ class TestBuildCommand:
         assert mock_run_pipeline.call_args.kwargs["reuse_raw"] is True
 
     @patch("jkp.data.main.run_pipeline")
+    def test_build_daily_download_workers(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--daily-download-workers", "4"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["daily_download_workers"] == 4
+
+    def test_build_rejects_more_than_four_daily_download_workers(self, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--daily-download-workers", "5"])
+        assert result.exit_code != 0
+
+    @patch("jkp.data.main.run_pipeline")
     def test_build_wrds_source(self, mock_run_pipeline, tmp_path):
-        result = runner.invoke(
-            app, ["build", str(tmp_path), "--compustat-source", "wrds"]
-        )
+        result = runner.invoke(app, ["build", str(tmp_path), "--compustat-source", "wrds"])
         assert result.exit_code == 0
         assert mock_run_pipeline.call_args.kwargs["compustat_source"] is CompustatSource.wrds
 
@@ -252,9 +268,7 @@ class TestPortfolioCommand:
 
     @patch("jkp.data.portfolio.run_portfolio")
     def test_portfolio_end_date(self, mock_run_portfolio, tmp_path):
-        result = runner.invoke(
-            app, ["portfolio", str(tmp_path), "--end-date", "2026-07-31"]
-        )
+        result = runner.invoke(app, ["portfolio", str(tmp_path), "--end-date", "2026-07-31"])
         assert result.exit_code == 0
         assert mock_run_portfolio.call_args.kwargs["end_date"] == date(2026, 7, 31)
 

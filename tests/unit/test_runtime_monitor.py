@@ -55,6 +55,52 @@ def test_monitor_persists_successful_run_metrics_steps_and_history(tmp_path) -> 
     assert len(step_rows) == len(PIPELINE_PHASES)
     assert all(row["status"] == "completed" for row in step_rows)
 
+    monitor.record_download(
+        event_type="batch",
+        table="comp.secd",
+        status="completed",
+        started_at_utc="2026-07-23T00:00:00+00:00",
+        duration_seconds=2.0,
+        batch_number=1,
+        total_batches=4,
+        worker_id=2,
+        pair_count=250,
+        row_count=1_000,
+        bytes_written=2 * 1024 * 1024,
+        retries=1,
+        timeouts=1,
+        completed_batches=1,
+        table_completion_percent=25.0,
+        overall_completion_percent=12.5,
+    )
+    with monitor.downloads_path.open(encoding="utf-8", newline="") as handle:
+        download_rows = list(csv.DictReader(handle))
+    assert download_rows == [
+        {
+            "timestamp_utc": download_rows[0]["timestamp_utc"],
+            "event_type": "batch",
+            "table": "comp.secd",
+            "status": "completed",
+            "started_at_utc": "2026-07-23T00:00:00+00:00",
+            "duration_seconds": "2.0",
+            "batch_number": "1",
+            "total_batches": "4",
+            "worker_id": "2",
+            "pair_count": "250",
+            "row_count": "1000",
+            "bytes_written": str(2 * 1024 * 1024),
+            "mib_written": "2.0",
+            "mib_per_second": "1.0",
+            "rows_per_second": "500.0",
+            "retries": "1",
+            "timeouts": "1",
+            "completed_batches": "1",
+            "table_completion_percent": "25.0",
+            "overall_completion_percent": "12.5",
+            "error_type": "",
+        }
+    ]
+
     history = json.loads(monitor.history_path.read_text(encoding="utf-8"))
     assert set(history["phases"]) == set(PIPELINE_PHASES)
     assert monitor.latest_path.read_text(encoding="ascii").strip() == monitor.run_id
