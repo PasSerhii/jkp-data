@@ -3,6 +3,12 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 23-07-2026
+__Changes__:
+- Applied the Bessembinder et al. (2023) Compustat daily-security corrections before return construction: decimal-shift repairs for North America and Global, unreliable-observation filters, never-dividend `trfd=1` recovery, and a residual screen that nulls returns above 1000%.
+- Changed degenerate rolling-daily windows to return null instead of artificial extreme signals, scrubbed non-finite daily characteristics before assembly, and prevented non-finite inputs from entering QMJ ranks.
+- Replaced four semantically unnecessary full joins in Quality Minus Junk with left joins, preserving its row set while avoiding Polars' 32-bit intermediate-row overflow.
+
 ## 28-06-2026
 __Changes__:
 - Added a CRSP-bypass build mode (`config.BYPASS_CRSP`, `jkp build --bypass-crsp`) that constructs the dataset from Compustat only, mirroring the SAS `bypass_crsp=1` path. When enabled: security files contain Compustat rows only (`source_crsp=0`); excess returns use the Fama-French risk-free rate with a last-available-month fallback instead of the CRSP 30-year T-bill; NYSE size breakpoints are identified via Compustat `exchg=11` instead of CRSP `exchcd=1`; SIC/NAICS industry codes come from Compustat only; and factor portfolios are built from Compustat (`PORTFOLIO_SETTINGS["source"]=["COMPUSTAT"]`). This mode is the new default.

@@ -19,7 +19,8 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
-from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
+from .compustat_correction import correct_decimal_errors, drop_unreliable_observations
+from .config import COLLECT_CHUNK_SIZE, CORRECTION_SPILL_COMPRESSION, END_DATE, MAIN_FILTERS
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
@@ -345,7 +346,7 @@ def sec_info_aux(filename):
     Output:
         LazyFrame of security status fields.
     """
-    df = pl.scan_parquet(filename).select(["gvkey", "iid", "secstat", "dlrsni"])
+    df = pl.scan_parquet(filename).select(["gvkey", "iid", "secstat", "dlrsni", "dldtei"])
     return df
 
 
@@ -1055,9 +1056,7 @@ def validate_reusable_raw_data(paths: DataPaths, *, bypass_crsp: bool) -> None:
 
     if problems:
         details = "; ".join(problems)
-        raise RuntimeError(
-            "Cannot reuse raw downloads because validation failed: " + details
-        )
+        raise RuntimeError("Cannot reuse raw downloads because validation failed: " + details)
 
 
 def _pair_where_clause(
@@ -1781,39 +1780,113 @@ def adj_trd_vol_NASDAQ(datevar, col_to_adjust, exchg_var, exchg_val):
     return adj_trd_vol
 
 
-def gen_comp_dsf(paths: DataPaths):
+def gen_comp_dsf(
+    paths: DataPaths,
+    apply_correction: bool = True,
+    correction_method: str = "multiplier",
+    variation_threshold: float = 1.3,
+):
     """
     Description:
         Build daily Compustat security data (SECD + G_SECD), convert to USD, and compute
         prices/returns/volumes/dividends; store as __comp_dsf.parquet.
 
     Steps:
-        1) Materialize daily FX to fx_data.parquet; register SECD, G_SECD, firm-shares, and FX in DuckDB.
-        2) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
+        1) Materialize daily FX to fx_data.parquet.
+        2) If apply_correction, repair decimal-shift errors in the raw data.
+        3) Register SECD, G_SECD, firm-shares, and FX in DuckDB.
+        4) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
         shares traded, shares outstanding, local return index (ri_local), dividend currencies.
-        3) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
-        4) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
-        5) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
-        6) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
+        The total-return factor trfd is null for securities that never pay a dividend;
+        substitute trfd=1 for those (price return = total return) so their returns survive.
+        5) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
+        6) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
+        7) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
+        8) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
         USD return index (ri), dividends (split into total/cash/special); derive month-end eom.
-        7) Drop intermediates and write __comp_dsf.parquet.
+        9) If apply_correction, drop unreliable observations from the USD data.
+        10) Drop intermediates and write __comp_dsf.parquet.
+
+    Args:
+        apply_correction: Whether to apply the Compustat return corrections
+            (Bessembinder et al. 2023). Default True. Set False to reproduce
+            original behavior.
+        correction_method: decimal-correction method ('multiplier' fixed multipliers
+            or 'interpolation' geometric mean of clean endpoints).
 
     Output:
         Parquet: __comp_dsf.parquet (daily Compustat security observations in USD).
     """
     (paths.interim_dir / "aux_comp_dsf.ddb").unlink(missing_ok=True)
+
+    # Prepare FX data
+    compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
+
+    # Repair decimal-shift errors in the raw data (local currency)
+    if apply_correction:
+        # Load and correct Global data (no ADRRC). spill_dir selects the
+        # memory-bounded array path; spill files are removed after each sink.
+        df_global = pl.scan_parquet(paths.raw_table_source("comp.g_secd")).pipe(
+            correct_decimal_errors,
+            group_cols=["gvkey", "iid"],
+            sort_col="datadate",
+            has_adrrc=False,
+            correction_method=correction_method,
+            spill_dir=paths.interim_dir,
+            variation_threshold=variation_threshold,
+        )
+        df_global.sink_parquet(
+            paths.interim_dir / "__comp_g_secd_corrected.parquet",
+            compression=CORRECTION_SPILL_COMPRESSION,
+        )
+        for spill in paths.interim_dir.glob("__corr_*.parquet"):
+            spill.unlink()
+
+        # Load and correct NA data (has ADRRC for ADRs)
+        df_na = pl.scan_parquet(paths.raw_table_source("comp.secd")).pipe(
+            correct_decimal_errors,
+            group_cols=["gvkey", "iid"],
+            sort_col="datadate",
+            has_adrrc=True,
+            correction_method=correction_method,
+            spill_dir=paths.interim_dir,
+            variation_threshold=variation_threshold,
+        )
+        df_na.sink_parquet(
+            paths.interim_dir / "__comp_secd_corrected.parquet",
+            compression=CORRECTION_SPILL_COMPRESSION,
+        )
+        for spill in paths.interim_dir.glob("__corr_*.parquet"):
+            spill.unlink()
+
+        # Use corrected files
+        g_secd_path = paths.interim_dir / "__comp_g_secd_corrected.parquet"
+        secd_path = paths.interim_dir / "__comp_secd_corrected.parquet"
+    else:
+        # Use original files
+        g_secd_path = paths.raw_table_source("comp.g_secd")
+        secd_path = paths.raw_table_source("comp.secd")
+
+    def _sql_path(source: Path | str) -> str:
+        return str(source).replace("\\", "/")
+
+    # Original SQL processing
+    # Views, not tables: the whole merge/FX/USD pipeline streams in a single
+    # pass at the final COPY instead of materializing five intermediate
+    # tables to the .ddb file. The NASDAQ cshtrd UPDATE is folded into the
+    # __comp_dsf_na view as an equivalent CASE expression.
     con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_dsf.ddb"), threads=os.cpu_count())
 
-    compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
-    con.create_table("comp_g_secd", con.read_parquet(paths.raw_table_source("comp.g_secd")))
-    con.create_table(
-        "__firm_shares2", con.read_parquet(paths.interim_dir / "__firm_shares2.parquet")
-    )
-    con.create_table("comp_secd", con.read_parquet(paths.raw_table_source("comp.secd")))
-    con.create_table("fx", con.read_parquet(paths.interim_dir / "fx_data.parquet"))
+    con.raw_sql(f"""
+    CREATE VIEW comp_g_secd AS SELECT * FROM read_parquet('{_sql_path(g_secd_path)}');
+    CREATE VIEW comp_secd AS SELECT * FROM read_parquet('{_sql_path(secd_path)}');
+    CREATE VIEW __firm_shares2 AS
+        SELECT * FROM read_parquet('{(paths.interim_dir / "__firm_shares2.parquet").as_posix()}');
+    CREATE VIEW fx AS SELECT * FROM read_parquet('{(paths.interim_dir / "fx_data.parquet").as_posix()}');
+    """)
 
     con.raw_sql("""
-    CREATE TABLE __comp_dsf_global AS
+    CREATE VIEW __comp_dsf_global AS
     SELECT
         gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prccd / qunit AS prc_local, ajexdi, cshoc / 1e6 AS cshoc,
         CASE
@@ -1825,11 +1898,19 @@ def gen_comp_dsf(paths: DataPaths):
             ELSE NULL
         END AS prc_low_lcl,
         prcod AS prc_open_lcl,
-        cshtrd, (prccd / qunit) / ajexdi * trfd AS ri_local,
+        -- trfd is null for never-dividend securities; substitute 1 only when the
+        -- security never pays a dividend (no dividends => price return = total
+        -- return), leaving genuine gaps for payers null. Per WRDS guidance:
+        -- https://wrds-www.wharton.upenn.edu/pages/support/support-articles/compustat/global/computing-returns/
+        cshtrd, (prccd / qunit) / ajexdi * COALESCE(trfd,
+            CASE WHEN NOT BOOL_OR(
+                     COALESCE(div, 0) > 0 OR COALESCE(divd, 0) > 0 OR COALESCE(divsp, 0) > 0
+                 ) OVER (PARTITION BY gvkey, iid)
+                 THEN 1 ELSE NULL END) AS ri_local,
         curcddv, div, divd, divsp
     FROM comp_g_secd;
 
-    CREATE TABLE __comp_dsf_na AS
+    CREATE VIEW __comp_dsf_na AS
     SELECT
         a.gvkey, a.iid, a.datadate, a.tpci, a.exchg, a.prcstd, a.curcdd, a.prccd AS prc_local, a.ajexdi,
         CASE
@@ -1841,29 +1922,36 @@ def gen_comp_dsf(paths: DataPaths):
             ELSE NULL
         END AS prc_low_lcl,
         a.prcod AS prc_open_lcl,
-        a.cshtrd, COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
-        (a.prccd / a.ajexdi * a.trfd) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
+        -- cast back to the column type: the original UPDATE assigned the
+        -- divided value in place, implicitly rounding to DECIMAL(28,8)
+        CAST(CASE
+            WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrd / 2
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrd / 1.8
+            WHEN a.exchg = 14 AND a.datadate <  DATE '2003-12-31' THEN a.cshtrd / 1.6
+            ELSE a.cshtrd
+        END AS DECIMAL(28, 8)) AS cshtrd,
+        COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
+        -- trfd (total return factor) is missing for securities that never pay
+        -- a dividend; per WRDS guidance, replace the missing factor with 1
+        -- (no dividends => price return = total return). Only do so when the
+        -- security never pays a dividend; leave genuine gaps for payers null.
+        -- https://wrds-www.wharton.upenn.edu/pages/support/support-articles/compustat/global/computing-returns/
+        (a.prccd / a.ajexdi * COALESCE(a.trfd,
+            CASE WHEN NOT BOOL_OR(
+                     COALESCE(a.div, 0) > 0 OR COALESCE(a.divd, 0) > 0 OR COALESCE(a.divsp, 0) > 0
+                 ) OVER (PARTITION BY a.gvkey, a.iid)
+                 THEN 1 ELSE NULL END)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
     LEFT JOIN __firm_shares2 AS b
     ON a.gvkey = b.gvkey AND a.datadate = b.ddate;
 
-    UPDATE __comp_dsf_na
-    SET cshtrd =
-        CASE
-            WHEN datadate <  DATE '2001-02-01' THEN cshtrd / 2
-            WHEN datadate <= DATE '2001-12-31' THEN cshtrd / 1.8
-            WHEN datadate <  DATE '2003-12-31' THEN cshtrd / 1.6
-            ELSE cshtrd
-        END
-    WHERE exchg = 14;
-
-    CREATE TABLE __comp_dsf1 AS
+    CREATE VIEW __comp_dsf1 AS
     SELECT *
     FROM __comp_dsf_na
     FULL OUTER JOIN __comp_dsf_global
     USING (gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prc_local, ajexdi, prc_high_lcl, prc_low_lcl, prc_open_lcl, cshtrd, cshoc, ri_local, curcddv, div, divd, divsp);
 
-    CREATE TABLE __comp_dsf2 AS
+    CREATE VIEW __comp_dsf2 AS
     SELECT a.*, b.fx AS fx, c.fx AS fx_div
     FROM __comp_dsf1 AS a
     LEFT JOIN fx AS b
@@ -1871,9 +1959,9 @@ def gen_comp_dsf(paths: DataPaths):
     LEFT JOIN fx AS c
         ON a.curcddv = c.curcdd AND a.datadate = c.datadate;
 
-    CREATE TABLE __comp_dsf3 AS
+    CREATE VIEW __comp_dsf3 AS
     SELECT
-        *,
+        * EXCLUDE (div, divd, divsp, fx_div, curcddv, prc_high_lcl, prc_low_lcl),
         prc_local    * fx AS prc,
         prc_high_lcl * fx AS prc_high,
         prc_low_lcl  * fx AS prc_low,
@@ -1888,11 +1976,63 @@ def gen_comp_dsf(paths: DataPaths):
     FROM __comp_dsf2;
 
     """)
-    t = con.table("__comp_dsf3").drop(
-        ["div", "divd", "divsp", "fx_div", "curcddv", "prc_high_lcl", "prc_low_lcl"]
-    )
-    t.to_parquet(paths.interim_dir / "__comp_dsf.parquet")
-    con.disconnect()
+
+    # Drop unreliable observations from the USD-converted data
+    if apply_correction:
+        # One streaming pass: DuckDB executes the whole view pipeline, joins
+        # the exchange-country mapping (needed for country-specific filters),
+        # external-sorts by the filter group/sort keys, and writes the spill
+        # file directly — no pre-filter round-trip, and the slim path skips its
+        # own sort (presorted=True).
+        comp_exchanges(paths).select(["exchg", "excntry"]).write_parquet(
+            paths.interim_dir / "__corr_exchanges.parquet"
+        )
+        sorted_path = paths.interim_dir / "__corr_filter_sorted.parquet"
+        # insertion-order preservation is irrelevant under an explicit ORDER BY
+        # and only inflates the external sort's memory; temp_directory
+        # guarantees the sort can spill (the slim path verifies the resulting
+        # order before trusting it)
+        con.raw_sql(f"""
+        SET preserve_insertion_order = false;
+        SET temp_directory = '{(paths.interim_dir / "__duckdb_tmp").as_posix()}';
+        """)
+        con.raw_sql(f"""
+        COPY (
+            SELECT t.*, e.excntry
+            FROM __comp_dsf3 AS t
+            LEFT JOIN read_parquet('{(paths.interim_dir / "__corr_exchanges.parquet").as_posix()}') AS e
+                USING (exchg)
+            ORDER BY gvkey NULLS FIRST, iid NULLS FIRST, datadate NULLS FIRST
+        ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET);
+        """)
+        con.disconnect()
+
+        df = drop_unreliable_observations(
+            pl.scan_parquet(sorted_path),
+            group_cols=["gvkey", "iid"],
+            sort_col="datadate",
+            country_col="excntry",
+            spill_dir=paths.interim_dir,
+            presorted_path=sorted_path,
+        )
+
+        df.drop("excntry").sink_parquet(paths.interim_dir / "__comp_dsf.parquet")
+
+        # Clean up temp files
+        for f in paths.interim_dir.glob("__corr_*.parquet"):
+            f.unlink()
+
+    else:
+        con.raw_sql(f"""
+        COPY (SELECT * FROM __comp_dsf3)
+        TO '{(paths.interim_dir / "__comp_dsf.parquet").as_posix()}' (FORMAT PARQUET);
+        """)
+        con.disconnect()
+
+    # Clean up corrected temp files if they exist
+    if apply_correction:
+        for f in ["__comp_g_secd_corrected.parquet", "__comp_secd_corrected.parquet"]:
+            (paths.interim_dir / f).unlink(missing_ok=True)
 
 
 def gen_secd_data(paths: DataPaths):
@@ -2051,7 +2191,8 @@ def gen_secm_data(paths: DataPaths):
         dvpsxm         * fx_div            AS div_tot,
         NULL::DOUBLE                       AS div_cash,
         NULL::DOUBLE                       AS div_spc
-        FROM base;
+        FROM base
+        WHERE prc_local IS NOT NULL AND curcdd IS NOT NULL;
     """)
     con.table("__comp_secm2").to_parquet(paths.interim_dir / "secm_data.parquet")
 
@@ -2368,7 +2509,7 @@ def gen_returns_df(paths: DataPaths, freq):
            {gvkey,iid,datadate} keeping highest prcstd (best data quality); sort.
         3) Compute ret and ret_local as pct_change of ri and ri_local over (gvkey,iid).
         4) If iid unchanged but currency changed, set ret_local = ret (reset local base).
-        5) Null-out ±∞/NaN returns; select core columns and collect.
+        5) Null-out ±∞/NaN returns and residual returns above 1000%; select core columns.
 
     Output:
         Polars DataFrame with {gvkey,iid,datadate,ret,ret_local,ret_lag_dif}.
@@ -2408,10 +2549,12 @@ def gen_returns_df(paths: DataPaths, freq):
             .otherwise(col("ret_local"))
         )
         .with_columns(
-            ret_local=pl.when(col("ret_local").is_infinite() | col("ret_local").is_nan())
+            ret_local=pl.when(
+                col("ret_local").is_infinite() | col("ret_local").is_nan() | (col("ret_local") > 10)
+            )
             .then(None)
             .otherwise(col("ret_local")),
-            ret=pl.when(col("ret").is_infinite() | col("ret").is_nan())
+            ret=pl.when(col("ret").is_infinite() | col("ret").is_nan() | (col("ret") > 10))
             .then(None)
             .otherwise(col("ret")),
         )
@@ -2427,22 +2570,32 @@ def gen_delist_df(paths: DataPaths, __returns):
 
     Steps:
         1) From __returns, keep final nonzero/non-null ret_local per (gvkey,iid).
-        2) Join __sec_info to get secstat/dlrsni; keep inactive (secstat='I').
+        2) Join __sec_info to get secstat/dlrsni/dldtei; keep inactive securities
+           only when the vendor delisting date is not after the downloaded panel.
         3) Map delisting code {02,03} → dlret = -0.30 else 0.0; rename columns.
 
     Output:
         DataFrame {gvkey,iid,date_delist,dlret} for use in delisting adjustments.
     """
     __sec_info = pl.scan_parquet(paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
+    coverage = (
+        __returns.lazy()
+        .group_by(["gvkey", "iid"])
+        .agg(col("datadate").max().alias("max_data_date"))
+    )
     __delist = (
         __returns.lazy()
         .filter((col("ret_local").is_not_null()) & (col("ret_local") != 0.0))
         .select(["gvkey", "iid", "datadate"])
         .sort(["gvkey", "iid", "datadate"])
         .unique(["gvkey", "iid"], keep="last")
+        .join(coverage, how="left", on=["gvkey", "iid"])
         .join(__sec_info, how="left", on=["gvkey", "iid"])
         .rename({"datadate": "date_delist"})
-        .filter(col("secstat") == "I")
+        .filter(
+            (col("secstat") == "I")
+            & (col("dldtei").is_null() | (col("dldtei") <= col("max_data_date")))
+        )
         .with_columns(
             dlret=pl.when(col("dlrsni").is_in(["02", "03"]))
             .then(pl.lit(-0.3))
@@ -2938,7 +3091,11 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                     ajexdi AS adjfct,
                     cshoc AS shares,
                     me,
-                    me AS me_company,
+                    COALESCE(
+                        SUM(CASE WHEN tpci = '0' THEN me ELSE NULL END)
+                            OVER (PARTITION BY gvkey, eom),
+                        me
+                    ) AS me_company,
                     prc, prc_local, prc_high, prc_low, dolvol,
                     cshtrm AS tvol,
                     ret, ret_local, ret_exc,
@@ -3131,6 +3288,8 @@ def comp_hgics(paths: DataPaths, lib, end_date: date = END_DATE):
 
     data = data.with_columns(
         gics=pl.when(col("gics").is_null()).then(-999).otherwise(col("gics")),
+    ).sort(["gvkey", "indfrom"])
+    data = data.with_columns(
         n=pl.len().over("gvkey"),
         n_aux=pl.cum_count("gvkey").over("gvkey"),
     )
@@ -5409,7 +5568,7 @@ def ohlson_o(df, name="o_score"):
                 -1.32
                 - 0.407 * col("__o_lat")
                 + 6.03 * col("__o_lev")
-                - 1.43 * col("__o_wc")
+                + 1.43 * col("__o_wc")
                 + 0.076 * col("__o_cacl")
                 - 1.72 * col("__o_neg_eq")
                 - 2.37 * col("__o_roe")
@@ -8430,6 +8589,7 @@ def finish_daily_chars(paths: DataPaths, output_path):
         2) Outer join on (id, eom).
         3) Add betabab (beta * rvol / mktvol) and rmax5_rvol ratio.
         4) Drop helper columns.
+        5) Convert every non-finite floating-point result to null.
 
     Output:
         '{output_path}' parquet with final daily characteristics.
@@ -8443,6 +8603,17 @@ def finish_daily_chars(paths: DataPaths, output_path):
         betabab_1260d=col("corr_1260d") * col("rvol_252d") / col("__mktvol_252d"),
         rmax5_rvol_21d=col("rmax5_21d") / col("rvol_252d"),
     ).drop("__mktvol_252d")
+    daily_schema = daily_chars.collect_schema()
+    float_cols = [name for name, dtype in daily_schema.items() if dtype.is_float()]
+    daily_chars = daily_chars.with_columns(
+        [
+            pl.when(col(name).is_finite())
+            .then(col(name))
+            .otherwise(pl.lit(None, dtype=daily_schema[name]))
+            .alias(name)
+            for name in float_cols
+        ]
+    )
     daily_chars.collect().write_parquet(output_path)
 
 
@@ -8452,16 +8623,16 @@ def z_ranks(data, var, __min, sort):
         ["excntry", "eom"]
     )
     z_df = (
-        data.filter(col(var).is_not_nan())
+        data.filter(col(var).is_finite())
         .filter(pl.count(var).over(["excntry", "eom"]) >= __min)
         .with_columns(
             rank=col(var).rank(method="average", descending=order).over(["excntry", "eom"])
         )
         .select(["excntry", "id", "eom", exp_z_var.alias(f"z_{var}")])
         .with_columns(
-            pl.when(col(f"z_{var}").is_nan())
-            .then(fl_none())
-            .otherwise(col(f"z_{var}"))
+            pl.when(col(f"z_{var}").is_finite())
+            .then(col(f"z_{var}"))
+            .otherwise(fl_none())
             .alias(f"z_{var}")
         )
         .filter(col(f"z_{var}").is_not_null())
@@ -8552,12 +8723,13 @@ def quality_minus_junk(paths: DataPaths, data_path, min_stks):
         & (col("me").is_not_null())
     )
     # NOTE: input must be unique on (excntry, eom, id) — guaranteed upstream by
-    # construction of world_data_-1. Duplicate keys would fan out multiplicatively
-    # across the 16+3 full joins below and panic at the Polars frame-length limit.
+    # construction of world_data_-1. Duplicate keys would still make each rank
+    # attachment ambiguous even though the joins below deliberately preserve the
+    # filtered QMJ base universe with left joins.
     qmj = pl.scan_parquet(data_path).filter(c1).select(cols).sort(["excntry", "eom"]).collect()
     for var_z, dir in zip(z_vars, direction, strict=True):
         __z = z_ranks(qmj, var_z, min_stks, dir)
-        qmj = qmj.join(__z, how="full", coalesce=True, on=["excntry", "eom", "id"])
+        qmj = qmj.join(__z, how="left", on=["excntry", "eom", "id"])
 
     qmj = qmj.with_columns(
         __prof=pl.mean_horizontal(
@@ -8577,9 +8749,9 @@ def quality_minus_junk(paths: DataPaths, data_path, min_stks):
     }
     qmj = (
         qmj.select(["excntry", "id", "eom"])
-        .join(ranks["prof"], how="full", coalesce=True, on=["excntry", "id", "eom"])
-        .join(ranks["growth"], how="full", coalesce=True, on=["excntry", "id", "eom"])
-        .join(ranks["safety"], how="full", coalesce=True, on=["excntry", "id", "eom"])
+        .join(ranks["prof"], how="left", on=["excntry", "id", "eom"])
+        .join(ranks["growth"], how="left", on=["excntry", "id", "eom"])
+        .join(ranks["safety"], how="left", on=["excntry", "id", "eom"])
         .with_columns(__qmj=(col("qmj_prof") + col("qmj_growth") + col("qmj_safety")) / 3)
     )
     __qmj = z_ranks(qmj, "__qmj", min_stks, "ascending").rename({"z___qmj": "qmj"})
@@ -9334,7 +9506,10 @@ def rvol(df, sfx, __min):
         LazyFrame with f'rvol{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("ret_exc").cast(pl.Float64).std().alias(f"rvol{sfx}")
+        pl.when(col("ret_exc").min() < col("ret_exc").max())
+        .then(col("ret_exc").cast(pl.Float64).std())
+        .otherwise(fl_none())
+        .alias(f"rvol{sfx}")
     )
     return df
 
@@ -9353,8 +9528,14 @@ def rmax(df, sfx, __min):
     """
     df = df.group_by(["id_int", "group_number"]).agg(
         [
-            col("ret").top_k(5).mean().alias(f"rmax5{sfx}"),
-            col("ret").max().alias(f"rmax1{sfx}"),
+            pl.when(col("ret").min() < col("ret").max())
+            .then(col("ret").top_k(5).mean())
+            .otherwise(fl_none())
+            .alias(f"rmax5{sfx}"),
+            pl.when(col("ret").min() < col("ret").max())
+            .then(col("ret").max())
+            .otherwise(fl_none())
+            .alias(f"rmax1{sfx}"),
         ]
     )
     return df
@@ -9373,7 +9554,10 @@ def skew(df, sfx, __min):
         LazyFrame with f'rskew{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("ret_exc").skew(bias=False).alias(f"rskew{sfx}")
+        pl.when(col("ret_exc").min() < col("ret_exc").max())
+        .then(col("ret_exc").skew(bias=False))
+        .otherwise(fl_none())
+        .alias(f"rskew{sfx}")
     )
     return df
 
@@ -9400,9 +9584,10 @@ def prc_to_high(df, sfx, __min):
         df.group_by(["id_int", "group_number"])
         .agg(
             [
-                (col("prc_adj").sort_by("date").last() / col("prc_adj").max()).alias(
-                    f"prc_highprc{sfx}"
-                ),
+                pl.when(col("prc_adj").min() < col("prc_adj").max())
+                .then(col("prc_adj").sort_by("date").last() / col("prc_adj").max())
+                .otherwise(fl_none())
+                .alias(f"prc_highprc{sfx}"),
                 pl.count("prc_adj").alias("n"),
             ]
         )
@@ -9424,11 +9609,14 @@ def capm(df, sfx, __min):
     Output:
         LazyFrame with f'beta{sfx}' and f'ivol_capm{sfx}'.
     """
+    beta_exp = pl.cov("ret_exc", "mktrf") / pl.var("mktrf")
+    residual_exp = col("ret_exc") - col("mktrf") * beta_exp
     df = df.group_by(["id_int", "group_number"]).agg(
         [
-            (pl.cov("ret_exc", "mktrf") / pl.var("mktrf")).alias(f"beta{sfx}"),
-            (col("ret_exc") - col("mktrf") * (pl.cov("ret_exc", "mktrf") / pl.var("mktrf")))
-            .std()
+            beta_exp.alias(f"beta{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(residual_exp.std())
+            .otherwise(fl_none())
             .alias(f"ivol_capm{sfx}"),
         ]
     )
@@ -9453,7 +9641,10 @@ def ami(df, sfx, __min):
         df.group_by(["id_int", "group_number"])
         .agg(
             [
-                (col("ret").abs() / aux_1 * 1e6).mean().alias(f"ami{sfx}"),
+                pl.when((col("ret").min() < col("ret").max()) & (~(col("dolvol_d") == 0).any()))
+                .then((col("ret").abs() / aux_1 * 1e6).mean())
+                .otherwise(fl_none())
+                .alias(f"ami{sfx}"),
                 pl.count("dolvol_d").alias("n"),
             ]
         )
@@ -9503,7 +9694,10 @@ def mktrf_vol(df, sfx, __min):
         LazyFrame with f'__mktvol{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("mktrf").cast(pl.Float64).std().alias(f"__mktvol{sfx}")
+        pl.when(col("mktrf").min() < col("mktrf").max())
+        .then(col("mktrf").cast(pl.Float64).std())
+        .otherwise(fl_none())
+        .alias(f"__mktvol{sfx}")
     )
     return df
 
@@ -9530,9 +9724,18 @@ def capm_ext(df, sfx, __min):
     df = df.group_by(["id_int", "group_number"]).agg(
         [
             beta_col.cast(pl.Float64).alias(f"beta{sfx}"),
-            residual_col.std().alias(f"ivol_capm{sfx}"),
-            residual_col.skew(bias=False).alias(f"iskew_capm{sfx}"),
-            (exp_coskew1 / exp_coskew2).alias(f"coskew{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(residual_col.std())
+            .otherwise(fl_none())
+            .alias(f"ivol_capm{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(residual_col.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_capm{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(exp_coskew1 / exp_coskew2)
+            .otherwise(fl_none())
+            .alias(f"coskew{sfx}"),
         ]
     )
     return df
@@ -9557,8 +9760,14 @@ def ff3(df, sfx, __min):
         df.filter(col("smb_ff").is_not_null() & col("hml").is_not_null())
         .group_by(["id_int", "group_number"])
         .agg(
-            res_exp.std(ddof=3).alias(f"ivol_ff3{sfx}"),
-            res_exp.skew(bias=False).alias(f"iskew_ff3{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.std(ddof=3))
+            .otherwise(fl_none())
+            .alias(f"ivol_ff3{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_ff3{sfx}"),
         )
     )
     return df
@@ -9585,8 +9794,14 @@ def hxz4(df, sfx, __min):
         )
         .group_by(["id_int", "group_number"])
         .agg(
-            res_exp.std(ddof=4).alias(f"ivol_hxz4{sfx}"),
-            res_exp.skew(bias=False).alias(f"iskew_hxz4{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.std(ddof=4))
+            .otherwise(fl_none())
+            .alias(f"ivol_hxz4{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_hxz4{sfx}"),
         )
     )
     return df
@@ -9650,7 +9865,7 @@ def dolvol(df, sfx, __min):
     df = df.group_by(["id_int", "group_number"]).agg(
         [
             col("dolvol_d").mean().alias(f"dolvol{sfx}"),
-            pl.when(col("dolvol_d").mean() != 0)
+            pl.when((col("dolvol_d").mean() != 0) & (col("dolvol_d").min() < col("dolvol_d").max()))
             .then(col("dolvol_d").std() / col("dolvol_d").mean())
             .otherwise(fl_none())
             .alias(f"dolvol_var{sfx}"),
@@ -9678,16 +9893,18 @@ def turnover(df, sfx, __min):
         .agg(
             turnover_d.mean().alias(f"turnover{sfx}"),
             turnover_d.std().alias("turnover_std"),
+            turnover_d.min().alias("turnover_min"),
+            turnover_d.max().alias("turnover_max"),
             pl.len().alias("n"),
         )
         .with_columns(
-            pl.when(col(f"turnover{sfx}") != 0)
+            pl.when((col(f"turnover{sfx}") != 0) & (col("turnover_min") < col("turnover_max")))
             .then(col("turnover_std") / col(f"turnover{sfx}"))
             .otherwise(fl_none())
             .alias(f"turnover_var{sfx}"),
         )
         .filter(col("n") >= __min)
-        .drop(["turnover_std", "n"])
+        .drop(["turnover_std", "turnover_min", "turnover_max", "n"])
     )
     return df
 
@@ -9704,14 +9921,18 @@ def mktcorr(df, sfx, __min):
     Output:
         LazyFrame with f'corr{sfx}'.
     """
+    name = f"corr{sfx}"
     return (
         df.group_by(["id_int", "group_number"])
         .agg(
             pl.len().alias("n"),
-            pl.corr("ret_exc_3l", "mkt_exc_3l").alias(f"corr{sfx}"),
+            pl.corr("ret_exc_3l", "mkt_exc_3l").alias(name),
         )
         .filter(col("n") >= __min)
         .drop("n")
+        .with_columns(
+            pl.when(col(name).is_finite()).then(col(name)).otherwise(fl_none()).alias(name)
+        )
     )
 
 
@@ -9740,7 +9961,7 @@ def dimsonbeta(
             )
         )
         .select("id_int", "group_number", beta_expr.alias(name))
-        .filter(pl.col(name).is_not_null() & pl.col(name).is_not_nan())
+        .filter(pl.col(name).is_not_null() & pl.col(name).is_finite())
     )
 
 

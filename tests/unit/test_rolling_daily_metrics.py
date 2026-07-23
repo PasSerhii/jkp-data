@@ -26,6 +26,7 @@ from jkp.data.aux_functions import (
     dolvol,
     downbeta,
     ff3,
+    finish_daily_chars,
     hxz4,
     mktcorr,
     mktrf_vol,
@@ -36,6 +37,111 @@ from jkp.data.aux_functions import (
     turnover,
     zero_trades,
 )
+
+
+class TestDegenerateRollingWindows:
+    """Flat or non-finite windows must not become extreme ranked signals."""
+
+    def test_flat_return_extremes_are_null(self):
+        df = pl.DataFrame({"id_int": [1] * 5, "group_number": [10] * 5, "ret": [0.0] * 5})
+        result = rmax(df, "_21d", __min=5)
+        assert result["rmax5_21d"][0] is None
+        assert result["rmax1_21d"][0] is None
+
+    def test_flat_nonzero_price_to_high_is_null(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 3,
+                "group_number": [10] * 3,
+                "date": [date(2024, 1, d) for d in (1, 2, 3)],
+                "prc_adj": [12.0] * 3,
+            }
+        )
+        result = prc_to_high(df, "_21d", __min=3)
+        assert result["prc_highprc_21d"][0] is None
+
+    def test_flat_stock_return_nulls_idiosyncratic_moments(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 5,
+                "group_number": [10] * 5,
+                "ret_exc": [0.0] * 5,
+                "mktrf": [-0.02, -0.01, 0.0, 0.01, 0.02],
+            }
+        )
+        capm_result = capm(df, "_21d", __min=5)
+        ext_result = capm_ext(df, "_21d", __min=5)
+        assert capm_result["ivol_capm_21d"][0] is None
+        assert ext_result["ivol_capm_21d"][0] is None
+        assert ext_result["iskew_capm_21d"][0] is None
+        assert ext_result["coskew_21d"][0] is None
+
+    def test_flat_stock_return_nulls_multifactor_residual_moments(self):
+        n = 8
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * n,
+                "group_number": [10] * n,
+                "ret_exc": [0.0] * n,
+                "mktrf": [-0.04, -0.03, -0.02, -0.01, 0.01, 0.02, 0.03, 0.04],
+                "smb_ff": [0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.04, -0.04],
+                "hml": [-0.02, 0.01, 0.03, -0.04, 0.04, -0.03, -0.01, 0.02],
+                "smb_hxz": [0.03, -0.01, -0.04, 0.02, -0.02, 0.04, 0.01, -0.03],
+                "roe": [-0.01, 0.04, -0.02, 0.03, -0.04, 0.02, -0.03, 0.01],
+                "inv": [0.04, -0.03, 0.01, -0.02, 0.03, -0.01, 0.02, -0.04],
+            }
+        )
+        ff3_result = ff3(df, "_21d", __min=n)
+        hxz_result = hxz4(df, "_21d", __min=n)
+        assert ff3_result["ivol_ff3_21d"][0] is None
+        assert ff3_result["iskew_ff3_21d"][0] is None
+        assert hxz_result["ivol_hxz4_21d"][0] is None
+        assert hxz_result["iskew_hxz4_21d"][0] is None
+
+    def test_flat_dollar_volume_keeps_level_but_nulls_variability(self):
+        df = pl.DataFrame({"id_int": [1] * 3, "group_number": [10] * 3, "dolvol_d": [100.0] * 3})
+        result = dolvol(df, "_126d", __min=3)
+        assert result["dolvol_126d"][0] == 100.0
+        assert result["dolvol_var_126d"][0] is None
+
+    def test_flat_turnover_keeps_level_but_nulls_variability(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 3,
+                "group_number": [10] * 3,
+                "tvol": [10.0] * 3,
+                "shares": [1.0] * 3,
+            }
+        )
+        result = turnover(df, "_126d", __min=3)
+        assert result["turnover_126d"][0] == pytest.approx(10.0 / 1e6)
+        assert result["turnover_var_126d"][0] is None
+
+    def test_finish_daily_chars_scrubs_nan_and_infinity(self, test_paths):
+        eom = date(2024, 1, 31)
+        pl.DataFrame({"id": [1], "eom": [eom], "bidaskhl_21d": [float("inf")]}).write_parquet(
+            test_paths.interim_dir / "corwin_schultz.parquet"
+        )
+        pl.DataFrame(
+            {
+                "id": [1],
+                "eom": [eom],
+                "corr_1260d": [float("nan")],
+                "rvol_252d": [0.0],
+                "__mktvol_252d": [0.0],
+                "rmax5_21d": [0.0],
+            }
+        ).write_parquet(test_paths.interim_dir / "roll_apply_daily.parquet")
+        output = test_paths.interim_dir / "daily_chars.parquet"
+
+        finish_daily_chars(test_paths, output)
+
+        result = pl.read_parquet(output)
+        assert result["bidaskhl_21d"][0] is None
+        assert result["corr_1260d"][0] is None
+        assert result["betabab_1260d"][0] is None
+        assert result["rmax5_rvol_21d"][0] is None
+
 
 GOLDEN_DIR = Path(__file__).parent.parent / "golden" / "fixtures"
 
@@ -88,11 +194,12 @@ class TestRvol:
         # Polars std() is sample std (ddof=1), so:
         # (1,10): std([1,2,3]) = 1.0
         # (1,20): std([2,4,4]) = sqrt(4/3)
-        # (2,10): std([3,3,3]) = 0.0
+        # (2,10): constant window is economically undefined -> null
         # (2,20): std([-1,0,1]) = 1.0
+        assert result["rvol_21d"][2] is None
         np.testing.assert_allclose(
-            result["rvol_21d"].to_list(),
-            [1.0, np.sqrt(4.0 / 3.0), 0.0, 1.0],
+            [result["rvol_21d"][0], result["rvol_21d"][1], result["rvol_21d"][3]],
+            [1.0, np.sqrt(4.0 / 3.0), 1.0],
             **tolerance.STANDARD,
             err_msg=f"Unexpected rvol values: {result['rvol_21d'].to_list()}",
         )
@@ -501,8 +608,8 @@ class TestCapm:
 class TestAmi:
     """Tests for ami() Amihud illiquidity helper."""
 
-    def test_ami_zero_dollar_volume_ignored_and_min_filter_applied(self, tolerance):
-        """dolvol_d == 0 should become null in ratio; groups keep only if n >= __min."""
+    def test_ami_zero_dollar_volume_nulls_window_and_min_filter_applied(self):
+        """A zero-volume day makes the window's Amihud estimate unreliable."""
         df = pl.DataFrame(
             {
                 "id_int": [1, 1, 1, 2, 2],
@@ -515,16 +622,11 @@ class TestAmi:
         result = ami(df, "_21d", __min=3).sort(["id_int", "group_number"])
 
         # group (1,10):
-        # abs(ret)/dolvol*1e6 -> [100, null, 25] -> mean = 62.5
-        # n = count(dolvol_d) = 3, passes
+        # A zero dolvol day invalidates the whole group's estimate.
+        # n = count(dolvol_d) = 3, so the group itself still passes.
         # group (2,20): n=2, filtered out
         assert len(result) == 1, f"Expected 1 group after min filter, got {len(result)}"
-        np.testing.assert_allclose(
-            result["ami_21d"][0],
-            62.5,
-            **tolerance.STANDARD,
-            err_msg=f"Expected ami_21d=62.5, got {result['ami_21d'][0]}",
-        )
+        assert result["ami_21d"][0] is None
 
     def test_ami_all_zero_dollar_volume_gives_null(self):
         """If all dolvol_d are zero, the Amihud ratio should be undefined."""
@@ -625,9 +727,10 @@ class TestMktrfVol:
         assert result.columns == ["id_int", "group_number", "__mktvol_21d"], (
             f"Unexpected columns: {result.columns}"
         )
+        assert result["__mktvol_21d"][1] is None
         np.testing.assert_allclose(
-            result["__mktvol_21d"].to_list(),
-            [1.0, 0.0],
+            result["__mktvol_21d"][0],
+            1.0,
             **tolerance.STANDARD,
             err_msg=f"Unexpected __mktvol_21d values: {result['__mktvol_21d'].to_list()}",
         )

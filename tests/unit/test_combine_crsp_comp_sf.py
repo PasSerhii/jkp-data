@@ -357,7 +357,11 @@ def _polars_combine_crsp_comp_sf(tmp: Path) -> tuple[pl.DataFrame, pl.DataFrame]
             bidask=pl.when(pl.col("prcstd") == 4).then(pl.lit(1)).otherwise(pl.lit(0)),
             crsp_shrcd=fl_none(),
             crsp_exchcd=fl_none(),
-            me_company=pl.col("me"),
+            me_company=pl.when(
+                pl.when(pl.col("tpci") == "0").then(pl.col("me")).count().over(["gvkey", "eom"]) > 0
+            )
+            .then(pl.when(pl.col("tpci") == "0").then(pl.col("me")).sum().over(["gvkey", "eom"]))
+            .otherwise(pl.col("me")),
             source_crsp=pl.lit(0),
             ret_lag_dif=pl.col("ret_lag_dif").cast(pl.Int64),
         )
@@ -1369,6 +1373,27 @@ class TestEdgeCases:
         msf, dsf = _duckdb_combine_crsp_comp_sf(interim)
         assert msf.height >= 1
         assert dsf.height >= 1
+
+    def test_compustat_company_me_sums_common_share_classes(self, tmp_path: Path) -> None:
+        """Each primary issue must carry total common-equity ME for its gvkey-month."""
+        interim = _make_test_layout(tmp_path)
+        _make_crsp_msf(interim, n_permnos=0)
+        _make_comp_msf(interim, n_gvkeys=1)
+        _make_crsp_dsf(interim, n_permnos=0)
+        _make_comp_dsf(interim, n_gvkeys=1)
+
+        comp = pl.read_parquet(interim / "comp_msf.parquet").with_columns(tpci=pl.lit("0"))
+        second = comp.with_columns(iid=pl.lit("02"), me=pl.col("me") * 2)
+        pl.concat([comp, second]).write_parquet(interim / "comp_msf.parquet")
+
+        msf, _ = _duckdb_combine_crsp_comp_sf(interim)
+        comp_rows = msf.filter(pl.col("source_crsp") == 0)
+        expected = (
+            comp_rows.group_by(["gvkey", "eom"])
+            .agg(pl.col("me").sum().alias("expected"))
+            .join(comp_rows, on=["gvkey", "eom"])
+        )
+        assert expected.filter((pl.col("me_company") - pl.col("expected")).abs() > 1e-12).is_empty()
 
     def test_leap_year_eom(self, tmp_path: Path) -> None:
         """Feb 29 dates handled correctly by DuckDB last_day()."""

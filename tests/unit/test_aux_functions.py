@@ -17,9 +17,63 @@ from jkp.data.aux_functions import (
     _ensure_ff_portfolio_columns,
     aug_msf_v2,
     gen_crsp_sf,
+    gen_delist_df,
     merge_roll_apply_daily_results,
     prepare_daily,
 )
+
+
+def test_compustat_delist_after_download_cutoff_is_not_applied(test_paths) -> None:
+    """A later vendor delist must not truncate the last days of an earlier run."""
+    pl.DataFrame(
+        {
+            "gvkey": ["001000"],
+            "iid": ["01"],
+            "secstat": ["I"],
+            "dlrsni": ["01"],
+            "dldtei": [date(2026, 7, 14)],
+        }
+    ).write_parquet(test_paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
+    returns = pl.DataFrame(
+        {
+            "gvkey": ["001000", "001000"],
+            "iid": ["01", "01"],
+            "datadate": [date(2026, 6, 29), date(2026, 6, 30)],
+            "ret": [0.01, 0.0],
+            "ret_local": [0.01, 0.0],
+            "ret_lag_dif": [1, 1],
+        }
+    )
+
+    assert gen_delist_df(test_paths, returns).is_empty()
+
+
+def test_compustat_delist_within_download_uses_last_nonzero_return(test_paths) -> None:
+    """Completed delists retain the established last-trading-return behavior."""
+    pl.DataFrame(
+        {
+            "gvkey": ["001000"],
+            "iid": ["01"],
+            "secstat": ["I"],
+            "dlrsni": ["02"],
+            "dldtei": [date(2026, 6, 30)],
+        }
+    ).write_parquet(test_paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
+    returns = pl.DataFrame(
+        {
+            "gvkey": ["001000", "001000"],
+            "iid": ["01", "01"],
+            "datadate": [date(2026, 6, 29), date(2026, 6, 30)],
+            "ret": [0.01, 0.0],
+            "ret_local": [0.01, 0.0],
+            "ret_lag_dif": [1, 1],
+        }
+    )
+
+    result = gen_delist_df(test_paths, returns)
+    assert result.to_dicts() == [
+        {"gvkey": "001000", "iid": "01", "date_delist": date(2026, 6, 29), "dlret": -0.3}
+    ]
 
 
 def test_ff_portfolio_pivot_adds_missing_buckets_as_typed_nulls() -> None:
