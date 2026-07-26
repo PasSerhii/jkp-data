@@ -111,6 +111,22 @@ Write-Host "Immutable URI: ${Registry}/${Repository}@${Digest}"
 but this repository currently permits mutable tags. Only the reported digest
 URI is immutable, so production jobs should use that URI.
 
+### The `jkp-data-production` tag
+
+`alphabeta` is shared with other services, so every jkp-data tag carries the
+`jkp-data-` prefix. Automation tracks the moving tag
+`alphabeta:jkp-data-production`, which is repointed at each release:
+
+```powershell
+docker tag jkp-data:production "${Registry}/${Repository}:jkp-data-production"
+docker push "${Registry}/${Repository}:jkp-data-production"
+```
+
+Push the timestamped `jkp-data-<timestamp>-<sha>` tag alongside it from the same
+build. Both tags then share one digest, so the moving tag stays convenient for
+schedulers while the timestamped tag pins the exact build for rollback. Anything
+that must not shift under a re-push should still reference the digest URI.
+
 ## Run on EC2
 
 Attach an adequately sized EBS volume and prepare its mount for the container's
