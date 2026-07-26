@@ -30,6 +30,14 @@ BYPASS_CRSP = True
 # mirroring the SAS `*_production_*` macros. Written under processed/production/.
 PRODUCTION_OUTPUT = True
 
+# Shared parallel workers for the indexed SECD/G_SECD batch downloads (capped at
+# 4 by aux_functions.MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS). The July 2026 run
+# had both workers 100% busy at 2 with zero retries/timeouts (downloads were the
+# binding constraint); 4 is being evaluated against that baseline — compare
+# download_telemetry.csv throughput/retries and RDS load before keeping it. The
+# `jkp build --daily-download-workers` flag overrides this default per run.
+DAILY_DOWNLOAD_WORKERS = 4
+
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
     "primary_sec": 1,

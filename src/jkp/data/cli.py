@@ -108,16 +108,17 @@ def build(
         min=1.0,
         help="Seconds between persistent CPU, memory, disk, I/O, and network samples.",
     ),
-    daily_download_workers: int = typer.Option(
-        2,
+    daily_download_workers: int | None = typer.Option(
+        None,
         "--daily-download-workers",
         min=1,
         max=4,
-        help="Shared parallel workers for indexed SECD/G_SECD batch downloads.",
+        help="Shared parallel workers for indexed SECD/G_SECD batch downloads. "
+        "Defaults to config.DAILY_DOWNLOAD_WORKERS when not specified.",
     ),
 ) -> None:
     """Run the full data generation pipeline."""
-    from .config import BYPASS_CRSP, PRODUCTION_OUTPUT
+    from .config import BYPASS_CRSP, DAILY_DOWNLOAD_WORKERS, PRODUCTION_OUTPUT
     from .main import run_pipeline
 
     if not force and output_dir.exists() and any(output_dir.iterdir()):
@@ -136,7 +137,9 @@ def build(
         compustat_source=compustat_source,
         metrics_interval_seconds=metrics_interval_seconds,
         reuse_raw=reuse_raw,
-        daily_download_workers=daily_download_workers,
+        daily_download_workers=(
+            DAILY_DOWNLOAD_WORKERS if daily_download_workers is None else daily_download_workers
+        ),
     )
 
 

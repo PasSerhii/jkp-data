@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from jkp.data import __version__
 from jkp.data.cli import app
-from jkp.data.config import BYPASS_CRSP, PRODUCTION_OUTPUT
+from jkp.data.config import BYPASS_CRSP, DAILY_DOWNLOAD_WORKERS, PRODUCTION_OUTPUT
 from jkp.data.database_sources import CompustatSource
 
 runner = CliRunner()
@@ -100,7 +100,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -117,7 +117,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -134,7 +134,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -151,7 +151,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -168,7 +168,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -185,7 +185,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -212,7 +212,7 @@ class TestBuildCommand:
             compustat_source=CompustatSource.xpressfeed,
             metrics_interval_seconds=60.0,
             reuse_raw=False,
-            daily_download_workers=2,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
         )
 
     @patch("jkp.data.main.run_pipeline")

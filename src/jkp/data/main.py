@@ -52,6 +52,7 @@ from .config import (
 )
 from .config import (
     BYPASS_CRSP,
+    DAILY_DOWNLOAD_WORKERS,
     PRODUCTION_OUTPUT,
     ROLLING_DAILY_SPECS,
 )
@@ -77,7 +78,7 @@ def run_pipeline(
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
     metrics_interval_seconds: float = 60.0,
     reuse_raw: bool = False,
-    daily_download_workers: int = 2,
+    daily_download_workers: int = DAILY_DOWNLOAD_WORKERS,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
