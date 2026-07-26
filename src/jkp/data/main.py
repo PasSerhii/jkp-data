@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
@@ -55,6 +56,7 @@ from .config import (
     DAILY_DOWNLOAD_WORKERS,
     PRODUCTION_OUTPUT,
     ROLLING_DAILY_SPECS,
+    ROLLING_DAILY_WORKERS,
 )
 from .config import (
     END_DATE as DEFAULT_END_DATE,
@@ -64,6 +66,33 @@ from .paths import DataPaths
 from .production import export_production
 from .runtime_monitor import get_active_monitor, monitor_pipeline
 from .wrds_credentials import get_wrds_credentials
+
+
+def _run_rolling_daily(paths: DataPaths, end_date: date) -> None:
+    """Compute every rolling daily window, overlapping independent calculations.
+
+    Each (window, variable) pair reads the same prepared daily panel and writes
+    its own ``__roll{sfx}_{var}.parquet``, so the combinations neither share
+    mutable state nor collide on output paths. Threads rather than processes:
+    the work happens inside Polars, which releases the GIL, and passing
+    LazyFrames across process boundaries would cost more than it saves.
+    ``config.ROLLING_DAILY_WORKERS = 1`` restores sequential execution.
+    """
+    jobs = [(var, sfx, min_obs) for sfx, min_obs, vars_ in ROLLING_DAILY_SPECS for var in vars_]
+    if ROLLING_DAILY_WORKERS <= 1 or len(jobs) <= 1:
+        for var, sfx, min_obs in jobs:
+            roll_apply_daily(paths, var, sfx, min_obs, end_date=end_date)
+        return
+
+    with ThreadPoolExecutor(max_workers=ROLLING_DAILY_WORKERS) as pool:
+        futures = [
+            pool.submit(roll_apply_daily, paths, var, sfx, min_obs, end_date=end_date)
+            for var, sfx, min_obs in jobs
+        ]
+        # Let every job settle before raising, so a failure cannot leave the
+        # merge step reading a half-written set of windows.
+        for future in futures:
+            future.result()
 
 
 @monitor_pipeline
@@ -293,9 +322,7 @@ def run_pipeline(
         10,
     )
     prepare_daily(paths, interim / "world_dsf.parquet", interim / "ap_factors_daily.parquet")
-    for sfx, min_obs, vars_ in ROLLING_DAILY_SPECS:
-        for var in vars_:
-            roll_apply_daily(paths, var, sfx, min_obs, end_date=effective_end_date)
+    _run_rolling_daily(paths, effective_end_date)
     merge_roll_apply_daily_results(paths, end_date=effective_end_date)
     finish_daily_chars(paths, interim / "market_chars_d.parquet")
     monitor.set_phase("final_outputs")

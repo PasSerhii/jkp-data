@@ -6,6 +6,7 @@ from datetime import date
 from unittest.mock import MagicMock
 
 import jkp.data.main as pipeline
+from jkp.data.config import DAILY_DOWNLOAD_WORKERS
 
 
 def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) -> None:
@@ -147,7 +148,7 @@ def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) ->
     assert download_kwargs["end_date"] == runtime_end
     assert download_kwargs["raw_schema"] == "public"
     assert download_kwargs["connection_info"] == "postgresql://private-rds"
-    assert download_kwargs["daily_download_workers"] == 2
+    assert download_kwargs["daily_download_workers"] == DAILY_DOWNLOAD_WORKERS
     assert mocks["standardized_accounting_data"].call_args.args[-1] == runtime_start
 
     assert mocks["comp_industry"].call_args.kwargs["end_date"] == runtime_end

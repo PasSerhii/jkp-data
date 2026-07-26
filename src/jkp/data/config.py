@@ -30,13 +30,25 @@ BYPASS_CRSP = True
 # mirroring the SAS `*_production_*` macros. Written under processed/production/.
 PRODUCTION_OUTPUT = True
 
-# Shared parallel workers for the indexed SECD/G_SECD batch downloads (capped at
-# 4 by aux_functions.MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS). The July 2026 run
-# had both workers 100% busy at 2 with zero retries/timeouts (downloads were the
-# binding constraint); 4 is being evaluated against that baseline — compare
-# download_telemetry.csv throughput/retries and RDS load before keeping it. The
+# Shared parallel workers for the indexed SECD/G_SECD batch downloads. The
 # `jkp build --daily-download-workers` flag overrides this default per run.
-DAILY_DOWNLOAD_WORKERS = 4
+# Measured on the 2026-07-26 full run: 2->4 workers scaled linearly (saturation
+# 4.00x/4, zero retries) while the source RDS stayed at ~40% CPU and 13% of
+# provisioned IOPS, so the client — not the database — was the limit.
+DAILY_DOWNLOAD_WORKERS = 8
+
+# Hard ceiling on the above; also bounds the CLI flag. Raise only alongside
+# evidence that the source database tolerates the extra concurrency.
+MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS = 8
+
+# Independent rolling-window calculations executed concurrently by
+# `roll_apply_daily`. The 19 (window, variable) combinations are independent and
+# each writes its own parquet, but on the 2026-07-26 run they were issued
+# serially at a mean of 22.7 of 128 cores. A single call peaked at ~48 GiB of
+# real RAM with ~445 GiB free, so a small fan-out is safe; keep this modest
+# because each worker holds its own Polars collect buffers. Set to 1 to restore
+# fully sequential execution.
+ROLLING_DAILY_WORKERS = 4
 
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {

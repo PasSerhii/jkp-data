@@ -25,7 +25,12 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
-from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
+from .config import (
+    COLLECT_CHUNK_SIZE,
+    END_DATE,
+    MAIN_FILTERS,
+    MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
+)
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
@@ -110,7 +115,6 @@ DAILY_COMPUSTAT_PAIR_HEADERS = {
     "comp.g_secd": "comp.g_security",
 }
 DAILY_COMPUSTAT_BATCH_SIZE = 250
-MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS = 4
 DAILY_COMPUSTAT_BATCH_MAX_RETRIES = 3
 DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0)
 

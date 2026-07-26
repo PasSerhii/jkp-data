@@ -484,7 +484,9 @@ class PipelineRunMonitor:
         status: str,
         error: BaseException | None,
     ) -> None:
-        with self.steps_path.open("a", encoding="utf-8", newline="") as handle:
+        # Steps can finish concurrently (see the parallel roll_apply_daily fan-out
+        # in main), so serialize the append or rows interleave mid-write.
+        with self._lock, self.steps_path.open("a", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(
                 (
                     step.token,

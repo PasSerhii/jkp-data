@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 
 from . import __version__
+from .config import MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS
 from .database_sources import CompustatSource
 
 
@@ -112,7 +113,7 @@ def build(
         None,
         "--daily-download-workers",
         min=1,
-        max=4,
+        max=MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
         help="Shared parallel workers for indexed SECD/G_SECD batch downloads. "
         "Defaults to config.DAILY_DOWNLOAD_WORKERS when not specified.",
     ),
