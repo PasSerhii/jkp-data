@@ -4,6 +4,11 @@ The image runs the `jkp` CLI. It does not contain credentials, licensed source
 data, or generated output. Supply credentials at runtime and mount durable
 storage at `/data`.
 
+The build is multi-stage: a builder resolves the virtualenv with `uv`, and the
+runtime stage copies only the finished `/app/.venv`. Neither `uv` nor the
+`src/` tree ships in the final image — the package is installed non-editable,
+so its `resources/` data lives inside the virtualenv.
+
 ## Build and test locally
 
 From the repository root in PowerShell:
