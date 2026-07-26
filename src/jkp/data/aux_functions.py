@@ -4978,8 +4978,16 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     publication_fields = [
         name for name in ("pdate", "fdate", "pdateq", "fdateq", "rdq") if name in schema_names
     ]
+    # Earliest marker, not latest: `pdate`/`rdq` record when preliminary results
+    # were released and `fdate` when the final filing landed, typically weeks
+    # later. Taking the maximum would withhold a statement that was already
+    # public — Driven Brands FY2025 was released 2026-05-19 but finalized
+    # 2026-06-03, which pushed it out of the May panel that the production SAS
+    # (a plain four-month lag) includes. Minimum keeps the guard doing only its
+    # intended job: blocking rows whose data did not exist yet, such as Akanda
+    # FY2025, which has no `pdate` at all and a `fdate` of 2026-07-01.
     availability_date = (
-        pl.max_horizontal([col(name).cast(pl.Date) for name in publication_fields])
+        pl.min_horizontal([col(name).cast(pl.Date) for name in publication_fields])
         if publication_fields
         else pl.lit(None, dtype=pl.Date)
     )

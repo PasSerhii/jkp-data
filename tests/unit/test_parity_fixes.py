@@ -165,24 +165,74 @@ def test_accounting_public_start_respects_actual_availability() -> None:
     assert result == [date(2026, 4, 30), date(2026, 7, 31), date(2026, 4, 30)]
 
 
-def test_accounting_loader_uses_latest_publication_field(tmp_path) -> None:
+def test_accounting_loader_uses_earliest_publication_field(tmp_path) -> None:
+    """Availability is the first public release, not the final filing.
+
+    Row 1 mirrors Driven Brands FY2025: released 2026-05-19, finalized
+    2026-06-03. Using the later date would withhold it from the May panel that
+    the production SAS includes. Row 2 mirrors Akanda FY2025, which has no
+    pdate, so fdate is the only evidence of when the data existed.
+    """
     source_path = tmp_path / "funda.parquet"
     pl.DataFrame(
         {
-            "gvkey": ["040703"],
-            "datadate": [date(2025, 12, 31)],
-            "indfmt": ["INDL"],
-            "datafmt": ["STD"],
-            "popsrc": ["D"],
-            "consol": ["C"],
-            "pdate": [date(2026, 6, 20)],
-            "fdate": [date(2026, 7, 1)],
-        }
+            "gvkey": ["037751", "040703"],
+            "datadate": [date(2025, 12, 31), date(2025, 12, 31)],
+            "indfmt": ["INDL", "INDL"],
+            "datafmt": ["STD", "STD"],
+            "popsrc": ["D", "D"],
+            "consol": ["C", "C"],
+            "pdate": [date(2026, 5, 19), None],
+            "fdate": [date(2026, 6, 3), date(2026, 7, 1)],
+        },
+        schema_overrides={"pdate": pl.Date, "fdate": pl.Date},
     ).write_parquet(source_path)
 
     result = load_raw_fund_table_and_filter(source_path, None, "NA", 2).collect()
 
-    assert result["availability_date"][0] == date(2026, 7, 1)
+    assert result["availability_date"].to_list() == [date(2026, 5, 19), date(2026, 7, 1)]
+
+
+def test_publication_guard_matches_production_lag_on_known_records(tmp_path) -> None:
+    """End-to-end on the four securities audited against the RDS.
+
+    The guard must only ever delay a statement past the plain four-month lag
+    when the data genuinely was not public yet.
+    """
+    source_path = tmp_path / "funda.parquet"
+    pl.DataFrame(
+        {
+            "gvkey": ["037751", "319310", "009818", "040703"],
+            "datadate": [
+                date(2025, 12, 31),  # Driven Brands FY2025
+                date(2026, 1, 31),  # OVS FY2025
+                date(2026, 3, 31),  # Sony FY2025
+                date(2025, 12, 31),  # Akanda FY2025
+            ],
+            "indfmt": ["INDL"] * 4,
+            "datafmt": ["STD"] * 4,
+            "popsrc": ["D"] * 4,
+            "consol": ["C"] * 4,
+            "pdate": [date(2026, 5, 19), date(2026, 4, 21), date(2026, 5, 8), None],
+            "fdate": [date(2026, 6, 3), date(2026, 6, 5), date(2026, 6, 23), date(2026, 7, 1)],
+        },
+        schema_overrides={"pdate": pl.Date, "fdate": pl.Date},
+    ).write_parquet(source_path)
+
+    starts = (
+        load_raw_fund_table_and_filter(source_path, None, "NA", 2)
+        .with_columns(accounting_public_start(4))
+        .collect()
+        .get_column("start_date")
+        .to_list()
+    )
+
+    assert starts == [
+        date(2026, 5, 31),  # Driven Brands: public 05-19, in the May panel
+        date(2026, 5, 31),  # OVS: public 04-21, four-month lag binds
+        date(2026, 7, 31),  # Sony: four-month lag binds, not eligible in May
+        date(2026, 7, 31),  # Akanda: no pdate, fdate 07-01 blocks the look-ahead
+    ]
 
 
 def test_secm_return_index_uses_production_trfm_coalesce(test_paths, monkeypatch) -> None:
