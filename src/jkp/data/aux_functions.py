@@ -470,10 +470,12 @@ def gen_prihist_files(paths: DataPaths):
         1) Load comp_sec_history and comp_g_sec_history into DuckDB.
         2) Create three tables by item code: PRIHISTROW (global), PRIHISTUSA (NA), PRIHISTCAN (NA).
         3) Keep gvkey, itemvalue→flag, effdate, thrudate.
-        4) Write each to raw_data_dfs as separate Parquet files.
+        4) Combine issue-level EXCHG intervals into __exchg_history.
+        5) Write each to raw_data_dfs as separate Parquet files.
 
     Output:
-        Parquets: __prihistrow.parquet, __prihistusa.parquet, __prihistcan.parquet.
+        Parquets: __prihistrow.parquet, __prihistusa.parquet,
+        __prihistcan.parquet, and __exchg_history.parquet.
     """
     con = ibis.duckdb.connect(threads=os.cpu_count())
     con.create_table(
@@ -519,6 +521,30 @@ def gen_prihist_files(paths: DataPaths):
     con.table("__prihistcan").to_parquet(
         paths.interim_dir / "raw_data_dfs" / "__prihistcan.parquet"
     )
+    con.raw_sql("""
+    CREATE TABLE __exchg_history AS
+    SELECT DISTINCT
+        gvkey,
+        iid,
+        TRY_CAST(itemvalue AS INTEGER) AS historical_exchg,
+        effdate,
+        thrudate
+    FROM (
+        SELECT gvkey, iid, itemvalue, effdate, thrudate
+        FROM comp_sec_history
+        WHERE item = 'EXCHG'
+
+        UNION ALL
+
+        SELECT gvkey, iid, itemvalue, effdate, thrudate
+        FROM comp_g_sec_history
+        WHERE item = 'EXCHG'
+    ) history
+    WHERE TRY_CAST(itemvalue AS INTEGER) IS NOT NULL;
+    """)
+    con.table("__exchg_history").to_parquet(
+        paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet"
+    )
     con.disconnect()
 
 
@@ -555,6 +581,40 @@ def gen_fx1(paths: DataPaths):
     """)
     con.table("__fx1").to_parquet(paths.interim_dir / "raw_data_dfs" / "__fx1.parquet")
     con.disconnect()
+
+
+def _record_ff_snapshot(paths: DataPaths) -> None:
+    """Persist the exact FF/RF input identity used by this pipeline run."""
+    source_path = paths.raw_tables_dir / "ff_factors_monthly.parquet"
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    factors = pl.read_parquet(source_path, columns=["date", "rf"]).sort("date")
+    latest = factors.tail(1)
+    manifest = {
+        "source": "ff.factors_monthly",
+        "sha256": digest.hexdigest(),
+        "bytes": source_path.stat().st_size,
+        "row_count": factors.height,
+        "min_date": str(factors["date"].min()) if factors.height else None,
+        "max_date": str(factors["date"].max()) if factors.height else None,
+        "latest_rf": float(latest["rf"][0])
+        if latest.height and latest["rf"][0] is not None
+        else None,
+    }
+    manifest_path = paths.base_dir / "source_snapshot_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.note(
+            "FF snapshot "
+            f"max_date={manifest['max_date']} latest_rf={manifest['latest_rf']} "
+            f"sha256={manifest['sha256']}"
+        )
 
 
 @measure_time
@@ -657,6 +717,7 @@ def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
     collect_and_write(
         ff_factors_monthly, paths.interim_dir / "raw_data_dfs" / "ff_factors_monthly.parquet"
     )
+    _record_ff_snapshot(paths)
     comp_r_ex_codes = pl.scan_parquet(paths.raw_tables_dir / "comp_r_ex_codes.parquet").select(
         ["exchgdesc", "exchgcd"]
     )
@@ -2386,7 +2447,12 @@ def build_mcti(paths: DataPaths):
 
 
 @measure_time
-def prepare_comp_sf(paths: DataPaths, freq, bypass_crsp: bool = False):
+def prepare_comp_sf(
+    paths: DataPaths,
+    freq,
+    bypass_crsp: bool = False,
+    apply_correction: bool = False,
+):
     """
     Description:
         Prepare Compustat security-file derivatives (Comp DSF/SSF equivalents) for daily/monthly runs.
@@ -2408,7 +2474,7 @@ def prepare_comp_sf(paths: DataPaths, freq, bypass_crsp: bool = False):
         "datadate",
         "ddate",
     )
-    gen_comp_dsf(paths)
+    gen_comp_dsf(paths, apply_correction=apply_correction)
     if freq == "both":
         process_comp_sf1(paths, "d", bypass_crsp=bypass_crsp)
         process_comp_sf1(paths, "m", bypass_crsp=bypass_crsp)
@@ -2524,9 +2590,67 @@ def adj_trd_vol_NASDAQ(datevar, col_to_adjust, exchg_var, exchg_val):
     return adj_trd_vol
 
 
+def _register_historical_exchange_view(
+    con,
+    *,
+    view_name: str,
+    source_path: Path | str,
+    history_path: Path | str,
+) -> None:
+    """Register a pricing view with EXCHG resolved as of each observation date.
+
+    Compustat's security pricing headers can expose the latest exchange on old
+    observations.  ``sec_history`` is the point-in-time source of truth used by
+    the original SAS code.  An ASOF join is both interval-correct and efficient
+    for the very large daily Parquets.
+    """
+
+    def sql_path(value: Path | str) -> str:
+        return str(value).replace("\\", "/").replace("'", "''")
+
+    current_view = f"{view_name}_current"
+    history_view = f"{view_name}_exchange_history"
+    if not Path(history_path).is_file():
+        con.raw_sql(f"""
+        CREATE VIEW {current_view} AS
+            SELECT * FROM read_parquet('{sql_path(source_path)}');
+        CREATE VIEW {view_name} AS SELECT * FROM {current_view};
+        """)
+        return
+    con.raw_sql(f"""
+    CREATE VIEW {current_view} AS
+        SELECT * FROM read_parquet('{sql_path(source_path)}');
+    CREATE VIEW {history_view} AS
+        SELECT gvkey, iid, historical_exchg, effdate, thrudate
+        FROM read_parquet('{sql_path(history_path)}')
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY gvkey, iid, effdate
+            ORDER BY thrudate DESC NULLS FIRST, historical_exchg
+        ) = 1;
+    CREATE VIEW {view_name} AS
+        SELECT
+            s.* EXCLUDE (exchg),
+            CAST(
+                COALESCE(
+                    CASE
+                        WHEN h.effdate IS NOT NULL
+                         AND (h.thrudate IS NULL OR s.datadate <= h.thrudate)
+                        THEN h.historical_exchg
+                    END,
+                    s.exchg
+                ) AS INTEGER
+            ) AS exchg
+        FROM {current_view} AS s
+        ASOF LEFT JOIN {history_view} AS h
+            ON s.gvkey = h.gvkey
+           AND s.iid = h.iid
+           AND s.datadate >= h.effdate;
+    """)
+
+
 def gen_comp_dsf(
     paths: DataPaths,
-    apply_correction: bool = True,
+    apply_correction: bool = False,
     correction_method: str = "multiplier",
     variation_threshold: float = 1.3,
 ):
@@ -2553,8 +2677,9 @@ def gen_comp_dsf(
 
     Args:
         apply_correction: Whether to apply the Compustat return corrections
-            (Bessembinder et al. 2023). Default True. Set False to reproduce
-            original behavior.
+            (Bessembinder et al. 2023). Default False so the pipeline preserves
+            the original SAS/WRDS source observations. Enable explicitly for a
+            robustness build.
         correction_method: decimal-correction method ('multiplier' fixed multipliers
             or 'interpolation' geometric mean of clean endpoints).
 
@@ -2611,9 +2736,6 @@ def gen_comp_dsf(
         g_secd_path = paths.raw_table_source("comp.g_secd")
         secd_path = paths.raw_table_source("comp.secd")
 
-    def _sql_path(source: Path | str) -> str:
-        return str(source).replace("\\", "/")
-
     # Original SQL processing
     # Views, not tables: the whole merge/FX/USD pipeline streams in a single
     # pass at the final COPY instead of materializing five intermediate
@@ -2621,9 +2743,21 @@ def gen_comp_dsf(
     # __comp_dsf_na view as an equivalent CASE expression.
     con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_dsf.ddb"), threads=os.cpu_count())
 
+    history_path = paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet"
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_g_secd",
+        source_path=g_secd_path,
+        history_path=history_path,
+    )
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_secd",
+        source_path=secd_path,
+        history_path=history_path,
+    )
+
     con.raw_sql(f"""
-    CREATE VIEW comp_g_secd AS SELECT * FROM read_parquet('{_sql_path(g_secd_path)}');
-    CREATE VIEW comp_secd AS SELECT * FROM read_parquet('{_sql_path(secd_path)}');
     CREATE VIEW __firm_shares2 AS
         SELECT * FROM read_parquet('{(paths.interim_dir / "__firm_shares2.parquet").as_posix()}');
     CREATE VIEW fx AS SELECT * FROM read_parquet('{(paths.interim_dir / "fx_data.parquet").as_posix()}');
@@ -2879,10 +3013,11 @@ def gen_secm_data(paths: DataPaths):
     compustat_fx(paths).rename({"datadate": "date"}).write_parquet(
         paths.interim_dir / "fx_data.parquet"
     )
-    con.create_table(
-        "comp_secm",
-        con.read_parquet(paths.raw_tables_dir / "comp_secm.parquet"),
-        overwrite=True,
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_secm",
+        source_path=paths.raw_tables_dir / "comp_secm.parquet",
+        history_path=paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet",
     )
     con.create_table(
         "__firm_shares2",
@@ -3683,10 +3818,13 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
         1) Connect to DuckDB (persistent file for out-of-core processing).
         2) Create monthly world table: normalize CRSP/Comp → UNION ALL → LEAD(ret_exc).
         3) Derive obs_main: prefer CRSP when multiple observations per (gvkey, iid, eom).
-        4) Write __msf_world.parquet with deterministic dedup (primary_sec preferred
+        4) In CRSP-bypass mode, recompute me_company for USA main-exchange rows as the
+           (gvkey, date) sum over all USA main-exchange listings, pre-dedup (production
+           SAS update); every other row keeps its incoming me_company.
+        5) Write __msf_world.parquet with deterministic dedup (primary_sec preferred
            on tie via ROW_NUMBER).
-        5) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
-        6) Clean up DuckDB file.
+        6) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
+        7) Clean up DuckDB file.
 
     When ``bypass_crsp`` is True, the CRSP normalization CTEs and the UNION ALL are
     dropped so the world files are built from Compustat only (every row has
@@ -3835,11 +3973,7 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                     ajexdi AS adjfct,
                     cshoc AS shares,
                     me,
-                    COALESCE(
-                        SUM(CASE WHEN tpci = '0' THEN me ELSE NULL END)
-                            OVER (PARTITION BY gvkey, eom),
-                        me
-                    ) AS me_company,
+                    me AS me_company,
                     prc, prc_local, prc_high, prc_low, dolvol,
                     cshtrm AS tvol,
                     ret, ret_local, ret_exc,
@@ -3853,7 +3987,12 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                     WHEN LEAD(ret_lag_dif, 1) OVER (PARTITION BY id ORDER BY eom) != 1
                     THEN NULL
                     ELSE LEAD(ret_exc, 1) OVER (PARTITION BY id ORDER BY eom)
-                END AS ret_exc_lead1m
+                END AS ret_exc_lead1m,
+                CASE
+                    WHEN LEAD(ret_lag_dif, 1) OVER (PARTITION BY id ORDER BY eom) != 1
+                    THEN NULL
+                    ELSE LEAD(ret_local, 1) OVER (PARTITION BY id ORDER BY eom)
+                END AS ret_local_lead1m
             FROM (
                 {monthly_union}
             ) unioned
@@ -3880,21 +4019,39 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
             GROUP BY id, eom
         """)
 
+        # In CRSP-bypass mode the production SAS recomputes me_company for USA
+        # main-exchange rows as the (gvkey, date) sum over all USA main-exchange
+        # listings — share classes and preferred issues alike, with no
+        # tpci/common filter — computed on the pre-dedup panel; every other row
+        # keeps its issue me. With CRSP present the original SAS has no such
+        # update: CRSP rows carry the permco aggregate, Compustat rows keep me.
+        me_company_expr = (
+            "CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
+            "THEN COALESCE(SUM(CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
+            "THEN a.me END) OVER (PARTITION BY a.gvkey, a.date), a.me) "
+            "ELSE a.me_company END"
+            if bypass_crsp
+            else "a.me_company"
+        )
+
         # Write monthly output with deterministic dedup (prefer CRSP)
         con.execute(f"""
             COPY (
                 SELECT
                     id, permno, permco, gvkey, iid, excntry, exch_main, common,
                     primary_sec, bidask, crsp_shrcd, crsp_exchcd, comp_tpci, comp_exchg,
-                    curcd, fx, date, eom, adjfct, shares, me, me_company, prc, prc_local,
+                    curcd, fx, date, eom, adjfct, shares, me,
+                    _me_company AS me_company, prc, prc_local,
                     prc_high, prc_low, dolvol, tvol, ret, ret_local, ret_exc, ret_lag_dif,
-                    div_tot, div_cash, div_spc, source_crsp, ret_exc_lead1m, obs_main
+                    div_tot, div_cash, div_spc, source_crsp, ret_exc_lead1m,
+                    ret_local_lead1m, obs_main
                 FROM (
                     -- source_crsp DESC is a no-op today (CRSP/Comp ids don't collide);
                     -- primary_sec DESC is the real tie-break: when Compustat rows
                     -- disagree on primary_sec for the same (id, eom), prefer the
                     -- primary one. See combine_crsp_comp_sf docstring for details.
                     SELECT a.*, b.obs_main,
+                        {me_company_expr} AS _me_company,
                         ROW_NUMBER() OVER (
                             PARTITION BY a.id, a.eom
                             ORDER BY a.source_crsp DESC, a.primary_sec DESC
@@ -4906,9 +5063,18 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     datafmt_val = "HIST_STD" if mode == 1 else "STD"
     popsrc_val = "I" if mode == 1 else "D"
     accounting_start = pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
+    raw = pl.scan_parquet(filename)
+    schema_names = set(raw.collect_schema().names())
+    publication_fields = [
+        name for name in ("pdate", "fdate", "pdateq", "fdateq", "rdq") if name in schema_names
+    ]
+    availability_date = (
+        pl.max_horizontal([col(name).cast(pl.Date) for name in publication_fields])
+        if publication_fields
+        else pl.lit(None, dtype=pl.Date)
+    )
     df = (
-        pl.scan_parquet(filename)
-        .with_row_index("n")
+        raw.with_row_index("n")
         .filter(
             c1
             & (col("datafmt") == datafmt_val)
@@ -4916,7 +5082,7 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
             & (col("consol") == "C")
             & (col("datadate") >= accounting_start)
         )
-        .with_columns(source=pl.lit(source_str))
+        .with_columns(source=pl.lit(source_str), availability_date=availability_date)
     )
     return df
 
@@ -5150,7 +5316,16 @@ def standardized_accounting_data(
                 ni=(col("ib") + pl.coalesce("xi", 0) + pl.coalesce("do", 0)).cast(pl.Float64)
             )
             .select(
-                ["gvkey", "datadate", "n", "indfmt", "curcd", "source", "ni"]
+                [
+                    "gvkey",
+                    "datadate",
+                    "availability_date",
+                    "n",
+                    "indfmt",
+                    "curcd",
+                    "source",
+                    "ni",
+                ]
                 + [fl_none().alias(i) for i in ["gp", "pstkrv", "pstkl", "itcb", "xad", "txbcof"]]
                 + query_vars
             )
@@ -5185,6 +5360,7 @@ def standardized_accounting_data(
                 [
                     "gvkey",
                     "datadate",
+                    "availability_date",
                     "n",
                     "indfmt",
                     "fyr",
@@ -5221,7 +5397,7 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_funda.parquet", start_date, "NA", 2
         )
         __funda = funda.select(
-            ["gvkey", "datadate", "n", "curcd", "source"]
+            ["gvkey", "datadate", "availability_date", "n", "curcd", "source"]
             + [fl_none().alias(i) for i in ["wcapt", "ltdch", "purtshr"]]
             + query_vars
         )
@@ -5240,7 +5416,17 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_fundq.parquet", start_date, "NA", 2
         )
         __fundq = fundq.select(
-            ["gvkey", "datadate", "n", "fyr", "fyearq", "fqtr", "curcdq", "source"]
+            [
+                "gvkey",
+                "datadate",
+                "availability_date",
+                "n",
+                "fyr",
+                "fyearq",
+                "fqtr",
+                "curcdq",
+                "source",
+            ]
             + [
                 fl_none().alias(i)
                 for i in ["dvtq", "gpq", "dvty", "gpy", "ltdchy", "purtshry", "wcapty"]
@@ -7238,6 +7424,18 @@ def add_profit_scaled_by_lagged_vars(df):
     return df
 
 
+def accounting_public_start(lag_to_pub: int) -> pl.Expr:
+    """Earliest month-end when an accounting observation may enter the panel."""
+    lagged_start = col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end()
+    reported_start = col("availability_date").dt.month_end()
+    return (
+        pl.when(reported_start.is_not_null() & (reported_start > lagged_start))
+        .then(reported_start)
+        .otherwise(lagged_start)
+        .alias("start_date")
+    )
+
+
 def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_pub, max_lag):
     """
     Description:
@@ -7246,7 +7444,9 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
     Steps:
         1) Run persistence job over input parquet (N=5 yrs, min=5) → 'ni_ar_res.parquet'.
         2) Join on (gvkey,curcd,datadate); keep rows with data_available=1.
-        3) Set start_date = datadate + lag_to_pub months; end_date = min(next_start−1mo, datadate+max_lag).
+        3) Set start_date to the later of the normal publication lag and the
+           actual pdate/fdate/rdq month; end_date = min(next_start−1mo,
+           datadate+max_lag).
         4) Expand monthly between start/end to 'public_date'.
 
     Output:
@@ -7258,7 +7458,7 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
         df.join(earnings_pers, on=["gvkey", "curcd", "datadate"], how="left")
         .filter(col("data_available") == 1)
         .sort(["gvkey", "datadate"])
-        .with_columns(start_date=col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end())
+        .with_columns(accounting_public_start(lag_to_pub))
         .sort(["gvkey", "datadate"])
         .with_columns(next_start_date=col("start_date").shift(-1).over(["gvkey"]))
         .with_columns(

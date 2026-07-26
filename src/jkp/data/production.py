@@ -198,39 +198,60 @@ def market_min_price(paths: DataPaths, n: int) -> pl.DataFrame:
 
 
 def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
-    """Daily identifier panel keyed (gvkey, iid, comp_exchg, date).
+    """Daily identifier panel keyed by the stable issue key and trading date.
 
     cusip + conm come from comp.secd; sedol + isin_orig (+ conm fallback) from
-    comp.g_secd. Mirrors the joins in the SAS production macros.
+    comp.g_secd.  Exchange is intentionally not a join key: it changes over an
+    issue's life and current headers can differ from the historical value.
     """
     secd = (
         pl.scan_parquet(paths.raw_table_source("comp.secd"))
         .select(
             "gvkey",
             "iid",
-            comp_exchg=pl.col("exchg").cast(pl.Int64),
             date=pl.col("datadate"),
             cusip=pl.col("cusip"),
             conm_secd=pl.col("conm"),
         )
-        .unique(["gvkey", "iid", "comp_exchg", "date"])
+        .unique(["gvkey", "iid", "date"])
     )
     gsecd = (
         pl.scan_parquet(paths.raw_table_source("comp.g_secd"))
         .select(
             "gvkey",
             "iid",
-            comp_exchg=pl.col("exchg").cast(pl.Int64),
             date=pl.col("datadate"),
             sedol=pl.col("sedol"),
             isin_orig=pl.col("isin"),
             conm_g=pl.col("conm"),
         )
-        .unique(["gvkey", "iid", "comp_exchg", "date"])
+        .unique(["gvkey", "iid", "date"])
     )
-    return secd.join(
-        gsecd, on=["gvkey", "iid", "comp_exchg", "date"], how="full", coalesce=True
-    ).with_columns(conm=pl.coalesce(["conm_secd", "conm_g"]))
+    return secd.join(gsecd, on=["gvkey", "iid", "date"], how="full", coalesce=True).with_columns(
+        conm=pl.coalesce(["conm_secd", "conm_g"])
+    )
+
+
+def _monthly_identifier_panel(paths: DataPaths) -> pl.LazyFrame:
+    """Last available identifiers in each issue-month.
+
+    Production observations use calendar month-end dates, which can be weekends
+    or holidays while SECD identifiers exist only on trading days.  Carrying the
+    last non-null identifier within the same month mirrors the SAS month-end
+    merge and prevents spurious missing names/CUSIPs/ISINs.
+    """
+    return (
+        _identifier_panel(paths)
+        .with_columns(eom=pl.col("date").dt.month_end())
+        .sort(["gvkey", "iid", "date"])
+        .group_by(["gvkey", "iid", "eom"])
+        .agg(
+            [
+                pl.col(name).drop_nulls().last().alias(name)
+                for name in ["conm", "sedol", "cusip", "isin_orig"]
+            ]
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,15 +272,13 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
     sas_out_dir.mkdir(parents=True, exist_ok=True)
     daily_cutoff = min(end_date, date.today())
 
-    # id -> (gvkey, iid, comp_exchg) map from the monthly file (daily lacks them).
+    # id -> stable Compustat issue key map from the monthly file (daily lacks it).
     id_map = (
         pl.scan_parquet(paths.interim_dir / "world_data_output.parquet")
-        .select("id", "gvkey", "iid", "comp_exchg")
+        .select("id", "gvkey", "iid")
         .unique("id")
     )
-    ids = _identifier_panel(paths).select(
-        "gvkey", "iid", "comp_exchg", "date", "sedol", "cusip", "isin_orig"
-    )
+    ids = _identifier_panel(paths).select("gvkey", "iid", "date", "sedol", "cusip", "isin_orig")
 
     daily = (
         pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
@@ -278,7 +297,7 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
             ret_exc_dollar=pl.col("ret_exc"),
         )
         .join(id_map, on="id", how="left")
-        .join(ids, on=["gvkey", "iid", "comp_exchg", "date"], how="left")
+        .join(ids, on=["gvkey", "iid", "date"], how="left")
         .select(
             "excntry",
             "id",
@@ -331,9 +350,7 @@ def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> Non
     )
     minp = market_min_price(paths, 3).rename({"min_prc": "min_price_last_3m_usd"})
     fx_ils = _ils_fx(paths)
-    ids = _identifier_panel(paths).select(
-        "gvkey", "iid", "comp_exchg", "date", "conm", "sedol", "cusip", "isin_orig"
-    )
+    ids = _monthly_identifier_panel(paths)
 
     data = (
         pl.scan_parquet(paths.interim_dir / "world_data_output.parquet")
@@ -341,7 +358,7 @@ def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> Non
         # columns of the same name to avoid '<col>_right' collisions.
         .drop("conm", "sedol", "cusip", "isin_orig", strict=False)
         .filter(pl.col("eom") <= pl.lit(end_date))
-        .join(ids, on=["gvkey", "iid", "comp_exchg", "date"], how="left")
+        .join(ids, on=["gvkey", "iid", "eom"], how="left")
         .join(vol3.lazy(), on=["id", "eom"], how="left")
         .join(vol6.lazy(), on=["id", "eom"], how="left")
         .join(minp.lazy(), on=["id", "eom"], how="left")

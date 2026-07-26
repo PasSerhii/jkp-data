@@ -186,9 +186,9 @@ def _write_monthly_and_ids(paths: DataPaths) -> None:
     ).cast({"date": pl.Date, "eom": pl.Date, "comp_exchg": pl.Int64}).write_parquet(
         paths.interim_dir / "world_data_output.parquet"
     )
-    # SECD / G_SECD are daily; provide identifier rows for the monthly date and
-    # every daily date used in _write_daily.
-    id_dates = [date(2020, 1, 31), date(2020, 1, 10), date(2020, 1, 20)]
+    # SECD / G_SECD are daily.  Jan 31 is deliberately absent so this fixture
+    # also verifies the monthly writer uses the last trading-day identifiers.
+    id_dates = [date(2020, 1, 10), date(2020, 1, 20)]
     n = len(id_dates)
     pl.DataFrame(
         {

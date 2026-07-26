@@ -357,11 +357,7 @@ def _polars_combine_crsp_comp_sf(tmp: Path) -> tuple[pl.DataFrame, pl.DataFrame]
             bidask=pl.when(pl.col("prcstd") == 4).then(pl.lit(1)).otherwise(pl.lit(0)),
             crsp_shrcd=fl_none(),
             crsp_exchcd=fl_none(),
-            me_company=pl.when(
-                pl.when(pl.col("tpci") == "0").then(pl.col("me")).count().over(["gvkey", "eom"]) > 0
-            )
-            .then(pl.when(pl.col("tpci") == "0").then(pl.col("me")).sum().over(["gvkey", "eom"]))
-            .otherwise(pl.col("me")),
+            me_company=pl.col("me"),
             source_crsp=pl.lit(0),
             ret_lag_dif=pl.col("ret_lag_dif").cast(pl.Int64),
         )
@@ -424,7 +420,10 @@ def _polars_combine_crsp_comp_sf(tmp: Path) -> tuple[pl.DataFrame, pl.DataFrame]
     __msf_world = __msf_world.sort(["id", "eom"]).with_columns(
         ret_exc_lead1m=pl.when(pl.col("ret_lag_dif").shift(-1).over("id") != 1)
         .then(None)
-        .otherwise(pl.col("ret_exc").shift(-1).over("id"))
+        .otherwise(pl.col("ret_exc").shift(-1).over("id")),
+        ret_local_lead1m=pl.when(pl.col("ret_lag_dif").shift(-1).over("id") != 1)
+        .then(None)
+        .otherwise(pl.col("ret_local").shift(-1).over("id")),
     )
 
     obs_main = (
@@ -547,7 +546,9 @@ def _make_test_layout(tmp_path: Path) -> Path:
     return interim
 
 
-def _duckdb_combine_crsp_comp_sf(tmp: Path) -> tuple[pl.DataFrame, pl.DataFrame]:
+def _duckdb_combine_crsp_comp_sf(
+    tmp: Path, bypass_crsp: bool = False
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Run the DuckDB implementation and return (monthly_df, daily_df).
 
     ``tmp`` is the interim directory; the function constructs a DataPaths whose
@@ -557,7 +558,7 @@ def _duckdb_combine_crsp_comp_sf(tmp: Path) -> tuple[pl.DataFrame, pl.DataFrame]
     from jkp.data.paths import DataPaths
 
     paths = DataPaths(base_dir=tmp.parent)
-    combine_crsp_comp_sf(paths)
+    combine_crsp_comp_sf(paths, bypass_crsp=bypass_crsp)
     msf = pl.read_parquet(str(tmp / "__msf_world.parquet"))
     dsf = pl.read_parquet(str(tmp / "world_dsf.parquet"))
     return msf, dsf
@@ -910,6 +911,7 @@ class TestUnionAndLead:
             "div_spc",
             "source_crsp",
             "ret_exc_lead1m",
+            "ret_local_lead1m",
             "obs_main",
         }
         assert set(msf.columns) == expected
@@ -1374,8 +1376,8 @@ class TestEdgeCases:
         assert msf.height >= 1
         assert dsf.height >= 1
 
-    def test_compustat_company_me_sums_common_share_classes(self, tmp_path: Path) -> None:
-        """Each primary issue must carry total common-equity ME for its gvkey-month."""
+    def test_compustat_company_me_matches_issue_me(self, tmp_path: Path) -> None:
+        """Without the CRSP bypass, Compustat rows keep issue ME as me_company."""
         interim = _make_test_layout(tmp_path)
         _make_crsp_msf(interim, n_permnos=0)
         _make_comp_msf(interim, n_gvkeys=1)
@@ -1388,12 +1390,46 @@ class TestEdgeCases:
 
         msf, _ = _duckdb_combine_crsp_comp_sf(interim)
         comp_rows = msf.filter(pl.col("source_crsp") == 0)
-        expected = (
-            comp_rows.group_by(["gvkey", "eom"])
-            .agg(pl.col("me").sum().alias("expected"))
-            .join(comp_rows, on=["gvkey", "eom"])
+        assert comp_rows.filter((pl.col("me_company") - pl.col("me")).abs() > 1e-12).is_empty()
+
+    def test_bypass_me_company_sums_usa_main_exchange_listings(self, tmp_path: Path) -> None:
+        """CRSP-bypass mirrors the production SAS company-ME update.
+
+        USA main-exchange listings carry the (gvkey, date) sum of me across all
+        USA main-exchange listings of the company (no tpci/common filter); a
+        null-me listing in that group inherits the group sum; USA off-main and
+        non-USA listings keep their issue me.
+        """
+        interim = _make_test_layout(tmp_path)
+        _make_comp_msf(interim, n_gvkeys=1)
+        _make_comp_dsf(interim, n_gvkeys=1)
+
+        base = pl.read_parquet(interim / "comp_msf.parquet").with_columns(
+            excntry=pl.lit("USA"), exch_main=pl.lit(1, dtype=pl.Int64)
         )
-        assert expected.filter((pl.col("me_company") - pl.col("expected")).abs() > 1e-12).is_empty()
+        pl.concat(
+            [
+                base.with_columns(iid=pl.lit("01"), me=pl.lit(10.0)),
+                base.with_columns(iid=pl.lit("02"), me=pl.lit(30.0)),
+                base.with_columns(iid=pl.lit("03"), me=pl.lit(None, dtype=pl.Float64)),
+                base.with_columns(
+                    iid=pl.lit("04"), me=pl.lit(5.0), exch_main=pl.lit(0, dtype=pl.Int64)
+                ),
+                base.with_columns(iid=pl.lit("05"), me=pl.lit(7.0), excntry=pl.lit("GBR")),
+            ]
+        ).write_parquet(interim / "comp_msf.parquet")
+
+        msf, _ = _duckdb_combine_crsp_comp_sf(interim, bypass_crsp=True)
+        assert msf.height == 5 * len(_MONTHLY_DATES)
+        by_iid = {
+            iid: msf.filter(pl.col("iid") == iid)["me_company"].to_list()
+            for iid in ["01", "02", "03", "04", "05"]
+        }
+        assert all(v == 40.0 for v in by_iid["01"])
+        assert all(v == 40.0 for v in by_iid["02"])
+        assert all(v == 40.0 for v in by_iid["03"])
+        assert all(v == 5.0 for v in by_iid["04"])
+        assert all(v == 7.0 for v in by_iid["05"])
 
     def test_leap_year_eom(self, tmp_path: Path) -> None:
         """Feb 29 dates handled correctly by DuckDB last_day()."""

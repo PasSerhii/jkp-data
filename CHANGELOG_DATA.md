@@ -3,6 +3,14 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 26-07-2026
+__Changes__:
+- Restored source-cell parity as the default: Bessembinder-style decimal repairs and full-history reliability filtering are now opt-in with `--compustat-corrections`.
+- Resolved Compustat exchange membership from `sec_history.EXCHG` at each observation date and month-end identifiers from the last trading day in the month.
+- Matched the production SAS company market equity in the CRSP-bypass build: USA main-exchange listings carry the sum of `me` over all USA main-exchange listings of the company per `(gvkey, date)` (share classes and preferred issues alike), and all other Compustat rows keep `me_company=me`. This replaces the July 23 per-gvkey global sum, which double-counted international cross-listings. Also populated `ret_local_lead1m` with the same continuity guard as `ret_exc_lead1m`.
+- Prevented accounting look-ahead by delaying each annual/quarterly record until the later of the normal publication lag and its actual `pdate`/`fdate`/`rdq` month.
+- Added `source_snapshot_manifest.json`, recording the exact `ff.factors_monthly` hash, date range, and latest RF used by a run.
+
 ## 23-07-2026
 __Changes__:
 - Applied the Bessembinder et al. (2023) Compustat daily-security corrections before return construction: decimal-shift repairs for North America and Global, unreliable-observation filters, never-dividend `trfd=1` recovery, and a residual screen that nulls returns above 1000%.

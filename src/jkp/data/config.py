@@ -30,6 +30,12 @@ BYPASS_CRSP = True
 # mirroring the SAS `*_production_*` macros. Written under processed/production/.
 PRODUCTION_OUTPUT = True
 
+# Optional Bessembinder-style repair/filter pass for extreme Compustat security
+# observations.  The original SAS/WRDS pipeline does not perform this pass, so
+# exact source-cell parity is the default.  Enable it explicitly only for a
+# robustness build where changing/dropping source observations is intended.
+APPLY_COMPUSTAT_CORRECTIONS = False
+
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
     "primary_sec": 1,
