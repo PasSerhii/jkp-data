@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from jkp.data import __version__
 from jkp.data.cli import app
-from jkp.data.config import APPLY_COMPUSTAT_CORRECTIONS, BYPASS_CRSP, PRODUCTION_OUTPUT
+from jkp.data.config import BYPASS_CRSP, PRODUCTION_OUTPUT
 from jkp.data.database_sources import CompustatSource
 
 runner = CliRunner()
@@ -43,7 +43,6 @@ class TestCliHelp:
         assert "--end-date" in _strip_ansi(result.output)
         assert "--compustat-sou" in _strip_ansi(result.output)
         assert "--daily-downloa" in _strip_ansi(result.output)
-        assert "--compustat-cor" in _strip_ansi(result.output)
         assert "OUTPUT_DIR" in _strip_ansi(result.output)
 
     def test_portfolio_help(self):
@@ -96,7 +95,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -114,7 +112,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -132,7 +129,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -150,7 +146,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=True,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -168,7 +163,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=False,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -186,7 +180,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=False,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=None,
             end_date=None,
             compustat_source=CompustatSource.xpressfeed,
@@ -194,12 +187,6 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=2,
         )
-
-    @patch("jkp.data.main.run_pipeline")
-    def test_build_compustat_corrections_are_explicit(self, mock_run_pipeline, tmp_path):
-        result = runner.invoke(app, ["build", str(tmp_path), "--compustat-corrections"])
-        assert result.exit_code == 0
-        assert mock_run_pipeline.call_args.kwargs["apply_compustat_corrections"] is True
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_date_filter(self, mock_run_pipeline, tmp_path):
@@ -220,7 +207,6 @@ class TestBuildCommand:
             output_dir=tmp_path,
             bypass_crsp=BYPASS_CRSP,
             production_output=PRODUCTION_OUTPUT,
-            apply_compustat_corrections=APPLY_COMPUSTAT_CORRECTIONS,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             compustat_source=CompustatSource.xpressfeed,

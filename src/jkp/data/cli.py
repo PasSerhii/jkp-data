@@ -86,12 +86,6 @@ def build(
         help="Also emit the alpha-beta production CSVs (per-country monthly + daily). "
         "Defaults to config.PRODUCTION_OUTPUT when not specified.",
     ),
-    compustat_corrections: bool | None = typer.Option(
-        None,
-        "--compustat-corrections/--no-compustat-corrections",
-        help="Opt into decimal-shift repairs and unreliable-history filtering. "
-        "Disabled by default to preserve WRDS/SAS source-cell parity.",
-    ),
     start_date: str | None = typer.Option(
         None,
         "--start-date",
@@ -123,7 +117,7 @@ def build(
     ),
 ) -> None:
     """Run the full data generation pipeline."""
-    from .config import APPLY_COMPUSTAT_CORRECTIONS, BYPASS_CRSP, PRODUCTION_OUTPUT
+    from .config import BYPASS_CRSP, PRODUCTION_OUTPUT
     from .main import run_pipeline
 
     if not force and output_dir.exists() and any(output_dir.iterdir()):
@@ -137,9 +131,6 @@ def build(
         output_dir=output_dir,
         bypass_crsp=BYPASS_CRSP if bypass_crsp is None else bypass_crsp,
         production_output=PRODUCTION_OUTPUT if production_output is None else production_output,
-        apply_compustat_corrections=(
-            APPLY_COMPUSTAT_CORRECTIONS if compustat_corrections is None else compustat_corrections
-        ),
         start_date=_parse_iso_date(start_date, "--start-date"),
         end_date=_parse_iso_date(end_date, "--end-date"),
         compustat_source=compustat_source,

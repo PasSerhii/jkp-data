@@ -116,3 +116,5 @@ aux_*.ddb
 jkp-plugin/target/
 jkp-plugin/Cargo.lock
 /docs/
+/.debug-output/
+/.env

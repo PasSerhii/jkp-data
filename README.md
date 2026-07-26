@@ -59,10 +59,7 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
    compressed bytes, rows/second, MiB/second, retries, timeouts, worker number,
    and cumulative completion percentages.
 
-   Normal builds preserve the WRDS/SAS source cells. The optional
-   `--compustat-corrections` mode applies decimal-shift repairs and removes
-   histories classified as unreliable; use it only for a deliberate robustness
-   build because it changes returns and universe composition. Exchange
+   Builds preserve the WRDS/SAS source cells exactly. Exchange
    eligibility is resolved from `sec_history.EXCHG` for each observation date,
    and accounting observations cannot enter a month before their reported
    `pdate`/`fdate`/`rdq`. Each run writes `source_snapshot_manifest.json` with

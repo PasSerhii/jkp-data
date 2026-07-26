@@ -5,7 +5,8 @@ This repository ports the original SAS pipeline ([ReplicationCrisis](https://git
 
 ## 26-07-2026
 __Changes__:
-- Restored source-cell parity as the default: Bessembinder-style decimal repairs and full-history reliability filtering are now opt-in with `--compustat-corrections`.
+- Removed the Bessembinder-style Compustat correction layer introduced on 23-07-2026 (decimal-shift repairs, unreliable-history filtering, and the conditional never-dividend `trfd` recovery). The pipeline now reproduces the WRDS/SAS source cells exactly.
+- Restored the production return-index construction: a missing total-return factor is replaced with 1 (`coalesce(trfd,1)` daily, `coalesce(trfm,1)` monthly, as in the production SAS), so missing factors no longer null returns.
 - Resolved Compustat exchange membership from `sec_history.EXCHG` at each observation date and month-end identifiers from the last trading day in the month.
 - Matched the production SAS company market equity in the CRSP-bypass build: USA main-exchange listings carry the sum of `me` over all USA main-exchange listings of the company per `(gvkey, date)` (share classes and preferred issues alike), and all other Compustat rows keep `me_company=me`. This replaces the July 23 per-gvkey global sum, which double-counted international cross-listings. Also populated `ret_local_lead1m` with the same continuity guard as `ret_exc_lead1m`.
 - Prevented accounting look-ahead by delaying each annual/quarterly record until the later of the normal publication lag and its actual `pdate`/`fdate`/`rdq` month.

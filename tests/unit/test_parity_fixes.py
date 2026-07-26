@@ -7,6 +7,7 @@ import ibis
 import polars as pl
 import pytest
 
+import jkp.data.aux_functions as aux
 from jkp.data.aux_functions import (
     _record_ff_snapshot,
     _register_historical_exchange_view,
@@ -90,6 +91,53 @@ def test_accounting_loader_uses_latest_publication_field(tmp_path) -> None:
     result = load_raw_fund_table_and_filter(source_path, None, "NA", 2).collect()
 
     assert result["availability_date"][0] == date(2026, 7, 1)
+
+
+def test_secm_return_index_uses_production_trfm_coalesce(test_paths, monkeypatch) -> None:
+    """Monthly SECM mirrors the production SAS coalesce(trfm, 1): a missing
+    total-return factor never nulls the monthly return index."""
+    pl.DataFrame(
+        {
+            "gvkey": ["001000", "001000"],
+            "iid": ["01", "01"],
+            "datadate": [date(2026, 4, 30), date(2026, 5, 29)],
+            "tpci": ["0", "0"],
+            "exchg": [11, 11],
+            "dvpsxm": [0.0, 0.5],
+            "curcdm": ["USD", "USD"],
+            "prccm": [10.0, 11.0],
+            "prchm": [10.5, 11.5],
+            "prclm": [9.5, 10.5],
+            "ajexm": [1.0, 1.0],
+            "cshom": [1_000_000.0, 1_000_000.0],
+            "csfsm": pl.Series([None, None], dtype=pl.Float64),
+            "cshoq": pl.Series([None, None], dtype=pl.Float64),
+            "cshtrm": [1000.0, 1000.0],
+            "curcddvm": ["USD", "USD"],
+            "trfm": pl.Series([None, None], dtype=pl.Float64),
+        }
+    ).write_parquet(test_paths.raw_tables_dir / "comp_secm.parquet")
+    pl.DataFrame(
+        {
+            "gvkey": pl.Series([], dtype=pl.String),
+            "ddate": pl.Series([], dtype=pl.Date),
+            "csho_fund": pl.Series([], dtype=pl.Float64),
+            "ajex_fund": pl.Series([], dtype=pl.Float64),
+        }
+    ).write_parquet(test_paths.interim_dir / "__firm_shares2.parquet")
+    monkeypatch.setattr(
+        aux,
+        "compustat_fx",
+        lambda _paths: pl.DataFrame(
+            {"datadate": [date(2026, 5, 29)], "curcdd": ["USD"], "fx": [1.0]}
+        ),
+    )
+
+    aux.gen_secm_data(test_paths)
+
+    result = pl.read_parquet(test_paths.interim_dir / "secm_data.parquet")
+    assert result.height == 2
+    assert result["ri"].null_count() == 0
 
 
 def test_ff_snapshot_manifest_records_input_identity(tmp_path) -> None:

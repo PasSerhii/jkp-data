@@ -30,12 +30,6 @@ BYPASS_CRSP = True
 # mirroring the SAS `*_production_*` macros. Written under processed/production/.
 PRODUCTION_OUTPUT = True
 
-# Optional Bessembinder-style repair/filter pass for extreme Compustat security
-# observations.  The original SAS/WRDS pipeline does not perform this pass, so
-# exact source-cell parity is the default.  Enable it explicitly only for a
-# robustness build where changing/dropping source observations is intended.
-APPLY_COMPUSTAT_CORRECTIONS = False
-
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
     "primary_sec": 1,
@@ -261,22 +255,3 @@ PORTFOLIO_SETTINGS = {
     "daily_pf": True,
     "ind_pf": True,
 }
-
-# Compustat return corrections (Bessembinder et al. 2023 Data Appendix)
-
-# Compression for scratch spill files written by the correction array passes.
-# They are read once and deleted, so encode speed matters more than file size.
-CORRECTION_SPILL_COMPRESSION = "lz4"
-
-# Valid decimal-correction methods. The floor variants only divide prices at
-# or above $1 and deliberately do not apply multiply-direction corrections.
-DECIMAL_CORRECTION_METHODS = ("multiplier", "interpolation", "floor", "floor_interp")
-
-# Trading-day windows used to detect decimal errors lasting up to one month.
-DECIMAL_DETECTION_WINDOWS = [1, 2, 3, 5, 10, 21]
-
-# Countries whose local price convention needs a $0.001 rather than $0.01 floor.
-LOW_PRICE_COUNTRIES = ["BRA", "IDN", "NGA", "TUR"]
-
-# Drop the first observation after an approximately 11-month trading gap.
-FILTER_GAP_TRADING_DAYS = 231

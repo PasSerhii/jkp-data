@@ -51,7 +51,6 @@ from .config import (
     ACCOUNTING_START_DATE as DEFAULT_ACCOUNTING_START_DATE,
 )
 from .config import (
-    APPLY_COMPUSTAT_CORRECTIONS,
     BYPASS_CRSP,
     PRODUCTION_OUTPUT,
     ROLLING_DAILY_SPECS,
@@ -73,7 +72,6 @@ def run_pipeline(
     output_dir: Path,
     bypass_crsp: bool = BYPASS_CRSP,
     production_output: bool = PRODUCTION_OUTPUT,
-    apply_compustat_corrections: bool = APPLY_COMPUSTAT_CORRECTIONS,
     start_date: date | None = None,
     end_date: date | None = None,
     compustat_source: CompustatSource | str = CompustatSource.xpressfeed,
@@ -128,7 +126,6 @@ def run_pipeline(
         end_date=effective_end_date,
         bypass_crsp=bypass_crsp,
         production_output=production_output,
-        apply_compustat_corrections=apply_compustat_corrections,
         compustat_source=source.value,
         persistent_connection=persistent_connection,
         metrics_interval_seconds=metrics_interval_seconds,
@@ -160,12 +157,7 @@ def run_pipeline(
         )
     monitor.set_phase("security_panels")
     gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
-    prepare_comp_sf(
-        paths,
-        "both",
-        bypass_crsp=bypass_crsp,
-        apply_correction=apply_compustat_corrections,
-    )
+    prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)
     if not bypass_crsp:
         prepare_crsp_sf(paths, "m")
         prepare_crsp_sf(paths, "d")

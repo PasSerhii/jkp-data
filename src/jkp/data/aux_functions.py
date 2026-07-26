@@ -25,8 +25,7 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
-from .compustat_correction import correct_decimal_errors, drop_unreliable_observations
-from .config import COLLECT_CHUNK_SIZE, CORRECTION_SPILL_COMPRESSION, END_DATE, MAIN_FILTERS
+from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
@@ -2451,7 +2450,6 @@ def prepare_comp_sf(
     paths: DataPaths,
     freq,
     bypass_crsp: bool = False,
-    apply_correction: bool = False,
 ):
     """
     Description:
@@ -2474,7 +2472,7 @@ def prepare_comp_sf(
         "datadate",
         "ddate",
     )
-    gen_comp_dsf(paths, apply_correction=apply_correction)
+    gen_comp_dsf(paths)
     if freq == "both":
         process_comp_sf1(paths, "d", bypass_crsp=bypass_crsp)
         process_comp_sf1(paths, "m", bypass_crsp=bypass_crsp)
@@ -2648,12 +2646,7 @@ def _register_historical_exchange_view(
     """)
 
 
-def gen_comp_dsf(
-    paths: DataPaths,
-    apply_correction: bool = False,
-    correction_method: str = "multiplier",
-    variation_threshold: float = 1.3,
-):
+def gen_comp_dsf(paths: DataPaths):
     """
     Description:
         Build daily Compustat security data (SECD + G_SECD), convert to USD, and compute
@@ -2661,27 +2654,16 @@ def gen_comp_dsf(
 
     Steps:
         1) Materialize daily FX to fx_data.parquet.
-        2) If apply_correction, repair decimal-shift errors in the raw data.
-        3) Register SECD, G_SECD, firm-shares, and FX in DuckDB.
-        4) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
+        2) Register SECD, G_SECD, firm-shares, and FX in DuckDB.
+        3) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
         shares traded, shares outstanding, local return index (ri_local), dividend currencies.
-        The total-return factor trfd is null for securities that never pay a dividend;
-        substitute trfd=1 for those (price return = total return) so their returns survive.
-        5) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
-        6) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
-        7) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
-        8) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
+        A missing total-return factor trfd is replaced with 1 (production SAS coalesce).
+        4) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
+        5) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
+        6) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
+        7) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
         USD return index (ri), dividends (split into total/cash/special); derive month-end eom.
-        9) If apply_correction, drop unreliable observations from the USD data.
-        10) Drop intermediates and write __comp_dsf.parquet.
-
-    Args:
-        apply_correction: Whether to apply the Compustat return corrections
-            (Bessembinder et al. 2023). Default False so the pipeline preserves
-            the original SAS/WRDS source observations. Enable explicitly for a
-            robustness build.
-        correction_method: decimal-correction method ('multiplier' fixed multipliers
-            or 'interpolation' geometric mean of clean endpoints).
+        8) Drop intermediates and write __comp_dsf.parquet.
 
     Output:
         Parquet: __comp_dsf.parquet (daily Compustat security observations in USD).
@@ -2691,50 +2673,8 @@ def gen_comp_dsf(
     # Prepare FX data
     compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
 
-    # Repair decimal-shift errors in the raw data (local currency)
-    if apply_correction:
-        # Load and correct Global data (no ADRRC). spill_dir selects the
-        # memory-bounded array path; spill files are removed after each sink.
-        df_global = pl.scan_parquet(paths.raw_table_source("comp.g_secd")).pipe(
-            correct_decimal_errors,
-            group_cols=["gvkey", "iid"],
-            sort_col="datadate",
-            has_adrrc=False,
-            correction_method=correction_method,
-            spill_dir=paths.interim_dir,
-            variation_threshold=variation_threshold,
-        )
-        df_global.sink_parquet(
-            paths.interim_dir / "__comp_g_secd_corrected.parquet",
-            compression=CORRECTION_SPILL_COMPRESSION,
-        )
-        for spill in paths.interim_dir.glob("__corr_*.parquet"):
-            spill.unlink()
-
-        # Load and correct NA data (has ADRRC for ADRs)
-        df_na = pl.scan_parquet(paths.raw_table_source("comp.secd")).pipe(
-            correct_decimal_errors,
-            group_cols=["gvkey", "iid"],
-            sort_col="datadate",
-            has_adrrc=True,
-            correction_method=correction_method,
-            spill_dir=paths.interim_dir,
-            variation_threshold=variation_threshold,
-        )
-        df_na.sink_parquet(
-            paths.interim_dir / "__comp_secd_corrected.parquet",
-            compression=CORRECTION_SPILL_COMPRESSION,
-        )
-        for spill in paths.interim_dir.glob("__corr_*.parquet"):
-            spill.unlink()
-
-        # Use corrected files
-        g_secd_path = paths.interim_dir / "__comp_g_secd_corrected.parquet"
-        secd_path = paths.interim_dir / "__comp_secd_corrected.parquet"
-    else:
-        # Use original files
-        g_secd_path = paths.raw_table_source("comp.g_secd")
-        secd_path = paths.raw_table_source("comp.secd")
+    g_secd_path = paths.raw_table_source("comp.g_secd")
+    secd_path = paths.raw_table_source("comp.secd")
 
     # Original SQL processing
     # Views, not tables: the whole merge/FX/USD pipeline streams in a single
@@ -2776,15 +2716,9 @@ def gen_comp_dsf(
             ELSE NULL
         END AS prc_low_lcl,
         prcod AS prc_open_lcl,
-        -- trfd is null for never-dividend securities; substitute 1 only when the
-        -- security never pays a dividend (no dividends => price return = total
-        -- return), leaving genuine gaps for payers null. Per WRDS guidance:
-        -- https://wrds-www.wharton.upenn.edu/pages/support/support-articles/compustat/global/computing-returns/
-        cshtrd, (prccd / qunit) / ajexdi * COALESCE(trfd,
-            CASE WHEN NOT BOOL_OR(
-                     COALESCE(div, 0) > 0 OR COALESCE(divd, 0) > 0 OR COALESCE(divsp, 0) > 0
-                 ) OVER (PARTITION BY gvkey, iid)
-                 THEN 1 ELSE NULL END) AS ri_local,
+        -- production SAS (Lior 15.12.2022): coalesce(trfd, 1) — a missing
+        -- total-return factor never nulls the return index
+        cshtrd, (prccd / qunit) / ajexdi * COALESCE(trfd, 1) AS ri_local,
         curcddv, div, divd, divsp
     FROM comp_g_secd;
 
@@ -2809,16 +2743,7 @@ def gen_comp_dsf(
             ELSE a.cshtrd
         END AS DECIMAL(28, 8)) AS cshtrd,
         COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
-        -- trfd (total return factor) is missing for securities that never pay
-        -- a dividend; per WRDS guidance, replace the missing factor with 1
-        -- (no dividends => price return = total return). Only do so when the
-        -- security never pays a dividend; leave genuine gaps for payers null.
-        -- https://wrds-www.wharton.upenn.edu/pages/support/support-articles/compustat/global/computing-returns/
-        (a.prccd / a.ajexdi * COALESCE(a.trfd,
-            CASE WHEN NOT BOOL_OR(
-                     COALESCE(a.div, 0) > 0 OR COALESCE(a.divd, 0) > 0 OR COALESCE(a.divsp, 0) > 0
-                 ) OVER (PARTITION BY a.gvkey, a.iid)
-                 THEN 1 ELSE NULL END)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
+        (a.prccd / a.ajexdi * COALESCE(a.trfd, 1)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
     LEFT JOIN __firm_shares2 AS b
     ON a.gvkey = b.gvkey AND a.datadate = b.ddate;
@@ -2855,62 +2780,11 @@ def gen_comp_dsf(
 
     """)
 
-    # Drop unreliable observations from the USD-converted data
-    if apply_correction:
-        # One streaming pass: DuckDB executes the whole view pipeline, joins
-        # the exchange-country mapping (needed for country-specific filters),
-        # external-sorts by the filter group/sort keys, and writes the spill
-        # file directly — no pre-filter round-trip, and the slim path skips its
-        # own sort (presorted=True).
-        comp_exchanges(paths).select(["exchg", "excntry"]).write_parquet(
-            paths.interim_dir / "__corr_exchanges.parquet"
-        )
-        sorted_path = paths.interim_dir / "__corr_filter_sorted.parquet"
-        # insertion-order preservation is irrelevant under an explicit ORDER BY
-        # and only inflates the external sort's memory; temp_directory
-        # guarantees the sort can spill (the slim path verifies the resulting
-        # order before trusting it)
-        con.raw_sql(f"""
-        SET preserve_insertion_order = false;
-        SET temp_directory = '{(paths.interim_dir / "__duckdb_tmp").as_posix()}';
-        """)
-        con.raw_sql(f"""
-        COPY (
-            SELECT t.*, e.excntry
-            FROM __comp_dsf3 AS t
-            LEFT JOIN read_parquet('{(paths.interim_dir / "__corr_exchanges.parquet").as_posix()}') AS e
-                USING (exchg)
-            ORDER BY gvkey NULLS FIRST, iid NULLS FIRST, datadate NULLS FIRST
-        ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET);
-        """)
-        con.disconnect()
-
-        df = drop_unreliable_observations(
-            pl.scan_parquet(sorted_path),
-            group_cols=["gvkey", "iid"],
-            sort_col="datadate",
-            country_col="excntry",
-            spill_dir=paths.interim_dir,
-            presorted_path=sorted_path,
-        )
-
-        df.drop("excntry").sink_parquet(paths.interim_dir / "__comp_dsf.parquet")
-
-        # Clean up temp files
-        for f in paths.interim_dir.glob("__corr_*.parquet"):
-            f.unlink()
-
-    else:
-        con.raw_sql(f"""
-        COPY (SELECT * FROM __comp_dsf3)
-        TO '{(paths.interim_dir / "__comp_dsf.parquet").as_posix()}' (FORMAT PARQUET);
-        """)
-        con.disconnect()
-
-    # Clean up corrected temp files if they exist
-    if apply_correction:
-        for f in ["__comp_g_secd_corrected.parquet", "__comp_secd_corrected.parquet"]:
-            (paths.interim_dir / f).unlink(missing_ok=True)
+    con.raw_sql(f"""
+    COPY (SELECT * FROM __comp_dsf3)
+    TO '{(paths.interim_dir / "__comp_dsf.parquet").as_posix()}' (FORMAT PARQUET);
+    """)
+    con.disconnect()
 
 
 def gen_secd_data(paths: DataPaths):
@@ -2999,7 +2873,8 @@ def gen_secm_data(paths: DataPaths):
         2) In CTE:
         - Map SECM fields to local price/hi/low/ajex, compute cshoc fallback from firm-shares,
             adjust NASDAQ cshtrm by historical factors.
-        - Join FX for trading and dividend currencies; compute ri_local.
+        - Join FX for trading and dividend currencies; compute ri_local with the
+            production coalesce(trfm, 1).
         3) Project to final fields: USD prc, prc_high/low, ME, dolvol, RI, total dividends (cash/special null),
         prcstd=10, source=0, and eom=last_day(datadate).
         4) Write to secm_data.parquet.
@@ -3047,7 +2922,8 @@ def gen_secm_data(paths: DataPaths):
             END AS cshtrm,
             CASE WHEN a.curcdm    = 'USD' THEN 1 ELSE c.fx END AS fx,
             CASE WHEN a.curcddvm  = 'USD' THEN 1 ELSE d.fx END AS fx_div,
-            a.prccm / a.ajexm * a.trfm AS ri_local
+            -- production SAS (Lior 21.12.2022): coalesce(trfm, 1), matching daily
+            a.prccm / a.ajexm * coalesce(a.trfm, 1) AS ri_local
         FROM comp_secm AS a
         LEFT JOIN __firm_shares2 AS b
             ON a.gvkey    = b.gvkey  AND a.datadate = b.ddate
