@@ -230,9 +230,43 @@ def test_publication_guard_matches_production_lag_on_known_records(tmp_path) -> 
     assert starts == [
         date(2026, 5, 31),  # Driven Brands: public 05-19, in the May panel
         date(2026, 5, 31),  # OVS: public 04-21, four-month lag binds
-        date(2026, 7, 31),  # Sony: four-month lag binds, not eligible in May
+        date(2026, 7, 31),  # Sony annual FY2025: four-month lag binds
         date(2026, 7, 31),  # Akanda: no pdate, fdate 07-01 blocks the look-ahead
     ]
+
+
+def test_quarterly_guard_uses_report_date_not_final_filing(tmp_path) -> None:
+    """Sony Q3 FY2025 is the record the May panel actually resolves to.
+
+    Its results were reported 2026-02-05 but the filing was only finalised
+    2026-06-15. Keying availability off the final date pushed it out of May, so
+    the panel fell back to Q2 and carried a pre-spinoff balance sheet
+    (atq 244,127) instead of the correct post-spinoff one (atq 101,315).
+    """
+    source_path = tmp_path / "fundq.parquet"
+    pl.DataFrame(
+        {
+            "gvkey": ["009818"],
+            "datadate": [date(2025, 12, 31)],
+            "indfmt": ["INDL"],
+            "datafmt": ["STD"],
+            "popsrc": ["D"],
+            "consol": ["C"],
+            "rdq": [date(2026, 2, 5)],
+            "pdateq": [None],
+            "fdateq": [date(2026, 6, 15)],
+        },
+        schema_overrides={"rdq": pl.Date, "pdateq": pl.Date, "fdateq": pl.Date},
+    ).write_parquet(source_path)
+
+    result = (
+        load_raw_fund_table_and_filter(source_path, None, "NA", 2)
+        .with_columns(accounting_public_start(4))
+        .collect()
+    )
+
+    assert result["availability_date"][0] == date(2026, 2, 5)
+    assert result["start_date"][0] == date(2026, 4, 30)
 
 
 def test_secm_return_index_uses_production_trfm_coalesce(test_paths, monkeypatch) -> None:
