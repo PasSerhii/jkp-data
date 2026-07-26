@@ -13,6 +13,7 @@ interim outputs `world_data_output.parquet` and `world_dsf_output.parquet`.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import polars as pl
 
@@ -197,12 +198,73 @@ def market_min_price(paths: DataPaths, n: int) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+_ID_HISTORY_ITEMS = {"cusip": "CUSIP", "isin_orig": "ISIN", "sedol": "SEDOL"}
+
+
+def _identifier_history(paths: DataPaths) -> pl.LazyFrame | None:
+    """Point-in-time identifier intervals, or None when unavailable.
+
+    ``comp.sec_id_history`` is maintained by sql/xpressfeed_views/capture_sec_ids.py:
+    a one-time backfill from WRDS plus a monthly diff of the feed's current
+    identifiers. Returns None when the table has not been downloaded, so a run
+    against an older raw set still produces output rather than failing.
+    """
+    source = paths.raw_table_source("comp.sec_id_history")
+    # A glob string means the parts directory already exists; a bare Path may not.
+    if isinstance(source, Path) and not source.is_file():
+        return None
+    return (
+        pl.scan_parquet(source)
+        .filter(pl.col("item").is_in(list(_ID_HISTORY_ITEMS.values())))
+        .select(
+            "gvkey",
+            "iid",
+            "item",
+            itemvalue=pl.col("itemvalue").cast(pl.Utf8),
+            efffrom=pl.col("efffrom").cast(pl.Date),
+            effthru=pl.col("effthru").cast(pl.Date),
+        )
+    )
+
+
+def _resolve_identifiers_asof(
+    history: pl.LazyFrame, keys: pl.LazyFrame, date_col: str
+) -> pl.LazyFrame:
+    """Attach cusip/isin_orig/sedol effective on each row's observation date.
+
+    Interval containment rather than a plain join: an issue can carry several
+    values for one item over its life, and only the interval covering the
+    observation date is correct for that row.
+    """
+    resolved = keys
+    for column, item in _ID_HISTORY_ITEMS.items():
+        matched = (
+            keys.join(history.filter(pl.col("item") == item), on=["gvkey", "iid"], how="inner")
+            .filter(
+                (pl.col(date_col) >= pl.col("efffrom")) & (pl.col(date_col) <= pl.col("effthru"))
+            )
+            # Overlapping intervals are possible where the backfill and the feed
+            # disagree; prefer the latest-starting one.
+            .sort("efffrom")
+            .group_by(["gvkey", "iid", date_col])
+            .agg(pl.col("itemvalue").last().alias(column))
+        )
+        resolved = resolved.join(matched, on=["gvkey", "iid", date_col], how="left")
+    return resolved
+
+
 def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
     """Daily identifier panel keyed by the stable issue key and trading date.
 
     cusip + conm come from comp.secd; sedol + isin_orig (+ conm fallback) from
     comp.g_secd.  Exchange is intentionally not a join key: it changes over an
     issue's life and current headers can differ from the historical value.
+
+    These columns come from the security header, which holds only the value in
+    force today, so they are stamped on every historical row.  When
+    ``comp.sec_id_history`` is present the caller replaces cusip/isin_orig/sedol
+    with the point-in-time values; ``conm`` has no historical source in the feed
+    and stays current-stamped.
     """
     secd = (
         pl.scan_parquet(paths.raw_table_source("comp.secd"))
@@ -227,9 +289,16 @@ def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
         )
         .unique(["gvkey", "iid", "date"])
     )
-    return secd.join(gsecd, on=["gvkey", "iid", "date"], how="full", coalesce=True).with_columns(
+    panel = secd.join(gsecd, on=["gvkey", "iid", "date"], how="full", coalesce=True).with_columns(
         conm=pl.coalesce(["conm_secd", "conm_g"])
     )
+
+    history = _identifier_history(paths)
+    if history is None:
+        return panel
+    keys = panel.select("gvkey", "iid", "date")
+    pit = _resolve_identifiers_asof(history, keys, "date")
+    return panel.drop(list(_ID_HISTORY_ITEMS)).join(pit, on=["gvkey", "iid", "date"], how="left")
 
 
 def _monthly_identifier_panel(paths: DataPaths) -> pl.LazyFrame:

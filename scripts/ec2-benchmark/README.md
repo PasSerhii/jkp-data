@@ -8,9 +8,18 @@ Used to validate performance changes and to check parity fixes against
 ## Rerun
 
 ```bash
+uv run python scripts/check_source_ready.py                          # feed complete?
+uv run --with "psycopg[binary]" python sql/xpressfeed_views/capture_sec_ids.py
 scripts/ec2-benchmark/launch.sh run-20260801
-scripts/ec2-benchmark/status.sh i-0abc...          # progress, any time
+scripts/ec2-benchmark/status.sh i-0abc...                            # progress, any time
 ```
+
+`capture_sec_ids.py` must run **before** the build downloads its raw tables. It
+appends any identifier changes since the last run to `comp.sec_id_history`, which
+is what gives historical rows their point-in-time CUSIP/ISIN/SEDOL instead of
+today's value. Skipping it does not fail the build — the run falls back to the
+security header — but that month's identifier changes are then lost for good,
+since the feed only ever exposes the current value.
 
 `launch.sh` is idempotent: it reuses the bucket, IAM role/profile and security
 group if they exist. It stages the `COMPUSTAT` credential as an SSM SecureString,
