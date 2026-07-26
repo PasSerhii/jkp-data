@@ -56,6 +56,98 @@ def test_exchange_is_resolved_from_history_for_observation_date(tmp_path) -> Non
     assert result["exchg"].to_list() == [12, 19]
 
 
+def _write_sec_history_tables(paths: DataPaths, na_rows: list[dict], g_rows: list[dict]) -> None:
+    schema = {
+        "gvkey": pl.Utf8,
+        "iid": pl.Utf8,
+        "item": pl.Utf8,
+        "itemvalue": pl.Utf8,
+        "effdate": pl.Date,
+        "thrudate": pl.Date,
+    }
+    pl.DataFrame(na_rows, schema=schema).write_parquet(
+        paths.raw_tables_dir / "comp_sec_history.parquet"
+    )
+    pl.DataFrame(g_rows, schema=schema).write_parquet(
+        paths.raw_tables_dir / "comp_g_sec_history.parquet"
+    )
+
+
+def test_exchg_history_parses_decimal_formatted_codes(test_paths) -> None:
+    """EXCHG itemvalues stored as '11.0000' must still resolve to integers."""
+    _write_sec_history_tables(
+        test_paths,
+        na_rows=[
+            {
+                "gvkey": "000001",
+                "iid": "01",
+                "item": "EXCHG",
+                "itemvalue": "11.0000",
+                "effdate": date(2020, 1, 1),
+                "thrudate": None,
+            }
+        ],
+        g_rows=[
+            {
+                "gvkey": "200000",
+                "iid": "01W",
+                "item": "EXCHG",
+                "itemvalue": "104",
+                "effdate": date(2020, 1, 1),
+                "thrudate": None,
+            }
+        ],
+    )
+
+    aux.gen_prihist_files(test_paths)
+
+    history = pl.read_parquet(test_paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet")
+    assert history["historical_exchg"].sort().to_list() == [11, 104]
+    assert history["historical_exchg"].dtype == pl.Int32
+
+
+def test_exchg_history_fails_when_no_itemvalue_parses(test_paths) -> None:
+    """Unparseable EXCHG codes must fail the build, not silently disable the fix."""
+    _write_sec_history_tables(
+        test_paths,
+        na_rows=[
+            {
+                "gvkey": "000001",
+                "iid": "01",
+                "item": "EXCHG",
+                "itemvalue": "N/A",
+                "effdate": date(2020, 1, 1),
+                "thrudate": None,
+            }
+        ],
+        g_rows=[],
+    )
+
+    with pytest.raises(RuntimeError, match="parsed as an integer exchange code"):
+        aux.gen_prihist_files(test_paths)
+
+
+def test_exchg_history_fails_when_source_has_no_exchg_rows(test_paths) -> None:
+    """A sec_history source without EXCHG items must fail the build."""
+    _write_sec_history_tables(
+        test_paths,
+        na_rows=[
+            {
+                "gvkey": "000001",
+                "iid": "01",
+                "item": "PRIHISTUSA",
+                "itemvalue": "01",
+                "effdate": date(2020, 1, 1),
+                "thrudate": None,
+            }
+        ],
+        g_rows=[],
+    )
+
+    with pytest.raises(RuntimeError, match="no EXCHG rows"):
+        aux.gen_prihist_files(test_paths)
+
+
 def test_accounting_public_start_respects_actual_availability() -> None:
     result = (
         pl.DataFrame(

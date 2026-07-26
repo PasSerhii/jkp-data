@@ -469,7 +469,9 @@ def gen_prihist_files(paths: DataPaths):
         1) Load comp_sec_history and comp_g_sec_history into DuckDB.
         2) Create three tables by item code: PRIHISTROW (global), PRIHISTUSA (NA), PRIHISTCAN (NA).
         3) Keep gvkey, itemvalue→flag, effdate, thrudate.
-        4) Combine issue-level EXCHG intervals into __exchg_history.
+        4) Combine issue-level EXCHG intervals into __exchg_history; fail the
+           build if no EXCHG interval parses (empty history would silently
+           disable point-in-time exchange resolution).
         5) Write each to raw_data_dfs as separate Parquet files.
 
     Output:
@@ -525,6 +527,8 @@ def gen_prihist_files(paths: DataPaths):
     SELECT DISTINCT
         gvkey,
         iid,
+        -- DuckDB's varchar->int TRY_CAST also parses decimal-formatted
+        -- codes such as '11.0000' and whitespace-padded values
         TRY_CAST(itemvalue AS INTEGER) AS historical_exchg,
         effdate,
         thrudate
@@ -541,6 +545,32 @@ def gen_prihist_files(paths: DataPaths):
     ) history
     WHERE TRY_CAST(itemvalue AS INTEGER) IS NOT NULL;
     """)
+    # An empty exchange history would make _register_historical_exchange_view
+    # silently fall back to current-header EXCHG everywhere, reintroducing the
+    # point-in-time eligibility bug. Fail the build instead.
+    exchg_counts = pl.from_arrow(
+        con.raw_sql("""
+        SELECT
+            (SELECT COUNT(*) FROM __exchg_history) AS resolved,
+            (SELECT COUNT(*)
+             FROM (SELECT item FROM comp_sec_history
+                   UNION ALL
+                   SELECT item FROM comp_g_sec_history) all_items
+             WHERE item = 'EXCHG') AS raw
+        """).arrow()
+    )
+    resolved = int(exchg_counts["resolved"][0])
+    raw = int(exchg_counts["raw"][0])
+    if resolved == 0:
+        detail = (
+            f"none of the {raw} EXCHG itemvalues parsed as an integer exchange code"
+            if raw
+            else "the sec_history sources contain no EXCHG rows"
+        )
+        raise RuntimeError(
+            "__exchg_history is empty; point-in-time exchange resolution would "
+            f"silently fall back to current headers ({detail})"
+        )
     con.table("__exchg_history").to_parquet(
         paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet"
     )
