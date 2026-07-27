@@ -14,11 +14,13 @@ so its `resources/` data lives inside the virtualenv.
 From the repository root in PowerShell:
 
 ```powershell
-docker build --platform linux/amd64 --provenance=false --sbom=false -t jkp-data:local .
-docker run --rm jkp-data:local --version
-docker run --rm --entrypoint /app/.venv/bin/python jkp-data:local `
+docker build --platform linux/amd64 --provenance=false --sbom=false -t jkp-data:production .
+docker run --rm jkp-data:production --version
+docker run --rm --entrypoint /app/.venv/bin/python jkp-data:production `
   -c "import duckdb; c=duckdb.connect(); c.execute('LOAD postgres'); print('postgres extension OK')"
 ```
+
+There is one image and one name: `jkp-data:production`. Rebuilding replaces it.
 
 Use `linux/amd64` for an Intel/AMD EC2 instance. Use `linux/arm64` instead for
 an AWS Graviton instance, and build/test that platform before scheduling a job.
@@ -34,7 +36,7 @@ New-Item -ItemType Directory -Force D:\jkp-production | Out-Null
 docker run --rm --name jkp-build `
   --env-file .env `
   --mount type=bind,source=D:\jkp-production,target=/data `
-  jkp-data:local `
+  jkp-data:production `
   build /data `
   --compustat-source xpressfeed `
   --bypass-crsp `
@@ -48,101 +50,29 @@ cutoff at the previous calendar month-end when the process starts.
 
 ## Push to Amazon ECR
 
-Set the deployment values in PowerShell. The repository is created only if it
-does not already exist:
+`alphabeta` is shared with other services, so the tag carries a `jkp-data-`
+prefix. One tag, `alphabeta:jkp-data-production`, is what automation pulls; each
+push replaces it.
 
 ```powershell
-$ErrorActionPreference = "Stop"
-
-function Assert-NativeSuccess([string]$Action) {
-  if ($LASTEXITCODE -ne 0) {
-    throw "$Action failed with exit code $LASTEXITCODE."
-  }
-}
-
 $AwsRegion = "eu-central-1"
 $AwsAccountId = aws sts get-caller-identity --query Account --output text
-Assert-NativeSuccess "Read AWS account identity"
-
-$Repository = "alphabeta"
-$GitSha = git rev-parse --short=12 HEAD
-Assert-NativeSuccess "Read Git commit"
-
-$Dirty = git status --porcelain
-Assert-NativeSuccess "Read Git working-tree status"
-if ($Dirty) {
-  throw "Commit or stash the working tree before building a traceable production image."
-}
-
-$Tag = "jkp-data-$(Get-Date -Format 'yyyyMMdd-HHmmss')-$GitSha"
 $Registry = "$AwsAccountId.dkr.ecr.$AwsRegion.amazonaws.com"
-$Image = "${Registry}/${Repository}:${Tag}"
-
-aws ecr describe-repositories --region $AwsRegion --repository-names $Repository 2>$null
-if ($LASTEXITCODE -ne 0) {
-  aws ecr create-repository --region $AwsRegion --repository-name $Repository | Out-Null
-  Assert-NativeSuccess "Create ECR repository"
-}
+$Image = "$Registry/alphabeta:jkp-data-production"
 
 aws ecr get-login-password --region $AwsRegion |
   docker login --username AWS --password-stdin $Registry
-Assert-NativeSuccess "Log Docker in to ECR"
 
-docker build --platform linux/amd64 --provenance=false --sbom=false `
-  --build-arg GIT_REVISION=$(git rev-parse HEAD) `
-  --build-arg BUILD_DATE=$([DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")) `
-  -t $Image .
-Assert-NativeSuccess "Build Docker image"
-
+docker tag jkp-data:production $Image
 docker push $Image
-Assert-NativeSuccess "Push Docker image"
-
-$Digest = aws ecr describe-images `
-  --region $AwsRegion `
-  --repository-name $Repository `
-  --image-ids imageTag=$Tag `
-  --query "imageDetails[0].imageDigest" `
-  --output text
-Assert-NativeSuccess "Read pushed image digest"
-
-Write-Host "Pushed tag:    $Image"
-Write-Host "Immutable URI: ${Registry}/${Repository}@${Digest}"
 ```
 
-`alphabeta` is the ECR repository; the account-level private registry is
-`$Registry`. The timestamp plus Git commit makes the tag unique and traceable,
-but this repository currently permits mutable tags. Only the reported digest
-URI is immutable, so production jobs should use that URI.
+Build for `linux/amd64` before pushing: the tag is pulled by Intel/AMD EC2
+instances, and an arm64 image fails at run time, not at push time.
 
-The same revision is also baked in as an OCI label, so provenance survives
-independently of the tag string:
-
-```bash
-docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' <image>
-```
-
-Prefer the label over parsing the tag. A tag's SHA is only as durable as the
-history it came from: rewriting the branch (a rebase, or a `filter-branch` to
-amend messages) reassigns every commit hash, and once the old objects are
-garbage-collected the SHA in an older tag resolves to nothing. The label has the
-same exposure, but it travels with the image and can be read from a running
-container. When an image must be traceable across a rewrite, pin the digest URI.
-
-### The `jkp-data-production` tag
-
-`alphabeta` is shared with other services, so every jkp-data tag carries the
-`jkp-data-` prefix. Automation tracks the moving tag
-`alphabeta:jkp-data-production`, which is repointed at each release:
-
-```powershell
-docker tag jkp-data:production "${Registry}/${Repository}:jkp-data-production"
-docker push "${Registry}/${Repository}:jkp-data-production"
-```
-
-Push the timestamped `jkp-data-<timestamp>-<sha>` tag alongside it from the same
-build. Both tags then share one digest, so the moving tag stays convenient for
-schedulers while the timestamped tag pins the exact build for rollback. Anything
-that must not shift under a re-push should still reference the digest URI.
+Rebuild and push whenever the pipeline code changes. The tag is mutable and
+carries no version marker, so what it points at is only ever "the last thing
+pushed" — check `git log` for what that was.
 
 ## Run on EC2
 
@@ -162,7 +92,7 @@ Authenticate, pull, and run:
 AWS_REGION=eu-central-1
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-IMAGE="$REGISTRY/alphabeta:jkp-data-REPLACE_WITH_TIMESTAMP-AND-COMMIT"
+IMAGE="$REGISTRY/alphabeta:jkp-data-production"
 
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY"
