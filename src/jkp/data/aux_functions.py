@@ -5037,6 +5037,72 @@ def apply_indfmt_filter(df):
     return df
 
 
+# Identity/bookkeeping columns; everything else on an accounting frame is a
+# reported value and counts toward how complete a candidate row is.
+_ACCOUNTING_META_COLUMNS = frozenset(
+    {
+        "gvkey",
+        "datadate",
+        "availability_date",
+        "n",
+        "indfmt",
+        "fyr",
+        "fyearq",
+        "fqtr",
+        "curcd",
+        "curcdq",
+        "source",
+    }
+)
+
+
+def resolve_dual_package_rows(df, key_cols):
+    """
+    Description:
+        Pick one row per key when a company files in both the Global and NA
+        Compustat packages, preferring whichever row carries more data.
+
+    Steps:
+        1) Count populated (non-null) reported values on each candidate row.
+        2) Keep only rows tied for the highest count within the key.
+        3) Break any remaining tie toward the Global row.
+
+    Rationale:
+        The SAS leaves this undefined: `set __gfunda __funda` concatenates both
+        rows and the survivor is decided by a later `proc sort nodupkey` with no
+        ORDER BY and no stable-sort guarantee (accounting_chars.sas:413-423 and
+        the sort inside %add_helper_vars). Preferring Global unconditionally --
+        the previous behaviour here -- is deterministic but systematically picks
+        the weaker row: banks file the sparse `FS` format globally while their NA
+        `INDL` filing carries capex and working capital, and a dual filer whose
+        Global row has not caught up yet is a near-empty stub. Choosing on
+        completeness keeps this deterministic while retaining the data, and the
+        Global tie-break preserves the old outcome whenever both rows are equally
+        populated.
+
+        Whole rows are compared rather than coalescing field by field, so a
+        record always reflects a single filing instead of a balance sheet
+        assembled from two.
+
+    Output:
+        LazyFrame with one row per key.
+    """
+    value_cols = [
+        name for name in df.collect_schema().names() if name not in _ACCOUNTING_META_COLUMNS
+    ]
+    populated = (
+        pl.sum_horizontal([col(name).is_not_null().cast(pl.Int32) for name in value_cols])
+        if value_cols
+        else pl.lit(0, dtype=pl.Int32)
+    )
+    return (
+        df.with_columns(_populated=populated)
+        .filter(col("_populated") == col("_populated").max().over(key_cols))
+        .filter((pl.len().over(key_cols) == 1) | (col("source") == "GLOBAL"))
+        .drop("_populated")
+    )
+
+
 def add_fx_and_convert_vars(df, fx_df, vars, freq):
     """
     Description:
@@ -5361,16 +5427,11 @@ def standardized_accounting_data(
             + query_vars
         )
     if coverage == "world":
-        __wfunda = pl.concat([__gfunda, __funda], how="diagonal_relaxed").filter(
-            (pl.len().over(["gvkey", "datadate"]) == 1)
-            | ((pl.len().over(["gvkey", "datadate"]) == 2) & (col("source") == "GLOBAL"))
+        __wfunda = pl.concat([__gfunda, __funda], how="diagonal_relaxed").pipe(
+            resolve_dual_package_rows, key_cols=["gvkey", "datadate"]
         )
-        __wfundq = pl.concat([__gfundq, __fundq], how="diagonal_relaxed").filter(
-            (pl.len().over(["gvkey", "fyr", "fyearq", "fqtr"]) == 1)
-            | (
-                (pl.len().over(["gvkey", "fyr", "fyearq", "fqtr"]) == 2)
-                & (col("source") == "GLOBAL")
-            )
+        __wfundq = pl.concat([__gfundq, __fundq], how="diagonal_relaxed").pipe(
+            resolve_dual_package_rows, key_cols=["gvkey", "fyr", "fyearq", "fqtr"]
         )
     else:
         pass
