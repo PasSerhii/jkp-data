@@ -739,15 +739,22 @@ def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
     collect_and_write(__sec_info, paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
     if not bypass_crsp:
         build_mcti(paths)
+        # Float64 for the same reason as rf below: t30ret is divided by the
+        # daily scale and must not inherit a decimal operand's scale.
         crsp_mcti_t30ret = pl.scan_parquet(
             paths.interim_dir / "raw_data_dfs" / "crsp_mcti.parquet"
-        ).select(["caldt", "t30ret"])
+        ).select([col("caldt"), col("t30ret").cast(pl.Float64)])
         collect_and_write(
             crsp_mcti_t30ret, paths.interim_dir / "raw_data_dfs" / "crsp_mcti_t30ret.parquet"
         )
+    # Cast rf out of the source DECIMAL(7,5). Decimal arithmetic keeps the
+    # operand's scale, so the daily `rf / 21` would round 0.00014761904 to
+    # 0.00015 — a 1.6% overstatement of the daily risk-free rate applied to
+    # every daily excess return, while the monthly path (scale 1, no division)
+    # stayed exact. The two disagreed in the same output.
     ff_factors_monthly = pl.scan_parquet(
         paths.raw_tables_dir / "ff_factors_monthly.parquet"
-    ).select(["date", "rf"])
+    ).select([col("date"), col("rf").cast(pl.Float64)])
     collect_and_write(
         ff_factors_monthly, paths.interim_dir / "raw_data_dfs" / "ff_factors_monthly.parquet"
     )
