@@ -41,7 +41,7 @@ VOLUME_MBPS="${VOLUME_MBPS:-1000}"
 WORKERS="${WORKERS:-}"
 START_DATE="${START_DATE:-2000-01-01}"
 END_DATE="${END_DATE:-2026-06-30}"
-COUNTRIES="${COUNTRIES:-usa deu fra ita jpn}"
+COUNTRIES="${COUNTRIES:-usa can deu ita jpn hkg fra gbr ind nor}"
 MARKET="${MARKET:-spot}"          # set MARKET=ondemand to disable spot
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -100,7 +100,7 @@ for c in $COUNTRIES; do
     [ -f "$CSV_DIR/$freq/$c.csv" ] && aws s3 cp "$CSV_DIR/$freq/$c.csv" "$RUN_PREFIX/production/$freq/$c.csv" --only-show-errors
   done
 done
-aws s3 ls "$RUN_PREFIX/production/monthly/" > /mnt/jkp-data/UPLOADED 2>&1
+aws s3 ls --recursive "$RUN_PREFIX/production/" > /mnt/jkp-data/UPLOADED 2>&1
 aws s3 cp /mnt/jkp-data/UPLOADED "$RUN_PREFIX/UPLOADED" --only-show-errors
 df -h /mnt/jkp-data > /mnt/jkp-data/DISK_FINAL
 aws s3 cp /mnt/jkp-data/DISK_FINAL "$RUN_PREFIX/DISK_FINAL" --only-show-errors
