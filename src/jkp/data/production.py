@@ -298,7 +298,24 @@ def _identifier_panel(paths: DataPaths) -> pl.LazyFrame:
         return panel
     keys = panel.select("gvkey", "iid", "date")
     pit = _resolve_identifiers_asof(history, keys, "date")
-    return panel.drop(list(_ID_HISTORY_ITEMS)).join(pit, on=["gvkey", "iid", "date"], how="left")
+    # Point-in-time value wins; the security header is the fallback, not a
+    # replacement. Dropping the header outright would null the column wherever
+    # the history has no interval -- and for `isin_orig` a null is worse than a
+    # stale value, because _add_isin then fabricates `excntry[:2] + cusip`. That
+    # synthetic is a real ISIN only for US-domiciled issuers; for the ~24% of the
+    # US universe domiciled in Cayman, Canada, Israel and elsewhere it invents an
+    # identifier that resolves nowhere. Coalescing keeps the synthetic as a true
+    # last resort.
+    return (
+        panel.join(pit, on=["gvkey", "iid", "date"], how="left", suffix="_pit")
+        .with_columns(
+            [
+                pl.coalesce([pl.col(f"{name}_pit"), pl.col(name)]).alias(name)
+                for name in _ID_HISTORY_ITEMS
+            ]
+        )
+        .drop([f"{name}_pit" for name in _ID_HISTORY_ITEMS])
+    )
 
 
 def _monthly_identifier_panel(paths: DataPaths) -> pl.LazyFrame:
