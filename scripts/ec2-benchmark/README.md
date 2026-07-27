@@ -8,7 +8,7 @@ Used to validate performance changes and to check parity fixes against
 ## Rerun
 
 ```bash
-uv run python scripts/check_source_ready.py                          # feed complete?
+uv run python scripts/check_source_ready.py                          # feed complete? only in production not for test runs
 uv run --with "psycopg[binary]" python sql/xpressfeed_views/capture_sec_ids.py
 scripts/ec2-benchmark/launch.sh run-20260801
 scripts/ec2-benchmark/status.sh i-0abc...                            # progress, any time

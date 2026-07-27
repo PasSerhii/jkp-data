@@ -35,7 +35,10 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-m6a.32xlarge}"
 VOLUME_GB="${VOLUME_GB:-750}"
 VOLUME_IOPS="${VOLUME_IOPS:-8000}"
 VOLUME_MBPS="${VOLUME_MBPS:-1000}"
-WORKERS="${WORKERS:-4}"
+# Unset means "use config.DAILY_DOWNLOAD_WORKERS". Set it only to A/B a
+# different count; the flag overrides the config, so a default here would
+# silently pin every run to that number.
+WORKERS="${WORKERS:-}"
 START_DATE="${START_DATE:-2000-01-01}"
 END_DATE="${END_DATE:-2026-06-30}"
 COUNTRIES="${COUNTRIES:-usa deu fra ita jpn}"

@@ -14,6 +14,7 @@ TOPIC=@@TOPIC@@
 IMAGE=@@IMAGE@@
 RUN_PREFIX="s3://$BUCKET/@@RUN_TAG@@"
 COUNTRIES="@@COUNTRIES@@"
+WORKERS="@@WORKERS@@"
 
 notify() { aws sns publish --region "$REGION" --topic-arn "$TOPIC" --subject "$1" --message "$2" >/dev/null 2>&1 || true; }
 
@@ -79,7 +80,7 @@ docker run --name jkp-run \
   --start-date @@START_DATE@@ \
   --end-date @@END_DATE@@ \
   --production \
-  --daily-download-workers @@WORKERS@@ \
+  ${WORKERS:+--daily-download-workers $WORKERS} \
   --metrics-interval 30 \
   > /mnt/jkp-data/container.log 2>&1
 RC=$?
