@@ -30,6 +30,13 @@ start, on completion (with elapsed time), on failure, and on spot reclaim.
 Overrides (environment variables): `INSTANCE_TYPE`, `VOLUME_GB`, `VOLUME_IOPS`,
 `VOLUME_MBPS`, `WORKERS`, `START_DATE`, `END_DATE`, `COUNTRIES`, `MARKET=ondemand`.
 
+Leave `WORKERS` unset unless you are A/B testing a worker count:
+`--daily-download-workers` overrides `config.DAILY_DOWNLOAD_WORKERS`, so setting
+it pins the run to that number and the config is ignored.
+
+`RUN_TAG` defaults to `run-<UTC date>`, so a second launch on the same day
+overwrites the first in S3 without warning. Pass a distinct tag for reruns.
+
 After the completion email:
 
 ```bash
