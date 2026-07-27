@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hashlib
 import itertools
@@ -12,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from math import exp, sqrt
@@ -1677,12 +1679,15 @@ def download_wrds_daily_tables_parallel(
     worker_count: int,
     planning_db_alias: str | None = None,
     batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Download SECD/G_SECD through one shared, bounded worker queue.
 
     Every worker owns one DuckDB connection and one PostgreSQL attachment. Tasks
     from both daily tables are interleaved, written atomically, and skipped only
     when their manifest exactly matches the current pair/date/projection contract.
+    Setting ``cancel_event`` makes workers stop pulling batches; completed batches
+    keep their manifests and are reused on the next run.
     """
     if not 1 <= worker_count <= MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS:
         raise ValueError(
@@ -1755,7 +1760,7 @@ def download_wrds_daily_tables_parallel(
             monitor.note("reused every completed daily Compustat batch")
     else:
         errors: queue.Queue[_DailyBatchDownloadError] = queue.Queue()
-        stop_event = threading.Event()
+        stop_event = cancel_event if cancel_event is not None else threading.Event()
 
         def worker(worker_id: int) -> None:
             connection: duckdb.DuckDBPyConnection | None = None
@@ -2028,7 +2033,9 @@ def download_raw_data_tables(
            date column. SECD/G_SECD are pair-batched into Parquet datasets; the three
            large Compustat tables transfer only pipeline-consumed columns.
         3) If persistent_connection: ATTACH a single postgres connection and download all tables.
-           Otherwise: use postgres_scan() which creates a new connection per query.
+           Otherwise: use postgres_scan() which creates a new connection per query; with
+           daily_download_workers > 1 the SECD/G_SECD batch queue runs on a background
+           thread concurrently with the remaining tables and the age anchor.
         4) Disconnect.
 
     Args:
@@ -2041,8 +2048,9 @@ def download_raw_data_tables(
         persistent_connection: If True, use a single persistent connection via ATTACH.
             This reduces MFA prompts on systems with NAT IP rotation (e.g., Yale Bouchet).
             If False (default), use postgres_scan() which creates a new connection per query.
-        daily_download_workers: Shared SECD/G_SECD batch workers. Values 1-4;
-            production CLI runs default to 2 while direct library calls remain serial.
+        daily_download_workers: Shared SECD/G_SECD batch workers, 1 to
+            MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS; production CLI runs default to
+            DAILY_DOWNLOAD_WORKERS while direct library calls remain serial.
 
     Output:
         Parquet files under raw_tables/ (Compustat, CRSP, FF, etc.).
@@ -2281,116 +2289,161 @@ def download_raw_data_tables(
         finally:
             con.execute("DETACH source_db")
     else:
-        # Use postgres_scan() which creates a new connection per query (default)
-        for table in table_names:
-            if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
-                continue
-            _report_progress(f"Downloading {source_label} table {table}")
-            filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
-            selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
-            pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
-            table_started_at = datetime.now(UTC).isoformat()
-            table_started = time.monotonic()
-            try:
-                if pair_header is not None:
-                    assert selected_columns is not None
-                    pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
-                    download_wrds_daily_table_batched(
-                        source_connection_info,
-                        con,
-                        table,
-                        filename,
-                        pairs,
-                        selected_columns,
-                        date_column=date_columns[table],
-                        end_date=end_date,
-                        start_date=start_date,
-                    )
-                else:
-                    download_wrds_table(
-                        source_connection_info,
-                        con,
-                        table,
-                        filename,
-                        date_column=date_columns.get(table),
-                        end_date=end_date,
-                        start_date=start_date,
-                        selected_columns=selected_columns,
-                    )
-            except Exception as e:
-                _record_table_download_failure(
-                    table,
-                    started_at_utc=table_started_at,
-                    started_monotonic=table_started,
-                    error=e,
-                    timeouts=int(_is_timeout_error(e)),
-                )
-                _raise_redacted_source_error(source_label, f"download of {table}", e)
-            if pair_header is None:
-                _record_single_table_download(
-                    con,
-                    table,
-                    filename,
-                    started_at_utc=table_started_at,
-                    started_monotonic=table_started,
-                )
+        # Use postgres_scan() which creates a new connection per query (default).
+        # With workers > 1 the SECD/G_SECD batch queue needs only the two security
+        # header parquets, so it starts on a background thread as soon as those
+        # exist and drains while the remaining tables (and the age anchor) download
+        # here on the main thread.
+        cancel_event = threading.Event()
+        run_context = contextvars.copy_context()  # the monitor ContextVar is not thread-inherited
+        queue_future: Future[None] | None = None
 
-        if daily_download_workers > 1:
-            _report_progress(
-                f"Downloading {source_label} daily Compustat tables with "
-                f"{daily_download_workers} shared workers"
-            )
+        def run_daily_queue() -> None:
+            planning_connection = duckdb.connect(":memory:")
             try:
+                planning_connection.execute("LOAD postgres;")
                 download_wrds_daily_tables_parallel(
                     source_connection_info,
-                    con,
+                    planning_connection,
                     paths,
                     tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
                     date_columns,
                     start_date=start_date,
                     end_date=end_date,
                     worker_count=daily_download_workers,
+                    cancel_event=cancel_event,
                 )
-            except Exception as error:
-                if isinstance(error, _DailyBatchDownloadError):
-                    raise
-                _raise_redacted_source_error(source_label, "parallel daily download", error)
+            finally:
+                planning_connection.close()
 
-        _report_progress(f"Downloading {source_label} full-history age anchor")
-        anchor_alias = "age_anchor_source"
-        anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
-        anchor_started_at = datetime.now(UTC).isoformat()
-        anchor_started = time.monotonic()
-        try:
-            con.execute(
-                f"ATTACH {_sql_literal(source_connection_info)} AS {anchor_alias} "
-                "(TYPE postgres, READ_ONLY)"
-            )
-            download_compustat_age_anchor_attached(
-                con,
-                anchor_alias,
-                anchor_filename,
-                raw_schema,
-            )
-        except Exception as e:
-            _record_table_download_failure(
-                "comp.age_anchor",
-                started_at_utc=anchor_started_at,
-                started_monotonic=anchor_started,
-                error=e,
-                timeouts=int(_is_timeout_error(e)),
-            )
-            _raise_redacted_source_error(source_label, "age-anchor download", e)
-        finally:
-            with contextlib.suppress(Exception):
-                con.execute(f"DETACH {anchor_alias}")
-        _record_single_table_download(
-            con,
-            "comp.age_anchor",
-            anchor_filename,
-            started_at_utc=anchor_started_at,
-            started_monotonic=anchor_started,
-        )
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jkp-daily-queue") as pool:
+            try:
+                for table in table_names:
+                    if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
+                        continue
+                    _report_progress(f"Downloading {source_label} table {table}")
+                    filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
+                    selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
+                    pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
+                    table_started_at = datetime.now(UTC).isoformat()
+                    table_started = time.monotonic()
+                    retries = 0
+                    timeouts = 0
+                    try:
+                        if pair_header is not None:
+                            assert selected_columns is not None
+                            pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
+                            download_wrds_daily_table_batched(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                pairs,
+                                selected_columns,
+                                date_column=date_columns[table],
+                                end_date=end_date,
+                                start_date=start_date,
+                            )
+                        else:
+                            for attempt in (0, 1):
+                                try:
+                                    download_wrds_table(
+                                        source_connection_info,
+                                        con,
+                                        table,
+                                        filename,
+                                        date_column=date_columns.get(table),
+                                        end_date=end_date,
+                                        start_date=start_date,
+                                        selected_columns=selected_columns,
+                                    )
+                                    break
+                                except Exception as e:
+                                    if attempt or not _is_timeout_error(e):
+                                        raise
+                                    retries = 1
+                                    timeouts = 1
+                                    Path(filename).unlink(missing_ok=True)
+                                    _report_progress(
+                                        f"{source_label} download of {table} timed "
+                                        "out; retrying once."
+                                    )
+                    except Exception as e:
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=e,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(e)),
+                        )
+                        _raise_redacted_source_error(source_label, f"download of {table}", e)
+                    if pair_header is None:
+                        _record_single_table_download(
+                            con,
+                            table,
+                            filename,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            retries=retries,
+                            timeouts=timeouts,
+                        )
+                    # comp.security is the later of the two pair headers in
+                    # table_names, so the queue's planner inputs are now on disk.
+                    if daily_download_workers > 1 and table == "comp.security":
+                        _report_progress(
+                            f"Downloading {source_label} daily Compustat tables with "
+                            f"{daily_download_workers} shared workers"
+                        )
+                        queue_future = pool.submit(run_context.run, run_daily_queue)
+
+                _report_progress(f"Downloading {source_label} full-history age anchor")
+                anchor_alias = "age_anchor_source"
+                anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
+                anchor_started_at = datetime.now(UTC).isoformat()
+                anchor_started = time.monotonic()
+                try:
+                    con.execute(
+                        f"ATTACH {_sql_literal(source_connection_info)} AS {anchor_alias} "
+                        "(TYPE postgres, READ_ONLY)"
+                    )
+                    download_compustat_age_anchor_attached(
+                        con,
+                        anchor_alias,
+                        anchor_filename,
+                        raw_schema,
+                    )
+                except Exception as e:
+                    _record_table_download_failure(
+                        "comp.age_anchor",
+                        started_at_utc=anchor_started_at,
+                        started_monotonic=anchor_started,
+                        error=e,
+                        timeouts=int(_is_timeout_error(e)),
+                    )
+                    _raise_redacted_source_error(source_label, "age-anchor download", e)
+                finally:
+                    with contextlib.suppress(Exception):
+                        con.execute(f"DETACH {anchor_alias}")
+                _record_single_table_download(
+                    con,
+                    "comp.age_anchor",
+                    anchor_filename,
+                    started_at_utc=anchor_started_at,
+                    started_monotonic=anchor_started,
+                )
+
+                if queue_future is not None:
+                    try:
+                        queue_future.result()
+                    except _DailyBatchDownloadError:
+                        raise
+                    except Exception as error:
+                        _raise_redacted_source_error(source_label, "parallel daily download", error)
+            except BaseException:
+                # Stop the queue so the executor's join does not outlive the error.
+                cancel_event.set()
+                raise
 
     con.close()
 

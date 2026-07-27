@@ -4,8 +4,10 @@ import threading
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import polars as pl
+import pytest
 
 import jkp.data.aux_functions as aux
 from jkp.data.paths import DataPaths
@@ -13,6 +15,12 @@ from jkp.data.paths import DataPaths
 TABLES = ("comp.secd", "comp.g_secd")
 DATE_COLUMNS = dict.fromkeys(TABLES, "datadate")
 PAIRS = [("001", "01"), ("002", "02"), ("003", "03")]
+
+# Orchestration constants for download_raw_data_tables with bypass_crsp=True:
+# the first table processed after both pair headers, and the last sequential one.
+FIRST_POST_HEADER_TABLE = "comp.r_ex_codes"
+LAST_SEQUENTIAL_TABLE = "comp.g_fundq"
+SECRET_CONNINFO = "host=test password=hunter2"
 
 
 class _FakeConnection:
@@ -34,6 +42,12 @@ class _FakeMonitor:
 
     def note(self, message: str) -> None:
         self.notes.append(message)
+
+    def step_started(self, name: str) -> str:
+        return name
+
+    def step_finished(self, token: str, error: BaseException | None = None) -> None:
+        pass
 
 
 def _paths(root: Path) -> DataPaths:
@@ -302,3 +316,158 @@ def test_timeout_retries_with_new_connection_and_records_telemetry(tmp_path, mon
     assert completed[0]["overall_completion_percent"] == 100.0
     retry_notes = [note for note in monitor.notes if "retrying comp.secd batch" in note]
     assert len(retry_notes) == 3
+
+
+def _install_orchestration_fakes(monkeypatch, *, table_stub, parallel_stub) -> None:
+    monkeypatch.setattr(aux, "duckdb", MagicMock())
+    monkeypatch.setattr(aux, "download_wrds_table", table_stub)
+    monkeypatch.setattr(aux, "download_wrds_daily_tables_parallel", parallel_stub)
+
+
+def _download_raw(paths: DataPaths, workers: int = 2) -> None:
+    aux.download_raw_data_tables(
+        paths,
+        connection_info=SECRET_CONNINFO,
+        bypass_crsp=True,
+        daily_download_workers=workers,
+    )
+
+
+def test_daily_queue_overlaps_remaining_sequential_tables(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    queue_started = threading.Event()
+    release_queue = threading.Event()
+    queue_kwargs: dict[str, object] = {}
+
+    def parallel_stub(*args, **kwargs) -> None:
+        queue_kwargs.update(kwargs)
+        queue_started.set()
+        assert release_queue.wait(5), "sequential loop never finished while queue ran"
+
+    def table_stub(conninfo, connection, table, filename, **kwargs) -> None:
+        if table == FIRST_POST_HEADER_TABLE:
+            assert queue_started.wait(5), "daily queue did not start right after the headers"
+        if table == LAST_SEQUENTIAL_TABLE:
+            release_queue.set()
+
+    _install_orchestration_fakes(monkeypatch, table_stub=table_stub, parallel_stub=parallel_stub)
+    _download_raw(paths)
+
+    assert queue_kwargs["worker_count"] == 2
+    assert queue_kwargs.get("planning_db_alias") is None
+    assert isinstance(queue_kwargs["cancel_event"], threading.Event)
+
+
+def test_background_queue_daily_error_propagates_unwrapped(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+
+    def parallel_stub(*args, **kwargs) -> None:
+        raise aux._DailyBatchDownloadError("boom")
+
+    _install_orchestration_fakes(
+        monkeypatch, table_stub=lambda *args, **kwargs: None, parallel_stub=parallel_stub
+    )
+    with pytest.raises(aux._DailyBatchDownloadError, match="boom"):
+        _download_raw(paths)
+
+
+def test_background_queue_error_is_redacted(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+
+    def parallel_stub(*args, **kwargs) -> None:
+        raise ValueError(f"connection failed: {SECRET_CONNINFO}")
+
+    _install_orchestration_fakes(
+        monkeypatch, table_stub=lambda *args, **kwargs: None, parallel_stub=parallel_stub
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        _download_raw(paths)
+
+    assert "parallel daily download" in str(excinfo.value)
+    assert "hunter2" not in str(excinfo.value)
+
+
+def test_sequential_failure_cancels_background_queue(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    queue_cancelled = threading.Event()
+
+    def parallel_stub(*args, cancel_event=None, **kwargs) -> None:
+        if cancel_event.wait(5):
+            queue_cancelled.set()
+
+    def table_stub(conninfo, connection, table, filename, **kwargs) -> None:
+        if table == "comp.company":
+            raise ValueError(f"lost connection: {SECRET_CONNINFO}")
+
+    _install_orchestration_fakes(monkeypatch, table_stub=table_stub, parallel_stub=parallel_stub)
+    with pytest.raises(RuntimeError) as excinfo:
+        _download_raw(paths)
+
+    assert "download of comp.company" in str(excinfo.value)
+    assert "hunter2" not in str(excinfo.value)
+    assert queue_cancelled.is_set(), "main-loop failure did not cancel the background queue"
+
+
+def test_workers_one_downloads_daily_tables_inline(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    batched_tables: list[str] = []
+
+    def parallel_stub(*args, **kwargs) -> None:
+        raise AssertionError("the parallel queue must not run at workers=1")
+
+    def batched_stub(conninfo, connection, table, *args, **kwargs) -> None:
+        batched_tables.append(table)
+
+    _install_orchestration_fakes(
+        monkeypatch, table_stub=lambda *args, **kwargs: None, parallel_stub=parallel_stub
+    )
+    monkeypatch.setattr(aux, "download_wrds_daily_table_batched", batched_stub)
+    monkeypatch.setattr(aux, "load_security_pairs", lambda *args: list(PAIRS))
+    _download_raw(paths, workers=1)
+
+    assert batched_tables == ["comp.secd", "comp.g_secd"]
+
+
+def test_sequential_timeout_retries_once_and_records_telemetry(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    monitor = _FakeMonitor()
+    attempts: list[str] = []
+
+    def table_stub(conninfo, connection, table, filename, **kwargs) -> None:
+        attempts.append(table)
+        if table == "comp.funda" and attempts.count("comp.funda") == 1:
+            raise TimeoutError("canceling statement due to statement timeout")
+        Path(filename).write_bytes(b"stub")
+
+    _install_orchestration_fakes(
+        monkeypatch, table_stub=table_stub, parallel_stub=lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(aux, "get_active_monitor", lambda: monitor)
+    _download_raw(paths)
+
+    assert attempts.count("comp.funda") == 2
+    funda_rows = [
+        row
+        for row in monitor.downloads
+        if row.get("table") == "comp.funda" and row.get("event_type") == "table"
+    ]
+    assert funda_rows[0]["retries"] == 1
+    assert funda_rows[0]["timeouts"] == 1
+
+
+def test_sequential_non_timeout_error_fails_immediately(tmp_path, monkeypatch) -> None:
+    paths = _paths(tmp_path)
+    attempts: list[str] = []
+
+    def table_stub(conninfo, connection, table, filename, **kwargs) -> None:
+        attempts.append(table)
+        if table == "comp.funda":
+            raise ValueError("relation does not exist")
+
+    _install_orchestration_fakes(
+        monkeypatch, table_stub=table_stub, parallel_stub=lambda *args, **kwargs: None
+    )
+    with pytest.raises(RuntimeError, match="download of comp.funda"):
+        _download_raw(paths)
+
+    assert attempts.count("comp.funda") == 1

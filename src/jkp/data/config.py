@@ -35,6 +35,8 @@ PRODUCTION_OUTPUT = True
 # Measured on the 2026-07-26 full run: 2->4 workers scaled linearly (saturation
 # 4.00x/4, zero retries) while the source RDS stayed at ~40% CPU and 13% of
 # provisioned IOPS, so the client — not the database — was the limit.
+# With workers > 1 the batch queue also overlaps the remaining sequential
+# table downloads and the age anchor instead of running after them.
 DAILY_DOWNLOAD_WORKERS = 8
 
 # Hard ceiling on the above; also bounds the CLI flag. Raise only alongside
