@@ -19,7 +19,7 @@ RUN_TAG="${1:-run-$(date -u +%Y%m%d)}"
 REGION=eu-central-1
 ACCOUNT=485357734136
 REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
-IMAGE="$REGISTRY/alphabeta:jkp-data-production"
+IMAGE="$REGISTRY/jkp-data:production"
 BUCKET="jkp-data-runs-$ACCOUNT-$REGION"
 TOPIC="arn:aws:sns:$REGION:$ACCOUNT:jkp-spot-run-alerts"
 ROLE=jkp-data-run-role
@@ -46,9 +46,9 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 command -v aws >/dev/null || { echo "aws CLI not found" >&2; exit 1; }
 grep -q '^COMPUSTAT=' "$REPO/.env" || { echo "No COMPUSTAT= line in $REPO/.env" >&2; exit 1; }
-aws ecr describe-images --region "$REGION" --repository-name alphabeta \
-  --image-ids imageTag=jkp-data-production >/dev/null \
-  || { echo "Image alphabeta:jkp-data-production missing from ECR; build and push first" >&2; exit 1; }
+aws ecr describe-images --region "$REGION" --repository-name jkp-data \
+  --image-ids imageTag=production >/dev/null \
+  || { echo "Image jkp-data:production missing from ECR; build and push first" >&2; exit 1; }
 
 echo "== ensuring S3 bucket =="
 aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \

@@ -50,15 +50,14 @@ cutoff at the previous calendar month-end when the process starts.
 
 ## Push to Amazon ECR
 
-`alphabeta` is shared with other services, so the tag carries a `jkp-data-`
-prefix. One tag, `alphabeta:jkp-data-production`, is what automation pulls; each
-push replaces it.
+The image has its own ECR repository, so the name is the same locally and
+remotely: `jkp-data:production`. Each push replaces it.
 
 ```powershell
 $AwsRegion = "eu-central-1"
 $AwsAccountId = aws sts get-caller-identity --query Account --output text
 $Registry = "$AwsAccountId.dkr.ecr.$AwsRegion.amazonaws.com"
-$Image = "$Registry/alphabeta:jkp-data-production"
+$Image = "$Registry/jkp-data:production"
 
 aws ecr get-login-password --region $AwsRegion |
   docker login --username AWS --password-stdin $Registry
@@ -92,7 +91,7 @@ Authenticate, pull, and run:
 AWS_REGION=eu-central-1
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-IMAGE="$REGISTRY/alphabeta:jkp-data-production"
+IMAGE="$REGISTRY/jkp-data:production"
 
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY"

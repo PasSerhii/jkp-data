@@ -47,7 +47,7 @@ means a full rerun.
 | | |
 |---|---|
 | Account / region | 485357734136 / eu-central-1 |
-| Image | `485357734136.dkr.ecr.eu-central-1.amazonaws.com/alphabeta:jkp-data-production` |
+| Image | `485357734136.dkr.ecr.eu-central-1.amazonaws.com/jkp-data:production` |
 | VPC / subnet | `vpc-0712bd9cff9966754` / `subnet-0a74f7b1e230a2f12` (eu-central-1b) |
 | Security group | `jkp-data-run-sg` — egress only, no inbound |
 | IAM | role `jkp-data-run-role`, profile `jkp-data-run-profile` |
