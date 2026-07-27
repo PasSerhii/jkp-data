@@ -88,7 +88,10 @@ aws ecr get-login-password --region $AwsRegion |
   docker login --username AWS --password-stdin $Registry
 Assert-NativeSuccess "Log Docker in to ECR"
 
-docker build --platform linux/amd64 --provenance=false --sbom=false -t $Image .
+docker build --platform linux/amd64 --provenance=false --sbom=false `
+  --build-arg GIT_REVISION=$(git rev-parse HEAD) `
+  --build-arg BUILD_DATE=$([DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")) `
+  -t $Image .
 Assert-NativeSuccess "Build Docker image"
 
 docker push $Image
@@ -110,6 +113,20 @@ Write-Host "Immutable URI: ${Registry}/${Repository}@${Digest}"
 `$Registry`. The timestamp plus Git commit makes the tag unique and traceable,
 but this repository currently permits mutable tags. Only the reported digest
 URI is immutable, so production jobs should use that URI.
+
+The same revision is also baked in as an OCI label, so provenance survives
+independently of the tag string:
+
+```bash
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' <image>
+```
+
+Prefer the label over parsing the tag. A tag's SHA is only as durable as the
+history it came from: rewriting the branch (a rebase, or a `filter-branch` to
+amend messages) reassigns every commit hash, and once the old objects are
+garbage-collected the SHA in an older tag resolves to nothing. The label has the
+same exposure, but it travels with the image and can be read from a running
+container. When an image must be traceable across a rewrite, pin the digest URI.
 
 ### The `jkp-data-production` tag
 

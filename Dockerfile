@@ -65,3 +65,16 @@ VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/.venv/bin/jkp"]
 CMD ["--help"]
+
+# Provenance. .dockerignore excludes .git, so the revision cannot be read during
+# the build and must be passed in:
+#   docker build --build-arg GIT_REVISION=$(git rev-parse HEAD) ...
+# Declared last because these values change on every commit; anything below this
+# point would be rebuilt each time. Labels are metadata only and add no bytes.
+ARG GIT_REVISION=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="jkp-data" \
+      org.opencontainers.image.description="Global Factor Data pipeline (Jensen, Kelly and Pedersen)" \
+      org.opencontainers.image.source="https://github.com/PasSerhii/jkp-data" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
