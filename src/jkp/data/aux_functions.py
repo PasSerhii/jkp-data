@@ -7486,8 +7486,9 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
         1) Run persistence job over input parquet (N=5 yrs, min=5) → 'ni_ar_res.parquet'.
         2) Join on (gvkey,curcd,datadate); keep rows with data_available=1.
         3) Set start_date to the later of the normal publication lag and the
-           actual pdate/fdate/rdq month; end_date = min(next_start−1mo,
-           datadate+max_lag).
+           actual pdate/fdate/rdq month; end_date = min(earliest start among all
+           later records −1mo, datadate+max_lag). Records fully superseded by a
+           fresher, earlier-available report (end < start) are dropped.
         4) Expand monthly between start/end to 'public_date'.
 
     Output:
@@ -7501,7 +7502,15 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
         .sort(["gvkey", "datadate"])
         .with_columns(accounting_public_start(lag_to_pub))
         .sort(["gvkey", "datadate"])
-        .with_columns(next_start_date=col("start_date").shift(-1).over(["gvkey"]))
+        # Availability-based starts are not monotone in datadate: a fiscal period
+        # can be published after a later period's report. A record is therefore
+        # superseded by the earliest start among ALL later records, not just the
+        # next row's, or a stale record would cover months where fresher data was
+        # already public (the SAS original used shift(-1), which is safe only for
+        # its plain datadate+lag starts).
+        .with_columns(
+            next_start_date=col("start_date").cum_min(reverse=True).shift(-1).over("gvkey")
+        )
         .with_columns(
             end_date=pl.min_horizontal(
                 (col("next_start_date").dt.offset_by("-1mo").dt.month_end()),
@@ -7509,6 +7518,7 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
             )
         )
         .drop("next_start_date")
+        .filter(col("end_date") >= col("start_date"))
     )
     return expand(
         data=df,

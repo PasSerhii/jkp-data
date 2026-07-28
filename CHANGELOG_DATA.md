@@ -3,6 +3,10 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 28-07-2026
+__Changes__:
+- Fixed the accounting-panel expansion for reports published out of fiscal order. Each record's coverage was ended at the next fiscal period's start date, which is safe under the plain publication lag of the SAS original but not under the actual-availability guard added on 26-07-2026: a fiscal period published *after* a later period's report (e.g. a Q3 filed after Q4) extended the preceding stale record over months where fresher data was already public, and the stale record won the overlap. BGIN Blockchain and GrowHub carried mid-2025 balance sheets into May 2026 this way despite their FY2025Q4 reports being public since April/May. A record now ends before the earliest start among all later records, and fully superseded records drop out of the panel instead of emitting empty ranges. The frozen 2026-07-27 inputs show 99,301 quarterly and 11,173 annual records with out-of-order publication where stale extension was possible.
+
 ## 26-07-2026
 __Changes__:
 - Removed the Bessembinder-style Compustat correction layer introduced on 23-07-2026 (decimal-shift repairs, unreliable-history filtering, and the conditional never-dividend `trfd` recovery). The pipeline now reproduces the WRDS/SAS source cells exactly.

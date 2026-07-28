@@ -333,3 +333,62 @@ def test_ff_snapshot_manifest_records_input_identity(tmp_path) -> None:
     assert manifest["max_date"] == "2026-06-30"
     assert manifest["latest_rf"] == pytest.approx(0.00315)
     assert len(manifest["sha256"]) == 64
+
+
+def test_expansion_is_not_extended_by_out_of_order_publication(test_paths, monkeypatch) -> None:
+    """A late-published fiscal period must not extend the preceding stale record.
+
+    BGIN Blockchain (gvkey 051423) in the 2026-07-27 run: its 2025-09-30 quarter
+    was published 2026-06-03, after the 2025-12-31 quarter (2026-04-24). Chaining
+    end_date off only the next row's start let the stale 2025-06-30 record cover
+    April and May 2026, overriding the fresher FY2025Q4 data that was already
+    public. Each record must instead end before the earliest start of any later
+    record.
+    """
+
+    def fake_persistence(paths, data_path, n_years, n_min):
+        pl.DataFrame(
+            schema={
+                "gvkey": pl.Utf8,
+                "curcd": pl.Utf8,
+                "datadate": pl.Date,
+                "ni_ar1": pl.Float64,
+                "ni_ivol": pl.Float64,
+            }
+        ).write_parquet(paths.interim_dir / "ni_ar_res.parquet")
+
+    monkeypatch.setattr(aux, "compute_earnings_persistence", fake_persistence)
+
+    records = pl.LazyFrame(
+        {
+            "gvkey": ["051423"] * 3,
+            "curcd": ["USD"] * 3,
+            "datadate": [date(2025, 6, 30), date(2025, 9, 30), date(2025, 12, 31)],
+            "availability_date": [date(2025, 11, 14), date(2026, 6, 3), date(2026, 4, 24)],
+            "data_available": [1, 1, 1],
+            "at_x": [194.853, None, 92.836],
+        }
+    )
+
+    expanded = (
+        aux.add_earnings_persistence_and_expand(
+            test_paths, records, data_path=None, lag_to_pub=4, max_lag=18
+        )
+        .collect()
+        .sort("public_date")
+    )
+    by_month = dict(
+        zip(expanded["public_date"].to_list(), expanded["datadate"].to_list(), strict=True)
+    )
+
+    # Exactly one record may cover any month, and superseded ranges must vanish
+    # instead of exploding into null public_date rows.
+    assert expanded["public_date"].null_count() == 0
+    assert expanded.height == expanded["public_date"].n_unique()
+    # The stale 2025-06-30 record ends before FY2025Q4 becomes available...
+    assert by_month[date(2026, 3, 31)] == date(2025, 6, 30)
+    # ...and April/May 2026 carry the fresh record that was public since April.
+    assert by_month[date(2026, 4, 30)] == date(2025, 12, 31)
+    assert by_month[date(2026, 5, 31)] == date(2025, 12, 31)
+    # The late-published 2025-09-30 report is fully superseded before it starts.
+    assert date(2025, 9, 30) not in set(expanded["datadate"].to_list())
