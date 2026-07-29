@@ -3360,7 +3360,8 @@ def gen_returns_df(paths: DataPaths, freq):
            {gvkey,iid,datadate} keeping highest prcstd (best data quality); sort.
         3) Compute ret and ret_local as pct_change of ri and ri_local over (gvkey,iid).
         4) If iid unchanged but currency changed, set ret_local = ret (reset local base).
-        5) Null-out ±∞/NaN returns and residual returns above 1000%; select core columns.
+        5) Null-out ±∞/NaN returns (undefined pct_change, e.g. from a zero prior price);
+           select core columns.
 
     Output:
         Polars DataFrame with {gvkey,iid,datadate,ret,ret_local,ret_lag_dif}.
@@ -3400,12 +3401,10 @@ def gen_returns_df(paths: DataPaths, freq):
             .otherwise(col("ret_local"))
         )
         .with_columns(
-            ret_local=pl.when(
-                col("ret_local").is_infinite() | col("ret_local").is_nan() | (col("ret_local") > 10)
-            )
+            ret_local=pl.when(col("ret_local").is_infinite() | col("ret_local").is_nan())
             .then(None)
             .otherwise(col("ret_local")),
-            ret=pl.when(col("ret").is_infinite() | col("ret").is_nan() | (col("ret") > 10))
+            ret=pl.when(col("ret").is_infinite() | col("ret").is_nan())
             .then(None)
             .otherwise(col("ret")),
         )
@@ -7945,8 +7944,13 @@ def combine_ann_qtr_chars(paths: DataPaths, ann_df_path, qtr_df_path, char_vars,
 
     Steps:
         1) Load annual and quarterly files into DuckDB with row numbers.
-        2) Left-join on (gvkey, public_date); for each char_var choose quarterly value if present and more recent (datadate_qitem > datadate).
-        3) Drop redundant join and dated columns; dedupe on (gvkey, public_date).
+        2) Outer-join on (gvkey, public_date), since each panel is expanded to its own
+           coverage window and a security-month can be covered by only one of the two
+           (e.g. a slow-filing annual report leaves a gap that a timelier quarterly
+           filing does not); coalesce the join keys and source from whichever side matched.
+        3) For each char_var choose the quarterly value if the annual one is missing or
+           the quarterly one is present and more recent (datadate_qitem > datadate).
+        4) Drop redundant join and dated columns; dedupe on (gvkey, public_date).
 
     Output:
         Writes 'acc_chars_world.parquet' merged panel.
@@ -7967,7 +7971,14 @@ def combine_ann_qtr_chars(paths: DataPaths, ann_df_path, qtr_df_path, char_vars,
     )
     ann = con.table("ann")
     qtr = con.table("qtr")
-    combined = ann.left_join(qtr, [ann.gvkey == qtr.gvkey, ann.public_date == qtr.public_date])
+    combined = ann.join(
+        qtr, [ann.gvkey == qtr.gvkey, ann.public_date == qtr.public_date], how="outer"
+    )
+    combined = combined.mutate(
+        gvkey=combined.gvkey.coalesce(combined.gvkey_right),
+        public_date=combined.public_date.coalesce(combined.public_date_right),
+        source=combined.source.coalesce(combined.source_qitem),
+    )
     drop_columns = [
         "datadate",
         f"datadate{q_suffix}",

@@ -392,3 +392,66 @@ def test_expansion_is_not_extended_by_out_of_order_publication(test_paths, monke
     assert by_month[date(2026, 5, 31)] == date(2025, 12, 31)
     # The late-published 2025-09-30 report is fully superseded before it starts.
     assert date(2025, 9, 30) not in set(expanded["datadate"].to_list())
+
+
+def test_combine_ann_qtr_chars_keeps_quarterly_only_coverage(test_paths) -> None:
+    """A security-month covered only by the quarterly panel must survive the merge.
+
+    Vivanta Industries (gvkey 343490) in the 2026-07-27 run: its FY2024 annual
+    record expires (18-month cap) in 2025-09, and FY2025 isn't public until
+    2026-06, leaving an annual-panel gap that covers May 2026. Its Q4-2025
+    quarterly record was public by 2026-02, so the quarterly panel has no such
+    gap. The old `ann LEFT JOIN qtr` dropped May 2026 entirely for this gvkey
+    because it only exists on the annual side by construction; the row and its
+    quarterly-sourced values must now come through.
+    """
+    ann_df_path = test_paths.interim_dir / "ann.parquet"
+    qtr_df_path = test_paths.interim_dir / "qtr.parquet"
+
+    # gvkey "1": both panels cover May; quarterly is newer and must win (unchanged).
+    # gvkey "2": only annual covers May; annual value must be kept (unchanged).
+    # gvkey "3": only quarterly covers May; this row was silently dropped before the fix.
+    pl.DataFrame(
+        {
+            "source": ["NA", "NA"],
+            "gvkey": ["1", "2"],
+            "public_date": [date(2026, 5, 31), date(2026, 5, 31)],
+            "datadate": [date(2025, 1, 31), date(2025, 1, 31)],
+            "at": [10.0, 5.0],
+        }
+    ).write_parquet(ann_df_path)
+    pl.DataFrame(
+        {
+            "source": ["NA"],
+            "gvkey": ["1"],
+            "public_date": [date(2026, 5, 31)],
+            "datadate": [date(2025, 6, 30)],
+            "at_qitem": [20.0],
+        }
+    ).write_parquet(qtr_df_path)
+
+    aux.combine_ann_qtr_chars(test_paths, ann_df_path, qtr_df_path, ["at"], "_qitem")
+    combined = pl.read_parquet(test_paths.interim_dir / "acc_chars_world.parquet").sort("gvkey")
+
+    assert combined["gvkey"].to_list() == ["1", "2"]
+    assert combined["at"].to_list() == [20.0, 5.0]  # gvkey 1 prefers the newer quarterly value
+
+    # Now add gvkey "3": quarterly-only coverage of May 2026.
+    pl.DataFrame(
+        {
+            "source": ["NA", "GLOBAL"],
+            "gvkey": ["1", "3"],
+            "public_date": [date(2026, 5, 31), date(2026, 5, 31)],
+            "datadate": [date(2025, 6, 30), date(2025, 12, 31)],
+            "at_qitem": [20.0, 30.0],
+        }
+    ).write_parquet(qtr_df_path)
+
+    aux.combine_ann_qtr_chars(test_paths, ann_df_path, qtr_df_path, ["at"], "_qitem")
+    combined = pl.read_parquet(test_paths.interim_dir / "acc_chars_world.parquet").sort("gvkey")
+
+    assert combined["gvkey"].to_list() == ["1", "2", "3"]
+    assert combined["at"].to_list() == [20.0, 5.0, 30.0]
+    row3 = combined.filter(pl.col("gvkey") == "3")
+    assert row3["public_date"].to_list() == [date(2026, 5, 31)]
+    assert row3["source"].to_list() == ["GLOBAL"]
