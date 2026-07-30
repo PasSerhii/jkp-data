@@ -43,7 +43,10 @@ VOLUME_MBPS="${VOLUME_MBPS:-1000}"
 # different count; the flag overrides the config, so a default here would
 # silently pin every run to that number.
 WORKERS="${WORKERS:-}"
-START_DATE="${START_DATE:-2000-01-01}"
+# Unset means the pipeline computes END_DATE minus config.ROLLING_INPUT_YEARS.
+# Pin it only to reproduce an older run; a window shorter than 240 months nulls
+# the seasonality characteristics.
+START_DATE="${START_DATE:-}"
 END_DATE="${END_DATE:-2026-06-30}"
 # Empty means every country the run produces (~95 GiB, ~$2.20/month in S3).
 # Set it to a space-separated list to upload only those, e.g.

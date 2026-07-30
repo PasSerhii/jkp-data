@@ -102,6 +102,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -120,6 +121,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -138,6 +140,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -156,6 +159,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -174,6 +178,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -192,6 +197,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -220,6 +226,7 @@ class TestBuildCommand:
             reuse_raw=False,
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
+            full_history=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -239,6 +246,12 @@ class TestBuildCommand:
         result = runner.invoke(app, ["build", str(tmp_path), "--keep-interim"])
         assert result.exit_code == 0
         assert mock_run_pipeline.call_args.kwargs["keep_interim"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_full_history(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--full-history"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["full_history"] is True
 
     def test_build_rejects_more_than_four_daily_download_workers(self, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path), "--daily-download-workers", "5"])

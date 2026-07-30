@@ -56,9 +56,11 @@ from .config import (
 from .config import (
     BYPASS_CRSP,
     DAILY_DOWNLOAD_WORKERS,
+    MAX_LOOKBACK_MONTHS,
     PRODUCTION_OUTPUT,
     ROLLING_DAILY_SPECS,
     ROLLING_DAILY_WORKERS,
+    ROLLING_INPUT_YEARS,
 )
 from .config import (
     END_DATE as DEFAULT_END_DATE,
@@ -68,6 +70,41 @@ from .paths import DataPaths
 from .production import export_production
 from .runtime_monitor import get_active_monitor, monitor_pipeline
 from .wrds_credentials import get_wrds_credentials
+
+
+def _rolling_start_date(end: date) -> date:
+    """Earliest source date a run needs to keep every characteristic valid at ``end``.
+
+    Counts ``config.ROLLING_INPUT_YEARS`` back from the end date so a monthly
+    build carries a constant span rather than one that grows a year every year.
+    Anchored to the first of the month, so the window is never a few days short
+    of the full span.
+    """
+    return date(end.year - ROLLING_INPUT_YEARS, end.month, 1)
+
+
+def _resolve_source_window(
+    start_date: date | None, end_date: date, full_history: bool
+) -> tuple[date | None, str]:
+    """Pick the source download's lower bound, and a label naming which rule won.
+
+    Three ways to bound a run, in precedence order: an explicit ``start_date``,
+    ``full_history`` (``config.ACCOUNTING_START_DATE``, for re-seeding a
+    downstream store or reissuing after a change that rewrites history), and
+    otherwise the rolling window that keeps a monthly build's cost flat.
+
+    Returns the bound (``None`` means unbounded) and a label recorded in
+    ``run_summary.json``, so a run states which rule produced its window.
+    """
+    if full_history and start_date is not None:
+        raise ValueError(
+            "full_history and start_date set different source lower bounds; pass only one."
+        )
+    if start_date is not None:
+        return start_date, "explicit"
+    if full_history:
+        return DEFAULT_ACCOUNTING_START_DATE, "full-history"
+    return _rolling_start_date(end_date), f"rolling-{ROLLING_INPUT_YEARS}y"
 
 
 def _roll_label(var: str, sfx: str, min_obs: int) -> str:
@@ -160,6 +197,7 @@ def run_pipeline(
     reuse_raw: bool = False,
     daily_download_workers: int = DAILY_DOWNLOAD_WORKERS,
     keep_interim: bool = False,
+    full_history: bool = False,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -189,8 +227,10 @@ def run_pipeline(
         raw_schema = "comp"
         username = creds.username
         password = creds.password
-    effective_start_date = DEFAULT_ACCOUNTING_START_DATE if start_date is None else start_date
     effective_end_date = DEFAULT_END_DATE if end_date is None else end_date
+    effective_start_date, source_window = _resolve_source_window(
+        start_date, effective_end_date, full_history
+    )
     if (
         effective_start_date is not None
         and effective_end_date is not None
@@ -214,7 +254,23 @@ def run_pipeline(
         reuse_raw=reuse_raw,
         daily_download_workers=daily_download_workers,
         keep_interim=keep_interim,
+        source_window=source_window,
     )
+    # A window shorter than the longest lookback nulls seas_16_20 everywhere,
+    # silently -- the characteristic simply fails its own observation gate. The
+    # rolling default always clears this; an explicit start_date may not. A None
+    # bound means unbounded history, which cannot be too short.
+    if effective_start_date is not None:
+        window_months = (effective_end_date.year - effective_start_date.year) * 12 + (
+            effective_end_date.month - effective_start_date.month
+        )
+        if window_months < MAX_LOOKBACK_MONTHS:
+            monitor.note(
+                f"WARNING source window is {window_months} months, short of the "
+                f"{MAX_LOOKBACK_MONTHS} the longest lookback needs: seas_16_20an/na will "
+                f"be null for every security. Omit start_date for the rolling "
+                f"{ROLLING_INPUT_YEARS}-year default."
+            )
 
     interim = paths.interim_dir
 

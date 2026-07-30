@@ -11,11 +11,27 @@ def _previous_month_end(today: date | None = None) -> date:
 # once when the process starts so every stage of a run uses the same cutoff.
 END_DATE = _previous_month_end()
 
-# Single lower bound for date-bearing source downloads and the standardized
-# accounting panel. ``None`` downloads complete source history; the accounting
-# loader still falls back to the original 1949-12-31 floor in that case.
-# Use ``--start-date 2000-01-01`` to override this default for a bounded run.
+# Absolute floor for date-bearing source downloads and the standardized
+# accounting panel, used when a run asks for complete history.
 ACCOUNTING_START_DATE: date | None = date(1949, 12, 31)
+
+# Longest lookback any characteristic needs, in monthly observations:
+# ``seas_16_20`` requires 240. Everything else is 60 months (the ``ch5`` family,
+# ``beta_60m``, ``ret_60_36``), 1260 trading days, or shorter.
+MAX_LOOKBACK_MONTHS = 240
+
+# Source history retained by a default run, counted back from END_DATE, so cost
+# stays flat instead of growing a year every year.
+#
+# 23 rather than the bare 20 the 240-month lookback implies: that gate counts a
+# security's own rows, not calendar months, and the shifts behind it are
+# positional, so a security with missing months needs more than 20 calendar
+# years to accumulate 240 observations. Measured on the USA monthly panel
+# (1,849 securities mature enough to qualify), a 23-year window loses no
+# security that a 26-year window keeps, while 22 loses one and 21 loses two.
+# Shorten this only against a fresh measurement -- the emerging markets were
+# not sampled, and their panels are gappier.
+ROLLING_INPUT_YEARS = 23
 
 # Bypass CRSP entirely and build the dataset from Compustat only. When True the
 # pipeline skips all CRSP downloads/processing and mirrors the SAS `bypass_crsp=1`

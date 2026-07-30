@@ -91,7 +91,9 @@ def build(
         None,
         "--start-date",
         help="Earliest database source date to download, as YYYY-MM-DD. "
-        "Defaults to config.ACCOUNTING_START_DATE.",
+        "Defaults to config.ROLLING_INPUT_YEARS (23) before the end date, which is "
+        "the shortest window that keeps every characteristic valid. A shorter "
+        "explicit window nulls the 240-month seasonality characteristics.",
     ),
     end_date: str | None = typer.Option(
         None,
@@ -116,6 +118,13 @@ def build(
         max=MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
         help="Shared parallel workers for indexed SECD/G_SECD batch downloads. "
         "Defaults to config.DAILY_DOWNLOAD_WORKERS when not specified.",
+    ),
+    full_history: bool = typer.Option(
+        False,
+        "--full-history",
+        help="Download complete source history (config.ACCOUNTING_START_DATE) instead of "
+        "the rolling window. Use when re-seeding a downstream store, or reissuing after "
+        "a change that rewrites historical values. Cannot be combined with --start-date.",
     ),
     keep_interim: bool = typer.Option(
         False,
@@ -149,6 +158,7 @@ def build(
             DAILY_DOWNLOAD_WORKERS if daily_download_workers is None else daily_download_workers
         ),
         keep_interim=keep_interim,
+        full_history=full_history,
     )
 
 

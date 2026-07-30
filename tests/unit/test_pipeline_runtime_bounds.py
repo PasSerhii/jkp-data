@@ -5,11 +5,14 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
+import pytest
+
 import jkp.data.main as pipeline
-from jkp.data.config import DAILY_DOWNLOAD_WORKERS
+from jkp.data.config import DAILY_DOWNLOAD_WORKERS, ROLLING_INPUT_YEARS
 
 
-def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) -> None:
+def test_full_history_uses_the_accounting_start_date_bound(monkeypatch, tmp_path) -> None:
+    """--full-history restores the pre-rolling-window behaviour for re-seeds."""
     download = MagicMock()
     monkeypatch.setattr(pipeline, "download_raw_data_tables", download)
     monkeypatch.setattr(pipeline, "setup_folder_structure", MagicMock())
@@ -30,6 +33,7 @@ def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) ->
             bypass_crsp=True,
             production_output=False,
             compustat_source="xpressfeed",
+            full_history=True,
         )
     except RuntimeError as error:
         assert str(error) == "stop after download"
@@ -37,6 +41,54 @@ def test_accounting_start_date_is_default_source_bound(monkeypatch, tmp_path) ->
         raise AssertionError("pipeline should have stopped after the download step")
 
     assert download.call_args.kwargs["start_date"] == date(1949, 12, 31)
+
+
+def test_default_source_bound_is_the_rolling_window(monkeypatch, tmp_path) -> None:
+    """Without a flag a run downloads ROLLING_INPUT_YEARS back, not all history."""
+    download = MagicMock()
+    monkeypatch.setattr(pipeline, "download_raw_data_tables", download)
+    monkeypatch.setattr(pipeline, "setup_folder_structure", MagicMock())
+    monkeypatch.setattr(
+        pipeline,
+        "gen_raw_data_dfs",
+        MagicMock(side_effect=RuntimeError("stop after download")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_xpressfeed_connection_info",
+        MagicMock(return_value="postgresql://private-rds"),
+    )
+
+    end = date(2026, 6, 30)
+    try:
+        pipeline.run_pipeline(
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=False,
+            compustat_source="xpressfeed",
+            end_date=end,
+        )
+    except RuntimeError as error:
+        assert str(error) == "stop after download"
+    else:
+        raise AssertionError("pipeline should have stopped after the download step")
+
+    assert download.call_args.kwargs["start_date"] == date(
+        end.year - ROLLING_INPUT_YEARS, end.month, 1
+    )
+
+
+def test_full_history_and_start_date_together_are_rejected(tmp_path) -> None:
+    """Two different lower bounds is a mistake, not something to silently resolve."""
+    with pytest.raises(ValueError, match="only one"):
+        pipeline.run_pipeline(
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=False,
+            compustat_source="xpressfeed",
+            start_date=date(2000, 1, 1),
+            full_history=True,
+        )
 
 
 def test_reuse_raw_validates_inputs_and_skips_download(monkeypatch, tmp_path) -> None:

@@ -47,6 +47,18 @@ accounting artefacts to S3 (`accounting_data/`, `other_output/`, and the
 upload. The host probes the image for the flag first, so an older image degrades
 to the `processed/` copies rather than failing.
 
+Leave `START_DATE` unset too. The pipeline then downloads a rolling
+`config.ROLLING_INPUT_YEARS` (23) years back from the end date, which keeps the
+run's cost flat instead of growing a year every year. 23 is the shortest window
+that nulls no characteristic: `seas_16_20` needs 240 monthly *observations*, and
+its gate counts a security's own rows rather than calendar months, so gappy
+securities need more than 20 calendar years to reach 240. Pin `START_DATE` only
+to reproduce an older run — a window under 240 months silently nulls the
+seasonality columns, and the pipeline now warns when that happens. For a
+complete-history build (re-seeding a downstream store, or reissuing after a
+change that rewrites history) pass `jkp build --full-history` rather than
+guessing a start date; it uses `config.ACCOUNTING_START_DATE`.
+
 Leave `WORKERS` unset unless you are A/B testing a worker count:
 `--daily-download-workers` overrides `config.DAILY_DOWNLOAD_WORKERS`, so setting
 it pins the run to that number and the config is ignored.
@@ -111,7 +123,9 @@ no public IP, nothing inbound.
 
 ## Baselines
 
-All runs: `--start-date 2000-01-01 --end-date 2026-06-30 --production`, fresh
+All three runs below predate the rolling window and pinned
+`--start-date 2000-01-01`; a run today covers 23 years rather than 26, so expect
+a shorter download than these figures. All: `--end-date 2026-06-30 --production`, fresh
 download. The first two on 128 vCPU / ~500 GiB (`m6a.32xlarge`); 2026-07-29 on
 64 vCPU / ~500 GiB (`r7i.16xlarge`), so its per-phase figures are not directly
 comparable — only the total is.

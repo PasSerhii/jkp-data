@@ -15,6 +15,7 @@ IMAGE=@@IMAGE@@
 RUN_PREFIX="s3://$BUCKET/@@RUN_TAG@@"
 COUNTRIES="@@COUNTRIES@@"
 WORKERS="@@WORKERS@@"
+START_DATE="@@START_DATE@@"
 KEEP_INTERIM="@@KEEP_INTERIM@@"
 PARAM="@@PARAM@@"
 MARKET="@@MARKET@@"
@@ -157,7 +158,7 @@ docker run --name jkp-run \
   --compustat-source xpressfeed \
   --bypass-crsp \
   --persistent-connection \
-  --start-date @@START_DATE@@ \
+  ${START_DATE:+--start-date $START_DATE} \
   --end-date @@END_DATE@@ \
   --production \
   ${WORKERS:+--daily-download-workers $WORKERS} \
