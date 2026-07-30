@@ -18,7 +18,7 @@ from pathlib import Path
 import polars as pl
 
 from .aux_functions import compustat_fx, measure_time
-from .config import END_DATE
+from .config import END_DATE, PRODUCTION_OUTPUT_YEARS
 from .paths import DataPaths, get_production_monthly_columns
 
 # ---------------------------------------------------------------------------
@@ -345,8 +345,23 @@ def _monthly_identifier_panel(paths: DataPaths) -> pl.LazyFrame:
 # ---------------------------------------------------------------------------
 
 
+def _production_lower_bound(end_date: date, production_years: int) -> date | None:
+    """Earliest date the per-country production CSVs carry; ``None`` means all of it.
+
+    Anchored to the first of the month so the window is never a few days short of
+    the configured span, matching the rolling source window's convention.
+    """
+    if production_years <= 0:
+        return None
+    return date(end_date.year - production_years, end_date.month, 1)
+
+
 @measure_time
-def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> None:
+def save_daily_production_csv(
+    paths: DataPaths,
+    end_date: date = END_DATE,
+    production_years: int = PRODUCTION_OUTPUT_YEARS,
+) -> None:
     """Write per-country daily return CSVs in the SAS production (bra.csv) format.
 
     Columns: excntry, id, date, ret (local), prc_open (local), prc_high/low/close
@@ -355,6 +370,7 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
     out_dir = paths.production_dir / "daily"
     out_dir.mkdir(parents=True, exist_ok=True)
     daily_cutoff = min(end_date, date.today())
+    lower = _production_lower_bound(end_date, production_years)
 
     # id -> stable Compustat issue key map from the monthly file (daily lacks it).
     id_map = (
@@ -367,6 +383,10 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
     daily = (
         pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
         .filter(pl.col("date") <= pl.lit(daily_cutoff))
+        # Bounded before the joins so the identifier and id-map joins shrink too,
+        # not just the write. Every value was already computed over the full input
+        # window, so this only chooses which finished rows are published.
+        .filter(pl.lit(True) if lower is None else pl.col("date") >= pl.lit(lower))
         .select(
             "excntry",
             "id",
@@ -408,10 +428,15 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
 
 
 @measure_time
-def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> None:
+def save_main_production_csv(
+    paths: DataPaths,
+    end_date: date = END_DATE,
+    production_years: int = PRODUCTION_OUTPUT_YEARS,
+) -> None:
     """Write per-country monthly characteristics CSVs in the SAS production format."""
     out_dir = paths.production_dir / "monthly"
     out_dir.mkdir(parents=True, exist_ok=True)
+    lower = _production_lower_bound(end_date, production_years)
 
     vol3 = market_volumes(paths, 3).rename(
         {
@@ -439,6 +464,11 @@ def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> Non
         # columns of the same name to avoid '<col>_right' collisions.
         .drop("conm", "sedol", "cusip", "isin_orig", strict=False)
         .filter(pl.col("eom") <= pl.lit(end_date))
+        # Bounded before the joins so the volume, min-price, identifier and FX
+        # joins shrink with it, and _add_isin's per-pair check-digit UDF runs over
+        # fewer distinct pairs. Values are unaffected: each row was computed over
+        # the full input window before reaching here.
+        .filter(pl.lit(True) if lower is None else pl.col("eom") >= pl.lit(lower))
         .join(ids, on=["gvkey", "iid", "eom"], how="left")
         .join(vol3.lazy(), on=["id", "eom"], how="left")
         .join(vol6.lazy(), on=["id", "eom"], how="left")
@@ -481,7 +511,16 @@ def _write_country_csvs(lf: pl.DataFrame | pl.LazyFrame, out_dir) -> None:
 
 
 @measure_time
-def export_production(paths: DataPaths, end_date: date = END_DATE) -> None:
-    """Write both production outputs (monthly characteristics + daily returns)."""
-    save_main_production_csv(paths, end_date)
-    save_daily_production_csv(paths, end_date)
+def export_production(
+    paths: DataPaths,
+    end_date: date = END_DATE,
+    production_years: int = PRODUCTION_OUTPUT_YEARS,
+) -> None:
+    """Write both production outputs (monthly characteristics + daily returns).
+
+    ``production_years`` bounds how much history the per-country CSVs carry; 0
+    emits everything. The cross-country files (market returns, cutoffs, world
+    monthly returns) are written elsewhere and always carry full history.
+    """
+    save_main_production_csv(paths, end_date, production_years)
+    save_daily_production_csv(paths, end_date, production_years)

@@ -33,6 +33,19 @@ MAX_LOOKBACK_MONTHS = 240
 # not sampled, and their panels are gappier.
 ROLLING_INPUT_YEARS = 23
 
+# History kept in the per-country production CSVs, counted back from END_DATE.
+# 0 emits everything, which a downstream re-seed needs.
+#
+# These CSVs feed an appending loader that only reads rows past the destination's
+# high-water mark -- normally one month. 3 years rather than 2 months so that
+# restatements keep propagating (the loader deletes and reinserts everything the
+# file covers) and so a loader that has not run for a while still finds its
+# overlap instead of leaving a permanent hole.
+#
+# Output only: every characteristic is still computed over the full input window,
+# so trimming here changes no value in the rows that remain.
+PRODUCTION_OUTPUT_YEARS = 3
+
 # Bypass CRSP entirely and build the dataset from Compustat only. When True the
 # pipeline skips all CRSP downloads/processing and mirrors the SAS `bypass_crsp=1`
 # path: Compustat-only security files, FF risk-free rate (with last-month

@@ -9,7 +9,12 @@ from typer.testing import CliRunner
 
 from jkp.data import __version__
 from jkp.data.cli import app
-from jkp.data.config import BYPASS_CRSP, DAILY_DOWNLOAD_WORKERS, PRODUCTION_OUTPUT
+from jkp.data.config import (
+    BYPASS_CRSP,
+    DAILY_DOWNLOAD_WORKERS,
+    PRODUCTION_OUTPUT,
+    PRODUCTION_OUTPUT_YEARS,
+)
 from jkp.data.database_sources import CompustatSource
 
 runner = CliRunner()
@@ -103,6 +108,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -122,6 +128,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -141,6 +148,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -160,6 +168,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -179,6 +188,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -198,6 +208,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -227,6 +238,7 @@ class TestBuildCommand:
             daily_download_workers=DAILY_DOWNLOAD_WORKERS,
             keep_interim=False,
             full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -246,6 +258,18 @@ class TestBuildCommand:
         result = runner.invoke(app, ["build", str(tmp_path), "--keep-interim"])
         assert result.exit_code == 0
         assert mock_run_pipeline.call_args.kwargs["keep_interim"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_production_years(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--production-years", "5"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["production_years"] == 5
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_production_years_zero_means_full_history(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--production-years", "0"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["production_years"] == 0
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_full_history(self, mock_run_pipeline, tmp_path):

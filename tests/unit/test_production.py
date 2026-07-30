@@ -221,7 +221,9 @@ def test_save_main_production_csv_matches_column_order(tmp_path: Path) -> None:
     _write_daily(paths)
     _write_monthly_and_ids(paths)
 
-    save_main_production_csv(paths, end_date=date(2026, 5, 31))
+    # production_years=0: this asserts column order, which the output window does
+    # not touch. The fixture's only row is 2020-01, well outside the 3-year default.
+    save_main_production_csv(paths, end_date=date(2026, 5, 31), production_years=0)
     out_file = paths.production_dir / "monthly" / "bra.csv"
     assert out_file.exists()
     # processed/output/ held a byte-identical second copy of every country CSV,
@@ -248,7 +250,8 @@ def test_save_daily_production_csv_format(tmp_path: Path) -> None:
     _write_daily(paths)
     _write_monthly_and_ids(paths)
 
-    save_daily_production_csv(paths, end_date=date(2026, 5, 31))
+    # production_years=0 for the same reason as the monthly test above.
+    save_daily_production_csv(paths, end_date=date(2026, 5, 31), production_years=0)
     out_file = paths.production_dir / "daily" / "bra.csv"
     assert out_file.exists()
     assert not (paths.processed_dir / "output").exists()

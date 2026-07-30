@@ -75,10 +75,17 @@ aws ec2 terminate-instances --region eu-central-1 --instance-ids i-0abc...
 ```
 
 Terminating destroys the volume. By default the whole of `processed/production/`
-reaches S3 first (~95 GiB, roughly $2.20/month to keep); set `COUNTRIES` to a
-space-separated list to upload only those countries, in which case the six
-cross-country files still ship. Whatever is not uploaded — the remaining CSVs and
+reaches S3 first (~12 GiB with the 3-year output window, against ~95 GiB
+unbounded); set `COUNTRIES` to a space-separated list to upload only those
+countries, in which case the six cross-country files still ship. Whatever is not uploaded — the remaining CSVs and
 all parquet output — is lost, and recovering it means a full rerun.
+
+The per-country CSVs carry `config.PRODUCTION_OUTPUT_YEARS` (3) of history, not the
+whole panel — the loader downstream only reads rows past its own high-water mark,
+so the rest was written and shipped unread. `jkp build --production-years 0` emits
+everything for a re-seed. This bounds the output only: characteristics are computed
+over the full source window either way, so the retained rows are identical. The six
+cross-country files keep full history.
 
 `processed/production/` is the entire production deliverable:
 

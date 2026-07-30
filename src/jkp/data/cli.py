@@ -119,6 +119,15 @@ def build(
         help="Shared parallel workers for indexed SECD/G_SECD batch downloads. "
         "Defaults to config.DAILY_DOWNLOAD_WORKERS when not specified.",
     ),
+    production_years: int | None = typer.Option(
+        None,
+        "--production-years",
+        min=0,
+        help="Years of history the per-country production CSVs carry, counted back "
+        "from the end date. 0 emits everything, which a downstream re-seed needs. "
+        "Defaults to config.PRODUCTION_OUTPUT_YEARS. Output only: characteristics "
+        "are always computed over the full source window, so this changes no value.",
+    ),
     full_history: bool = typer.Option(
         False,
         "--full-history",
@@ -135,7 +144,12 @@ def build(
     ),
 ) -> None:
     """Run the full data generation pipeline."""
-    from .config import BYPASS_CRSP, DAILY_DOWNLOAD_WORKERS, PRODUCTION_OUTPUT
+    from .config import (
+        BYPASS_CRSP,
+        DAILY_DOWNLOAD_WORKERS,
+        PRODUCTION_OUTPUT,
+        PRODUCTION_OUTPUT_YEARS,
+    )
     from .main import run_pipeline
 
     if not force and output_dir.exists() and any(output_dir.iterdir()):
@@ -159,6 +173,9 @@ def build(
         ),
         keep_interim=keep_interim,
         full_history=full_history,
+        production_years=(
+            PRODUCTION_OUTPUT_YEARS if production_years is None else production_years
+        ),
     )
 
 

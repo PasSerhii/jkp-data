@@ -58,6 +58,7 @@ from .config import (
     DAILY_DOWNLOAD_WORKERS,
     MAX_LOOKBACK_MONTHS,
     PRODUCTION_OUTPUT,
+    PRODUCTION_OUTPUT_YEARS,
     ROLLING_DAILY_SPECS,
     ROLLING_DAILY_WORKERS,
     ROLLING_INPUT_YEARS,
@@ -198,6 +199,7 @@ def run_pipeline(
     daily_download_workers: int = DAILY_DOWNLOAD_WORKERS,
     keep_interim: bool = False,
     full_history: bool = False,
+    production_years: int = PRODUCTION_OUTPUT_YEARS,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -255,7 +257,16 @@ def run_pipeline(
         daily_download_workers=daily_download_workers,
         keep_interim=keep_interim,
         source_window=source_window,
+        production_years=production_years,
     )
+    # The published window cannot exceed the window the data was built from; the
+    # CSVs would silently stop at the source bound instead of the requested span.
+    if 0 < ROLLING_INPUT_YEARS < production_years:
+        monitor.note(
+            f"WARNING production_years={production_years} exceeds the "
+            f"{ROLLING_INPUT_YEARS}-year source window, so the CSVs will start at the "
+            f"source bound. Pass full_history for a longer published history."
+        )
     # A window shorter than the longest lookback nulls seas_16_20 everywhere,
     # silently -- the characteristic simply fails its own observation gate. The
     # rolling default always clears this; an explicit start_date may not. A None
@@ -449,5 +460,5 @@ def run_pipeline(
     # Production CSVs must run before cleanup: they read the filtered interim
     # outputs and the raw SECD/G_SECD identifier tables, all cleared below.
     if production_output:
-        export_production(paths, end_date=effective_end_date)
+        export_production(paths, end_date=effective_end_date, production_years=production_years)
     save_full_files_and_cleanup(paths, clear_interim=not keep_interim)
