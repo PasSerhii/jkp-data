@@ -117,6 +117,13 @@ def build(
         help="Shared parallel workers for indexed SECD/G_SECD batch downloads. "
         "Defaults to config.DAILY_DOWNLOAD_WORKERS when not specified.",
     ),
+    keep_interim: bool = typer.Option(
+        False,
+        "--keep-interim",
+        help="Retain interim/ and raw/ after the run instead of deleting them. "
+        "Needed to inspect or test against intermediate artefacts; costs several "
+        "hundred GB of disk.",
+    ),
 ) -> None:
     """Run the full data generation pipeline."""
     from .config import BYPASS_CRSP, DAILY_DOWNLOAD_WORKERS, PRODUCTION_OUTPUT
@@ -141,6 +148,7 @@ def build(
         daily_download_workers=(
             DAILY_DOWNLOAD_WORKERS if daily_download_workers is None else daily_download_workers
         ),
+        keep_interim=keep_interim,
     )
 
 

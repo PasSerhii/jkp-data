@@ -22,11 +22,15 @@ def _expected_jobs() -> set[tuple[str, str, int]]:
 def test_every_window_variable_pair_runs_exactly_once(monkeypatch, workers) -> None:
     """Sequential and concurrent paths must cover the same job set."""
     seen: list[tuple[str, str, int]] = []
+    labels: list[str] = []
     lock = threading.Lock()
 
-    def fake(paths, var, sfx, min_obs, end_date):  # noqa: ARG001
+    # _step_name mirrors the real roll_apply_daily, whose @measure_time wrapper
+    # consumes the kwarg; a double without it would not stand in for the original.
+    def fake(paths, var, sfx, min_obs, end_date, _step_name=None):  # noqa: ARG001
         with lock:
             seen.append((var, sfx, min_obs))
+            labels.append(_step_name)
 
     monkeypatch.setattr(main, "roll_apply_daily", fake)
     monkeypatch.setattr(main, "ROLLING_DAILY_WORKERS", workers)
@@ -35,6 +39,9 @@ def test_every_window_variable_pair_runs_exactly_once(monkeypatch, workers) -> N
 
     assert len(seen) == len(_expected_jobs())
     assert set(seen) == _expected_jobs()
+    # Both paths label every job, and no two jobs share a label.
+    assert len(set(labels)) == len(_expected_jobs())
+    assert all(label.startswith("roll_apply_daily[") for label in labels)
 
 
 def test_output_paths_are_unique_per_job() -> None:
@@ -52,7 +59,7 @@ def test_failure_propagates_after_all_jobs_settle(monkeypatch) -> None:
     completed: list[str] = []
     lock = threading.Lock()
 
-    def fake(paths, var, sfx, min_obs, end_date):  # noqa: ARG001
+    def fake(paths, var, sfx, min_obs, end_date, _step_name=None):  # noqa: ARG001
         if var == "rvol" and sfx == "_21d":
             raise RuntimeError("boom")
         with lock:

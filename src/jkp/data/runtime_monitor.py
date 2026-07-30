@@ -58,6 +58,42 @@ def _gib(value: int | float) -> float:
     return float(value) / (1024**3)
 
 
+def _read_cgroup_memory() -> tuple[float | None, float | None]:
+    """Return (current, limit) container memory in GiB, or (None, None) off cgroup v2.
+
+    Resident-set size is not a memory-pressure figure: shared pages and every
+    memory-mapped parquet count once per mapping, which is how a run can report a
+    459 GiB RSS on a host with 496 GiB of RAM and 351 GiB actually in use. The
+    cgroup counter is the number the kernel would enforce a limit against, so it is
+    the honest one when the pipeline runs in a container.
+
+    ``memory.max`` reads ``max`` when the container is unlimited (the benchmark
+    passes no ``docker run -m``), which is reported as None rather than a number:
+    there is no denominator to compute headroom against.
+    """
+    try:
+        current = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+    except (OSError, ValueError):
+        return None, None
+    limit: float | None = None
+    try:
+        raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        if raw != "max":
+            limit = _gib(int(raw))
+    except (OSError, ValueError):
+        limit = None
+    return _gib(current), limit
+
+
+def _cgroup_field(current: float | None, limit: float | None) -> str:
+    """Heartbeat fragment for container memory; empty when not under a cgroup."""
+    if current is None:
+        return ""
+    if limit is None:
+        return f" cgroup_mem={current:.1f}GiB"
+    return f" cgroup_mem={current:.1f}GiB/{limit:.1f}GiB"
+
+
 @dataclass
 class _Step:
     token: int
@@ -65,6 +101,17 @@ class _Step:
     phase: str | None
     started_monotonic: float
     started_at: str
+    parent_token: int | None = None
+    depth: int = 0
+
+
+# Which steps the caller is currently inside, innermost last. Context-local rather
+# than a plain list because the rolling-daily fan-out runs steps on worker threads:
+# each worker needs its own view of the stack, inheriting the parent that submitted
+# it. Only summing depth-0 rows gives a total free of double counting.
+_STEP_STACK: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextVar(
+    "jkp_active_step_stack", default=()
+)
 
 
 class PipelineRunMonitor:
@@ -245,6 +292,7 @@ class PipelineRunMonitor:
             handle.flush()
 
     def step_started(self, name: str) -> int:
+        stack = _STEP_STACK.get()
         with self._lock:
             self._step_counter += 1
             step = _Step(
@@ -253,12 +301,23 @@ class PipelineRunMonitor:
                 phase=self._phase,
                 started_monotonic=time.monotonic(),
                 started_at=_utc_now().isoformat(),
+                parent_token=stack[-1] if stack else None,
+                depth=len(stack),
             )
             self._steps.append(step)
-        self._log(f"STEP START {name} phase={step.phase or 'unassigned'}")
+        _STEP_STACK.set((*stack, step.token))
+        self._log(
+            f"STEP START {name} phase={step.phase or 'unassigned'} "
+            f"depth={step.depth} parent={step.parent_token if step.parent_token else 'none'}"
+        )
         return step.token
 
     def step_finished(self, token: int, error: BaseException | None = None) -> None:
+        # Drop this token and anything nested below it: a child that failed without
+        # unwinding must not leave the stack claiming parents that already finished.
+        stack = _STEP_STACK.get()
+        if token in stack:
+            _STEP_STACK.set(stack[: stack.index(token)])
         with self._lock:
             step = next((item for item in reversed(self._steps) if item.token == token), None)
             if step is None:
@@ -269,7 +328,7 @@ class PipelineRunMonitor:
         self._append_step_row(step, duration, status, error)
         self._log(
             f"STEP {status.upper()} {step.name} duration={_format_duration(duration)} "
-            f"overall_elapsed={_format_duration(self.elapsed_seconds)}"
+            f"depth={step.depth} overall_elapsed={_format_duration(self.elapsed_seconds)}"
         )
 
     def stop(self, error: BaseException | None = None) -> None:
@@ -320,8 +379,10 @@ class PipelineRunMonitor:
                     "ram_used_gib",
                     "ram_available_gib",
                     "ram_percent",
-                    "process_rss_gib",
-                    "children_rss_gib",
+                    "process_rss_raw_gib",
+                    "children_rss_raw_gib",
+                    "cgroup_memory_current_gib",
+                    "cgroup_memory_limit_gib",
                     "swap_used_gib",
                     "disk_total_gib",
                     "disk_used_gib",
@@ -338,6 +399,8 @@ class PipelineRunMonitor:
         with self.steps_path.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(
                 (
+                    # Existing columns keep their positions: status.sh and the
+                    # comparison scripts read them by index. New fields append.
                     "step_token",
                     "phase",
                     "step",
@@ -347,6 +410,8 @@ class PipelineRunMonitor:
                     "status",
                     "error_type",
                     "error_message",
+                    "parent_step_token",
+                    "step_depth",
                 )
             )
         with self.downloads_path.open("w", encoding="utf-8", newline="") as handle:
@@ -399,6 +464,7 @@ class PipelineRunMonitor:
                     children_rss += child.memory_info().rss
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
+            cgroup_current, cgroup_limit = _read_cgroup_memory()
             disk = psutil.disk_usage(str(self.output_dir))
             io = self._process.io_counters()
             disk_io = psutil.disk_io_counters()
@@ -427,6 +493,8 @@ class PipelineRunMonitor:
                 round(memory.percent, 3),
                 round(_gib(process_rss), 3),
                 round(_gib(children_rss), 3),
+                "" if cgroup_current is None else round(cgroup_current, 3),
+                "" if cgroup_limit is None else round(cgroup_limit, 3),
                 round(_gib(swap.used), 3),
                 round(_gib(disk.total), 3),
                 round(_gib(disk.used), 3),
@@ -457,17 +525,27 @@ class PipelineRunMonitor:
                 self._update_peak("cpu_iowait_percent", cpu_iowait)
                 self._update_peak("process_cpu_percent", process_cpu)
                 self._update_peak("ram_used_gib", _gib(memory.used))
-                self._update_peak("process_rss_gib", _gib(process_rss + children_rss))
+                # Raw RSS over-counts shared and memory-mapped pages, so it is kept
+                # for diagnostics but must not be read as the job's memory peak.
+                self._update_peak("process_rss_raw_gib", _gib(process_rss + children_rss))
+                if cgroup_current is not None:
+                    self._update_peak("cgroup_memory_current_gib", cgroup_current)
+                # How close the host actually came to running out.
+                self._update_min("ram_available_gib_min", _gib(memory.available))
                 self._update_peak("swap_used_gib", _gib(swap.used))
                 self._update_peak("disk_used_gib", _gib(disk.used))
                 eta = self._estimated_remaining_locked()
             self._write_summary()
+            cgroup_field = _cgroup_field(cgroup_current, cgroup_limit)
             self._log(
                 f"HEARTBEAT phase={phase or 'unassigned'} step={step or 'none'} "
                 f"cpu={system_cpu:.1f}% iowait={cpu_iowait:.1f}% "
                 f"process_cpu_cores={process_cpu / 100.0:.1f} "
                 f"ram_used={_gib(memory.used):.1f}/{_gib(memory.total):.1f}GiB "
-                f"process_rss={_gib(process_rss + children_rss):.1f}GiB "
+                f"ram_available={_gib(memory.available):.1f}GiB{cgroup_field} "
+                # Raw: counts shared and mmapped pages repeatedly, so it can exceed
+                # total RAM. Diagnostic only -- ram_available is the real headroom.
+                f"process_rss_raw={_gib(process_rss + children_rss):.1f}GiB "
                 f"disk_free={_gib(disk.free):.1f}GiB "
                 f"estimated_remaining={_format_duration(eta)}"
             )
@@ -476,6 +554,9 @@ class PipelineRunMonitor:
 
     def _update_peak(self, name: str, value: float) -> None:
         self._peaks[name] = max(value, self._peaks.get(name, value))
+
+    def _update_min(self, name: str, value: float) -> None:
+        self._peaks[name] = min(value, self._peaks.get(name, value))
 
     def _append_step_row(
         self,
@@ -498,6 +579,8 @@ class PipelineRunMonitor:
                     status,
                     type(error).__name__ if error is not None else "",
                     str(error) if error is not None else "",
+                    step.parent_token if step.parent_token is not None else "",
+                    step.depth,
                 )
             )
             handle.flush()

@@ -222,12 +222,12 @@ def test_save_main_production_csv_matches_column_order(tmp_path: Path) -> None:
     _write_monthly_and_ids(paths)
 
     save_main_production_csv(paths, end_date=date(2026, 5, 31))
-    out_file = paths.processed_dir / "production" / "monthly" / "bra.csv"
-    sas_out_file = paths.sas_output_dir / "CharacteristicsProduction" / "bra.csv"
+    out_file = paths.production_dir / "monthly" / "bra.csv"
     assert out_file.exists()
-    assert sas_out_file.exists()
+    # processed/output/ held a byte-identical second copy of every country CSV,
+    # ~95 GiB per run, purely to present the SAS directory shape. It must stay gone.
+    assert not (paths.processed_dir / "output").exists()
     header = out_file.read_text().splitlines()[0]
-    assert sas_out_file.read_text().splitlines()[0] == header
     cols = [c.strip('"') for c in header.split(",")]
     assert cols == get_production_monthly_columns()  # exact 455-col order
     # Read id columns as strings to preserve leading zeros (the CSV quotes them).
@@ -249,10 +249,9 @@ def test_save_daily_production_csv_format(tmp_path: Path) -> None:
     _write_monthly_and_ids(paths)
 
     save_daily_production_csv(paths, end_date=date(2026, 5, 31))
-    out_file = paths.processed_dir / "production" / "daily" / "bra.csv"
-    sas_out_file = paths.sas_output_dir / "bra.csv"
+    out_file = paths.production_dir / "daily" / "bra.csv"
     assert out_file.exists()
-    assert sas_out_file.exists()
+    assert not (paths.processed_dir / "output").exists()
     df = pl.read_csv(
         out_file, schema_overrides={"cusip": pl.Utf8, "sedol": pl.Utf8, "isin": pl.Utf8}
     )

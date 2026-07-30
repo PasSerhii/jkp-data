@@ -44,7 +44,7 @@ def test_monitor_persists_successful_run_metrics_steps_and_history(tmp_path) -> 
         "cpu_iowait_percent",
         "process_cpu_cores",
         "ram_used_gib",
-        "process_rss_gib",
+        "process_rss_raw_gib",
         "disk_used_delta_gib",
         "system_disk_write_gib",
         "network_recv_gib",

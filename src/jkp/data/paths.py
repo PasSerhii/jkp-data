@@ -36,9 +36,16 @@ class DataPaths:
         return self.base_dir / "processed"
 
     @property
-    def sas_output_dir(self) -> Path:
-        """SAS-compatible CSV output directory under processed/."""
-        return self.processed_dir / "output"
+    def production_dir(self) -> Path:
+        """The single production CSV directory.
+
+        Holds ``monthly/<country>.csv``, ``daily/<country>.csv`` and the six
+        cross-country files (market returns, cutoffs, world monthly returns).
+        This replaces the former ``processed/output/`` tree, which held a
+        byte-identical second copy of every country CSV purely to present the
+        SAS directory shape.
+        """
+        return self.processed_dir / "production"
 
     def raw_table_source(self, table_name: str) -> Path | str:
         """Return a file or Parquet glob for a downloaded source table.

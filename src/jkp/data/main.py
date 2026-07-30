@@ -1,5 +1,7 @@
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from functools import partial
 from pathlib import Path
 
 from .aux_functions import (
@@ -68,6 +70,20 @@ from .runtime_monitor import get_active_monitor, monitor_pipeline
 from .wrds_credentials import get_wrds_credentials
 
 
+def _roll_label(var: str, sfx: str, min_obs: int) -> str:
+    """Step name for one rolling-daily job.
+
+    The variable alone is not unique: ``zero_trades`` is computed over the 21d, 126d
+    and 252d windows, so three jobs would otherwise share a label and collapse into
+    one another in step_timings.csv.
+
+    Fields are separated by ``;`` rather than ``,``: step names land in a CSV column,
+    and the awk readers in scripts/ec2-benchmark split on every comma irrespective of
+    quoting, which would shift every later field on these rows.
+    """
+    return f"roll_apply_daily[stat={var};window={sfx.lstrip('_')};min_obs={min_obs}]"
+
+
 def _run_rolling_daily(paths: DataPaths, end_date: date) -> None:
     """Compute every rolling daily window, overlapping independent calculations.
 
@@ -81,18 +97,53 @@ def _run_rolling_daily(paths: DataPaths, end_date: date) -> None:
     jobs = [(var, sfx, min_obs) for sfx, min_obs, vars_ in ROLLING_DAILY_SPECS for var in vars_]
     if ROLLING_DAILY_WORKERS <= 1 or len(jobs) <= 1:
         for var, sfx, min_obs in jobs:
-            roll_apply_daily(paths, var, sfx, min_obs, end_date=end_date)
+            roll_apply_daily(
+                paths,
+                var,
+                sfx,
+                min_obs,
+                end_date=end_date,
+                _step_name=_roll_label(var, sfx, min_obs),
+            )
         return
 
-    with ThreadPoolExecutor(max_workers=ROLLING_DAILY_WORKERS) as pool:
-        futures = [
-            pool.submit(roll_apply_daily, paths, var, sfx, min_obs, end_date=end_date)
-            for var, sfx, min_obs in jobs
-        ]
-        # Let every job settle before raising, so a failure cannot leave the
-        # merge step reading a half-written set of windows.
-        for future in futures:
-            future.result()
+    monitor = get_active_monitor()
+    # One parent step covering the fan-out. Children run concurrently, so their
+    # durations sum to more than the parent's: only depth-0 rows may be summed.
+    parent_token = monitor.step_started("rolling_daily_fanout") if monitor is not None else None
+    try:
+        with ThreadPoolExecutor(max_workers=ROLLING_DAILY_WORKERS) as pool:
+            # A worker thread starts with an empty context, so the _ACTIVE_MONITOR
+            # and step-stack ContextVars would both read as unset and every child
+            # step would go unrecorded. Copying the context per submit carries the
+            # monitor and the parent step into the worker.
+            futures = [
+                pool.submit(
+                    contextvars.copy_context().run,
+                    partial(
+                        roll_apply_daily,
+                        paths,
+                        var,
+                        sfx,
+                        min_obs,
+                        end_date=end_date,
+                        _step_name=_roll_label(var, sfx, min_obs),
+                    ),
+                )
+                for var, sfx, min_obs in jobs
+            ]
+            # Let every job settle before raising, so a failure cannot leave the
+            # merge step reading a half-written set of windows.
+            errors = [future.exception() for future in futures]
+    except BaseException as error:
+        if monitor is not None and parent_token is not None:
+            monitor.step_finished(parent_token, error)
+        raise
+    first_error = next((item for item in errors if item is not None), None)
+    if monitor is not None and parent_token is not None:
+        monitor.step_finished(parent_token, first_error)
+    if first_error is not None:
+        raise first_error
 
 
 @monitor_pipeline
@@ -108,6 +159,7 @@ def run_pipeline(
     metrics_interval_seconds: float = 60.0,
     reuse_raw: bool = False,
     daily_download_workers: int = DAILY_DOWNLOAD_WORKERS,
+    keep_interim: bool = False,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -161,6 +213,7 @@ def run_pipeline(
         metrics_interval_seconds=metrics_interval_seconds,
         reuse_raw=reuse_raw,
         daily_download_workers=daily_download_workers,
+        keep_interim=keep_interim,
     )
 
     interim = paths.interim_dir
@@ -341,4 +394,4 @@ def run_pipeline(
     # outputs and the raw SECD/G_SECD identifier tables, all cleared below.
     if production_output:
         export_production(paths, end_date=effective_end_date)
-    save_full_files_and_cleanup(paths, clear_interim=True)
+    save_full_files_and_cleanup(paths, clear_interim=not keep_interim)

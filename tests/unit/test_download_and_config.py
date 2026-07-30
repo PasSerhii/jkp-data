@@ -593,7 +593,7 @@ class TestSaveMonthlyRet:
         )
         assert parquet_out.columns == expected
 
-        csv_out = test_paths.sas_output_dir / "world_ret_monthly.csv"
+        csv_out = test_paths.production_dir / "world_ret_monthly.csv"
         assert csv_out.exists()
         assert [c.strip('"') for c in csv_out.read_text().splitlines()[0].split(",")] == expected
 
@@ -625,7 +625,7 @@ class TestSaveOutputFiles:
             "return_cutoffs",
             "return_cutoffs_daily",
         ):
-            assert (test_paths.sas_output_dir / f"{name}.csv").exists()
+            assert (test_paths.production_dir / f"{name}.csv").exists()
             assert (test_paths.processed_dir / "other_output" / f"{name}.parquet").exists()
 
 

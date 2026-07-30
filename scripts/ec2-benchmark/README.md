@@ -22,13 +22,30 @@ security header — but that month's identifier changes are then lost for good,
 since the feed only ever exposes the current value.
 
 `launch.sh` is idempotent: it reuses the bucket, IAM role/profile and security
-group if they exist. It stages the `COMPUSTAT` credential as an SSM SecureString,
-has the instance read it once, then deletes the parameter and revokes the grant —
-so no plaintext lands in SSM command history or CloudTrail. Email arrives on
-start, on completion (with elapsed time), on failure, and on spot reclaim.
+group if they exist. It writes the `COMPUSTAT` credential to an SSM SecureString
+at `/jkp-data/<run-tag>/env`, launches the instance, and returns — it does not
+wait for the run to begin. The host then reads that parameter itself through its
+instance role and deletes it, so the credential's plaintext never appears in an
+SSM command, in CloudTrail, or in the launcher's terminal, and there is no
+handshake that can stall. The instance role holds a standing `ssm:GetParameter`
+/`ssm:DeleteParameter` grant scoped to `/jkp-data/*`.
+
+Email arrives on start, on completion (with elapsed time), on failure, on spot
+reclaim, and on bootstrap failure. **A missing "started" email means the host
+never got that far** — the bootstrap fails loudly rather than idling, so check
+for `JKP RUN: BOOTSTRAP FAILED`, which carries the reason.
 
 Overrides (environment variables): `INSTANCE_TYPE`, `VOLUME_GB`, `VOLUME_IOPS`,
-`VOLUME_MBPS`, `WORKERS`, `START_DATE`, `END_DATE`, `COUNTRIES`, `MARKET=ondemand`.
+`VOLUME_MBPS`, `WORKERS`, `START_DATE`, `END_DATE`, `COUNTRIES`, `MARKET=ondemand`,
+`KEEP_INTERIM=0`.
+
+`KEEP_INTERIM` defaults to `1`, passing `--keep-interim` so the run leaves
+`interim/` and `raw/` on the volume instead of deleting them, and ships the
+accounting artefacts to S3 (`accounting_data/`, `other_output/`, and the
+`acc_std_*`/`*chars_world` interim parquets). Without it the pipeline's
+`save_full_files_and_cleanup` wipes both directories, and there is nothing left to
+upload. The host probes the image for the flag first, so an older image degrades
+to the `processed/` copies rather than failing.
 
 Leave `WORKERS` unset unless you are A/B testing a worker count:
 `--daily-download-workers` overrides `config.DAILY_DOWNLOAD_WORKERS`, so setting
@@ -45,9 +62,34 @@ aws s3 sync s3://jkp-data-runs-485357734136-eu-central-1/<run-tag>/ \
 aws ec2 terminate-instances --region eu-central-1 --instance-ids i-0abc...
 ```
 
-Terminating destroys the volume. Only the countries in `COUNTRIES` reach S3 —
-every other country's CSV and all parquet output is lost, and recovering them
-means a full rerun.
+Terminating destroys the volume. By default the whole of `processed/production/`
+reaches S3 first (~95 GiB, roughly $2.20/month to keep); set `COUNTRIES` to a
+space-separated list to upload only those countries, in which case the six
+cross-country files still ship. Whatever is not uploaded — the remaining CSVs and
+all parquet output — is lost, and recovering it means a full rerun.
+
+`processed/production/` is the entire production deliverable:
+
+```
+processed/production/
+    monthly/<country>.csv          # 455-column characteristics
+    daily/<country>.csv            # returns, prices, identifiers
+    market_returns.csv  market_returns_daily.csv
+    nyse_cutoffs.csv    return_cutoffs.csv  return_cutoffs_daily.csv
+    world_ret_monthly.csv
+```
+
+The former `processed/output/` tree is gone. It held a byte-identical second copy
+of every country CSV — ~95 GiB per run, about half the export phase — purely to
+present the SAS directory shape.
+
+**The sasWrds uploader needs updating to match.** Its `Folder` enum walks
+`CharacteristicsProduction/` and `DailyReturnsProduction/`; the layout above uses
+`monthly/` and `daily/`. It also expects an `fx.csv` this pipeline has never
+written. `FileFactory` returns `None` for unrecognised names and `WrdsUpdater` logs
+nothing, so anything unmatched is skipped silently while the job still reports
+success — point `FILE_PATH` at `processed/production/` and rename the two folder
+constants.
 
 ## Fixed infrastructure
 
@@ -69,28 +111,47 @@ no public IP, nothing inbound.
 
 ## Baselines
 
-Both runs: `--start-date 2000-01-01 --end-date 2026-06-30 --production`, fresh
-download, 128 vCPU / ~500 GiB RAM.
+All runs: `--start-date 2000-01-01 --end-date 2026-06-30 --production`, fresh
+download. The first two on 128 vCPU / ~500 GiB (`m6a.32xlarge`); 2026-07-29 on
+64 vCPU / ~500 GiB (`r7i.16xlarge`), so its per-phase figures are not directly
+comparable — only the total is.
 
-| Phase (s) | 2026-07-23 | 2026-07-26 | |
-|---|---:|---:|---|
-| source_download | 5,673 | **3,343** | 2→4 workers |
-| security_panels | 1,329 | 1,334 | ASOF exchange join added, no cost |
-| market_returns | 760 | 776 | |
-| accounting_characteristics | 2,110 | 1,860 | |
-| factor_models | 324 | 272 | |
-| daily_characteristics | 1,333 | 1,522 | slower: corrections removed, more rows survive |
-| final_outputs | 1,274 | 1,119 | |
-| **total** | **12,804 (3h33m)** | **10,252 (2h51m)** | |
+| Phase (s) | 2026-07-23 | 2026-07-26 | 2026-07-29 | |
+|---|---:|---:|---:|---|
+| source_download | 5,673 | 3,343 | **2,564** | 2→4→8 workers |
+| security_panels | 1,329 | 1,334 | 760 | ASOF exchange join added, no cost |
+| market_returns | 760 | 776 | 449 | |
+| accounting_characteristics | 2,110 | 1,860 | 1,131 | |
+| factor_models | 324 | 272 | 229 | |
+| daily_characteristics | 1,333 | 1,522 | 769 | |
+| final_outputs | 1,274 | 1,119 | 987 | |
+| **total** | **12,804 (3h33m)** | **10,252 (2h51m)** | **6,891 (1h55m)** | |
 
 Config differences: 2026-07-23 ran 2 download workers on 1000 GiB gp3 at default
-throughput; 2026-07-26 ran 4 workers on 750 GiB gp3 at 8000 IOPS / 1000 MB/s.
+throughput; 2026-07-26 ran 4 workers on 750 GiB gp3 at 8000 IOPS / 1000 MB/s;
+2026-07-29 ran 8 workers on the same volume, on half the vCPUs.
 
 Download scaling was near-linear — 838 batches in 44.0 min versus 837 in 83.2 min,
 1.60 → 3.03 MiB/s, saturation exactly 4.00×/4 workers, zero retries or timeouts
-either time. Peak iowait fell 73.9% → 48.8%. Peak RAM 318 → 375 GiB and peak disk
-443 → 485 GiB (more observations survive without the corrections layer), so keep
-the volume at 750 GiB or above.
+either time. Peak iowait fell 73.9% → 48.8% → 40.5%. Peak RAM 318 → 375 → 351 GiB
+and peak disk 443 → 485 → 471 GiB, so keep the volume at 750 GiB or above.
+
+The authoritative phase figures are `phase_timings_seconds` in `run_summary.json`;
+they reconcile exactly with `elapsed_seconds` (6,891s on 2026-07-29 — the 6,942s in
+`ELAPSED` additionally covers container start and teardown).
+
+The 2026-07-29 column above is corrected. That run's `status.sh` reported
+`daily_characteristics` 203s and `final_outputs` 1,582s, both wrong: it summed
+every `step_timings.csv` row, so nested steps were counted twice
+(`export_production` contains five children) while the 19 `roll_apply_daily` jobs
+were counted not at all — they run on `ThreadPoolExecutor` threads, where the
+`_ACTIVE_MONITOR` ContextVar did not propagate, so `measure_time` fell back to
+plain prints and recorded no step. The two errors nearly cancelled in the total,
+which made the aggregate look healthy.
+
+Both are fixed: the fan-out copies its context into each worker and records the 19
+children under a `rolling_daily_fanout` parent, `step_timings.csv` carries
+`parent_step_token` and `step_depth`, and `status.sh` sums only depth-0 rows.
 
 ## Output verification
 
@@ -123,5 +184,29 @@ discontinuous series.
   (`sql/xpressfeed_views/load_ff_factors.py`). It lags roughly a month, so the
   last month of a run uses the last-available-RF fallback; the run records what
   it used in `source_snapshot_manifest.json`.
-- Spot in eu-central-1b was ~$1.475/hr against ~$6.60 on-demand; a full run costs
-  roughly $4–6 on spot. A reclaim voids the timing measurement.
+- **Spot for tests, on demand for production.** This kit runs timing benchmarks,
+  so `MARKET` defaults to `spot`; a reclaim there costs a rerun. Production runs
+  pass `MARKET=ondemand`, where a reclaim would cost a delivery. A reclaim also
+  voids the timing measurement outright, so re-measure rather than reporting a
+  partial run.
+- **The spot discount is very type-specific — check before switching.** In
+  eu-central-1b (2026-07-29): `m6a.32xlarge` $1.494 spot vs $6.624 on demand
+  (~77% off, 128 vCPU), but `r7i.16xlarge` only $2.604 vs $5.107 (~49% off,
+  64 vCPU). m6a is both cheaper per hour *and* twice the cores, which is why it is
+  the default. `m7i.16xlarge` is cheaper still but carries only 256 GiB against a
+  351 GiB peak, so it OOMs. Verify with:
+
+  ```bash
+  aws ec2 describe-spot-price-history --region eu-central-1 \
+      --instance-types m6a.32xlarge --product-descriptions "Linux/UNIX" \
+      --start-time "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S)" \
+      --query "SpotPriceHistory[].{az:AvailabilityZone,price:SpotPrice}" --output text
+  ```
+- **A running spot instance cannot become on-demand.** The market type is fixed at
+  launch and there is no conversion API; recovery always means a new instance.
+  `stop`/`hibernate` interruption behaviours do not help here — cloud-init runs
+  user-data once per instance, `jkp build` has no mid-phase resume, and hibernate
+  caps at 150 GiB of RAM. On reclaim the host flushes `run_logs` and emails; the
+  200+ GB of output cannot leave in 120 seconds, so nothing else is recoverable.
+  On spot the host also watches the rebalance recommendation, which usually
+  precedes the 2-minute notice and is the cue to relaunch on demand.

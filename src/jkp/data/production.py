@@ -352,10 +352,8 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
     Columns: excntry, id, date, ret (local), prc_open (local), prc_high/low/close
     (local = USD/fx), ret_dollar (USD), ret_exc_dollar, sedol, cusip, isin.
     """
-    out_dir = paths.processed_dir / "production" / "daily"
-    sas_out_dir = paths.sas_output_dir
+    out_dir = paths.production_dir / "daily"
     out_dir.mkdir(parents=True, exist_ok=True)
-    sas_out_dir.mkdir(parents=True, exist_ok=True)
     daily_cutoff = min(end_date, date.today())
 
     # id -> stable Compustat issue key map from the monthly file (daily lacks it).
@@ -402,7 +400,6 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
     )
     daily_df = daily.collect(engine="streaming")
     _write_country_csvs(daily_df, out_dir)
-    _write_country_csvs(daily_df, sas_out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +410,8 @@ def save_daily_production_csv(paths: DataPaths, end_date: date = END_DATE) -> No
 @measure_time
 def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> None:
     """Write per-country monthly characteristics CSVs in the SAS production format."""
-    out_dir = paths.processed_dir / "production" / "monthly"
-    sas_out_dir = paths.sas_output_dir / "CharacteristicsProduction"
+    out_dir = paths.production_dir / "monthly"
     out_dir.mkdir(parents=True, exist_ok=True)
-    sas_out_dir.mkdir(parents=True, exist_ok=True)
 
     vol3 = market_volumes(paths, 3).rename(
         {
@@ -464,7 +459,6 @@ def save_main_production_csv(paths: DataPaths, end_date: date = END_DATE) -> Non
     )
 
     _write_country_csvs(data, out_dir)
-    _write_country_csvs(data, sas_out_dir)
 
 
 # ---------------------------------------------------------------------------

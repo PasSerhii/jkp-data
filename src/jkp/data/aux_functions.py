@@ -165,49 +165,62 @@ def bo_false():
 def measure_time(func):
     """
     Description:
-        Decorator to time a function and print start/end timestamps and elapsed minutes:seconds.
+        Decorator recording a function as a monitored pipeline step, falling back to
+        printing timings when no monitor is active.
 
     Steps:
-        1) Record start time and print function name + start.
-        2) Execute the wrapped function and capture result.
-        3) Record end time; compute and print duration.
+        1) Resolve the step name, honouring a caller-supplied ``_step_name``.
+        2) Open a monitor step, or print a single start line when unmonitored.
+        3) Execute the wrapped function, closing the step on success or failure.
         4) Return the original result.
 
     Output:
-        Prints timing info to stdout; returns wrapped function's result.
+        Rows in step_timings.csv when monitored; otherwise one-line timings on
+        stdout. Returns the wrapped function's result unchanged.
+
+    Notes:
+        Pass ``_step_name="label"`` to distinguish repeated calls of the same
+        function -- ``roll_apply_daily`` runs 19 times over different (window,
+        variable) pairs, and three of those share the ``zero_trades`` variable, so
+        the bare function name cannot tell them apart. The kwarg is consumed here
+        and never reaches the wrapped function.
+
+        Output is written as single atomic lines. The rolling-daily fan-out runs
+        these on four worker threads, and the previous multi-line form interleaved
+        into unreadable fragments.
     """
 
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        step_name = kwargs.pop("_step_name", None) or func.__name__
         monitor = get_active_monitor()
-        step_token = monitor.step_started(func.__name__) if monitor is not None else None
+        step_token = monitor.step_started(step_name) if monitor is not None else None
         start_time = time.time()
         if monitor is None:
-            print(f"Function       : {func.__name__.upper()}", flush=True)
-            print(
-                f"Start          : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}",
-                flush=True,
-            )
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+            print(f"START {step_name} at {stamp}", flush=True)
         try:
             result = func(*args, **kwargs)
         except BaseException as error:
             if monitor is not None and step_token is not None:
                 monitor.step_finished(step_token, error)
+            else:
+                elapsed = time.time() - start_time
+                print(
+                    f"FAILED {step_name} after {elapsed:.2f}s "
+                    f"type={type(error).__name__} message={error}",
+                    flush=True,
+                )
             raise
-        end_time = time.time()
         if monitor is not None and step_token is not None:
             monitor.step_finished(step_token)
             return result
+        total_seconds = time.time() - start_time
+        minutes, seconds = divmod(total_seconds, 60)
         print(
-            f"End            : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}",
+            f"END {step_name} in {int(minutes)}m {seconds:.2f}s",
             flush=True,
         )
-        # Calculate total seconds
-        total_seconds = end_time - start_time
-        # Calculate minutes and seconds
-        minutes = int(total_seconds // 60)
-        seconds = total_seconds % 60
-        print(f"Execution time : {minutes} minutes and {seconds:.2f} seconds", flush=True)
-        print()
         return result
 
     return wrapper
@@ -229,7 +242,8 @@ def setup_folder_structure(paths: DataPaths) -> None:
         Create the pipeline's folder structure under the user-specified output directory.
 
     Steps:
-        1) Create directories: raw_tables, raw_data_dfs, characteristics, return_data, accounting_data, other_output, portfolios.
+        1) Create directories: raw_tables, raw_data_dfs, characteristics, return_data,
+           accounting_data, other_output, portfolios, production/{monthly,daily}.
         2) Copy the data README (license and citation info) into the output directory.
 
     Output:
@@ -247,8 +261,9 @@ def setup_folder_structure(paths: DataPaths) -> None:
     (paths.processed_dir / "accounting_data").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "other_output").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "portfolios").mkdir(parents=True, exist_ok=True)
-    paths.sas_output_dir.mkdir(parents=True, exist_ok=True)
-    (paths.sas_output_dir / "CharacteristicsProduction").mkdir(parents=True, exist_ok=True)
+    paths.production_dir.mkdir(parents=True, exist_ok=True)
+    (paths.production_dir / "monthly").mkdir(exist_ok=True)
+    (paths.production_dir / "daily").mkdir(exist_ok=True)
     shutil.copy2(get_data_readme_path(), paths.base_dir / "README.md")
 
 
@@ -9892,7 +9907,7 @@ def save_output_files(paths: DataPaths):
         1) Copy parquet outputs from interim/ to other_output/.
         2) Includes market returns (monthly/daily) and cutoff files.
         3) Write the five CSV files exported by the modified SAS main.sas to
-           processed/output/.
+           processed/production/.
         4) Interim files are preserved for downstream steps.
 
     Output:
@@ -9919,7 +9934,7 @@ def save_output_files(paths: DataPaths):
     ):
         _write_sas_csv(
             pl.scan_parquet(paths.interim_dir / f"{name}.parquet"),
-            paths.sas_output_dir / f"{name}.csv",
+            paths.production_dir / f"{name}.csv",
         )
 
 
@@ -10034,7 +10049,7 @@ def save_monthly_ret(paths: DataPaths):
         1) Load world_msf_output.parquet and select the SAS monthly-return columns.
         2) Shrink dtypes and collect results.
         3) Write to return_data/world_ret_monthly.parquet and
-           output/world_ret_monthly.csv.
+           production/world_ret_monthly.csv.
 
     Output:
         Parquet file with monthly returns by country/security.
@@ -10044,7 +10059,7 @@ def save_monthly_ret(paths: DataPaths):
     )
     monthly = data.select(pl.all().shrink_dtype()).collect()
     monthly.write_parquet(paths.processed_dir / "return_data" / "world_ret_monthly.parquet")
-    _write_sas_csv(monthly, paths.sas_output_dir / "world_ret_monthly.csv")
+    _write_sas_csv(monthly, paths.production_dir / "world_ret_monthly.csv")
 
 
 @measure_time
