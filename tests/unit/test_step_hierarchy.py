@@ -71,8 +71,14 @@ class TestStepHierarchy:
             "phase_timings_seconds"
         ]["final_outputs"]
 
-        assert top_level == pytest.approx(phase, abs=0.2)
-        # Summing indiscriminately roughly doubles it, which is the old behaviour.
+        # Wall clock, so no tighter than an inequality: the phase also spans
+        # set_phase -> step_started and step_finished -> stop(), and those gaps
+        # stretch arbitrarily when the rest of the suite is competing for the CPU.
+        # An abs=0.2 equality here failed once in a full-suite run and passed
+        # alone, which is a flaky test rather than a real reconciliation check.
+        assert top_level <= phase
+        # This is what actually catches the bug: if every row were depth 0, the
+        # two sums would be equal instead of the children being counted twice.
         assert every_row > top_level * 1.5
 
     def test_sibling_steps_are_both_top_level(self, tmp_path) -> None:
