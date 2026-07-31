@@ -53,16 +53,30 @@ TYPE_MAP = {
 }
 
 
+# The credentials these scripts need. The process environment may supply them
+# instead of the .env file, which is how the container form works: the runtime
+# image ships no .env and `docker run --env-file` is the only channel.
+ENV_KEYS = ("COMPUSTAT", "ENV_USERNAME", "ENV_PASSWORD")
+
+
 def load_env() -> dict[str, str]:
+    """Read credentials from the repo .env, then let the environment override.
+
+    Environment wins so a container started with ``--env-file`` works with no
+    .env on disk at all. On a developer machine none of ``ENV_KEYS`` is normally
+    exported, so the file still decides.
+    """
     env: dict[str, str] = {}
-    for line in ENV.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            value = v.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            env[k.strip()] = value
+    if ENV.is_file():
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                value = v.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                env[k.strip()] = value
+    env.update({k: os.environ[k] for k in ENV_KEYS if os.environ.get(k)})
     return env
 
 

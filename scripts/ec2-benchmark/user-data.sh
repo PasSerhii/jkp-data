@@ -1,10 +1,11 @@
 #!/bin/bash
-# Bootstrap for a full jkp-data timing benchmark on EC2.
+# Bootstrap for a full jkp-data run on EC2.
 #
-# launch.sh substitutes the @@PLACEHOLDER@@ tokens before passing this as
-# user-data. The host prepares itself, waits for the operator-supplied
-# credential at /secure/jkp.env, then runs the pipeline end to end and ships
-# logs plus the country CSVs under test to S3.
+# launch.sh substitutes the double-at tokens below before passing this as
+# user-data; tests/unit/test_unattended_run_wiring.py checks that none is left
+# behind. The host installs docker, pulls the image, reads its own credential
+# from SSM, optionally prepares the sources (UNATTENDED=1), then runs the
+# pipeline end to end and ships logs plus the production CSVs to S3.
 set -xuo pipefail
 exec > >(tee -a /var/log/jkp-setup.log) 2>&1
 
@@ -18,7 +19,9 @@ WORKERS="@@WORKERS@@"
 START_DATE="@@START_DATE@@"
 KEEP_INTERIM="@@KEEP_INTERIM@@"
 PARAM="@@PARAM@@"
+PARAM_EPHEMERAL="@@PARAM_EPHEMERAL@@"
 MARKET="@@MARKET@@"
+UNATTENDED="@@UNATTENDED@@"
 
 # The interim files the accounting tests read. The whole tree is ~230 GiB, so
 # only these ship to S3; --keep-interim leaves the rest on the volume to inspect
@@ -67,6 +70,19 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 docker pull "$IMAGE" || fail "docker pull $IMAGE failed"
 docker image inspect "$IMAGE" >/dev/null 2>&1 \
   || fail "$IMAGE absent after a pull that reported success"
+
+# Take the operational scripts out of the image rather than cloning the repo.
+# production-run.sh needs bash/aws/docker and so has to run on the host, but it
+# gates the very image it prepares for -- pulling it from anywhere else lets the
+# two versions drift. Extracted like this they are the image, by construction.
+REVISION=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2>/dev/null)
+CID=$(docker create "$IMAGE" 2>/dev/null)
+if [ -n "$CID" ]; then
+  rm -rf /opt/jkp
+  docker cp "$CID:/opt/jkp" /opt/jkp 2>/dev/null
+  docker rm -f "$CID" >/dev/null 2>&1
+fi
+echo "image revision: ${REVISION:-unlabelled}; host scripts: $(ls /opt/jkp/scripts 2>/dev/null | tr '\n' ' ')"
 
 # Spot reclaim gives a 2-minute warning: alert and flush logs before the host dies.
 # The rebalance recommendation usually lands earlier and carries no guarantee, so it
@@ -124,13 +140,30 @@ done
 chmod 600 /secure/jkp.env
 grep -q '^COMPUSTAT=' /secure/jkp.env || fail "$PARAM held no COMPUSTAT= line; the credential is malformed"
 
-# On disk now, so the parameter has served its purpose. Deleting it here keeps the
-# secret's lifetime to the first minute of the run without the launcher having to
-# coordinate the revoke.
-aws ssm delete-parameter --region "$REGION" --name "$PARAM" >/dev/null 2>&1 \
-  || notify "JKP RUN: could not delete $PARAM" \
+# A per-run parameter has served its purpose once it is on disk; deleting it here
+# keeps the secret's lifetime to the first minute of the run without the launcher
+# having to coordinate the revoke. A persistent one belongs to the next run too,
+# so leave it exactly where it is.
+if [ "$PARAM_EPHEMERAL" = "1" ]; then
+  aws ssm delete-parameter --region "$REGION" --name "$PARAM" >/dev/null 2>&1 \
+    || notify "JKP RUN: could not delete $PARAM" \
 "The run continues normally, but the SecureString is still there. Remove it:
   aws ssm delete-parameter --region $REGION --name $PARAM"
+fi
+
+# Readiness poll, Fama-French refresh and identifier capture, in that order.
+# Attended runs do these on the operator's machine before launching; an
+# unattended one has no operator, so the host does them for itself. Anything
+# fatal here stops the run before the two-hour pipeline starts.
+if [ "$UNATTENDED" = "1" ]; then
+  if [ -x /opt/jkp/scripts/production-run.sh ]; then
+    RUN_TAG="@@RUN_TAG@@" IMAGE="$IMAGE" ENV_FILE=/secure/jkp.env \
+      /opt/jkp/scripts/production-run.sh --unattended \
+      || fail "unattended preflight failed; see /var/log/jkp-setup.log"
+  else
+    fail "UNATTENDED=1 but $IMAGE ships no /opt/jkp/scripts/production-run.sh"
+  fi
+fi
 
 # Only pass --keep-interim to an image that understands it; an older image would
 # abort on the unknown option and waste the entire run.

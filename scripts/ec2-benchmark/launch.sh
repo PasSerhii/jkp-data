@@ -60,6 +60,15 @@ MARKET="${MARKET:-spot}"
 # Retain interim/ and raw/ so the accounting artefacts survive the run. Ignored
 # by images that predate --keep-interim; the host probes for it before starting.
 KEEP_INTERIM="${KEEP_INTERIM:-1}"
+# Point at an existing SSM SecureString (see scripts/put-production-credentials.sh)
+# instead of staging one from .env. The host then keeps the parameter rather than
+# deleting it, which is what lets a scheduled run start with no human and no .env
+# anywhere. Empty keeps the per-run staged-and-deleted credential.
+CREDENTIAL_PARAM="${CREDENTIAL_PARAM:-}"
+# 1 runs scripts/production-run.sh --unattended on the host before the pipeline:
+# the readiness poll, the FF refresh and the identifier capture. 0 assumes a human
+# already did those on their own machine, which is how the benchmark kit works.
+UNATTENDED="${UNATTENDED:-0}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -75,7 +84,14 @@ aws_file_uri() {
 }
 
 command -v aws >/dev/null || { echo "aws CLI not found" >&2; exit 1; }
-grep -q '^COMPUSTAT=' "$REPO/.env" || { echo "No COMPUSTAT= line in $REPO/.env" >&2; exit 1; }
+if [ -n "$CREDENTIAL_PARAM" ]; then
+  # Fail here rather than on the host: a missing parameter is a five-second
+  # check locally and a twenty-minute boot-and-die remotely.
+  aws ssm get-parameter --region "$REGION" --name "$CREDENTIAL_PARAM" >/dev/null \
+    || { echo "CREDENTIAL_PARAM $CREDENTIAL_PARAM not found in SSM; run scripts/put-production-credentials.sh" >&2; exit 1; }
+else
+  grep -q '^COMPUSTAT=' "$REPO/.env" || { echo "No COMPUSTAT= line in $REPO/.env" >&2; exit 1; }
+fi
 aws ecr describe-images --region "$REGION" --repository-name jkp-data \
   --image-ids imageTag=production >/dev/null \
   || { echo "Image jkp-data:production missing from ECR; build and push first" >&2; exit 1; }
@@ -107,8 +123,14 @@ aws iam put-role-policy --role-name "$ROLE" --policy-name jkp-run-bucket-and-ale
 # delete it afterwards. Persistent on purpose: a per-run grant has to be revoked
 # by the launcher, and that coupling is what forced the old wait/poll handshake.
 # Scoped to the prefix and to SSM-mediated KMS decrypts only.
+#
+# The explicit Deny carves /jkp-data/production/* back out of the delete grant.
+# That parameter outlives every run, so a host that deletes it takes the next
+# month's run down with it -- and unlike a per-run secret nobody would notice
+# until 09:00 on the 1st. user-data.sh already refuses to delete a persistent
+# parameter; this makes it true even if that logic is wrong.
 aws iam put-role-policy --role-name "$ROLE" --policy-name jkp-read-run-env --policy-document \
-  "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ssm:GetParameter\",\"ssm:DeleteParameter\"],\"Resource\":\"arn:aws:ssm:$REGION:$ACCOUNT:parameter/jkp-data/*\"},{\"Effect\":\"Allow\",\"Action\":\"kms:Decrypt\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":\"ssm.$REGION.amazonaws.com\"}}}]}"
+  "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ssm:GetParameter\",\"ssm:DeleteParameter\"],\"Resource\":\"arn:aws:ssm:$REGION:$ACCOUNT:parameter/jkp-data/*\"},{\"Effect\":\"Deny\",\"Action\":\"ssm:DeleteParameter\",\"Resource\":\"arn:aws:ssm:$REGION:$ACCOUNT:parameter/jkp-data/production/*\"},{\"Effect\":\"Allow\",\"Action\":\"kms:Decrypt\",\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"kms:ViaService\":\"ssm.$REGION.amazonaws.com\"}}}]}"
 aws iam create-instance-profile --instance-profile-name "$PROFILE" >/dev/null 2>&1 || true
 aws iam add-role-to-instance-profile --instance-profile-name "$PROFILE" --role-name "$ROLE" 2>/dev/null || true
 
@@ -122,28 +144,40 @@ if [ "$SG" = "None" ] || [ -z "$SG" ]; then
         --query GroupId --output text)
 fi
 
-# The host reads this parameter itself at boot and deletes it, so the credential
-# is never handed over interactively and the launcher has nothing to wait for.
-echo "== staging credential (SecureString, deleted by the host after it reads it) =="
-PARAM="/jkp-data/$RUN_TAG/env"
-# On a clean exit the host owns the parameter and deletes it after reading. On any
-# failure we cannot know a host is coming, so remove the secret rather than leave
-# it sitting in Parameter Store.
-cleanup() {
-  RC=$?
-  [ -z "${TMP:-}" ] || rm -f "$TMP"
-  [ -z "${USER_DATA:-}" ] || rm -f "$USER_DATA"
-  if [ "$RC" -ne 0 ]; then
-    aws ssm delete-parameter --region "$REGION" --name "$PARAM" >/dev/null 2>&1 || true
-    echo "launch failed; removed $PARAM" >&2
-  fi
-}
+# The host reads this parameter itself at boot, so the credential is never handed
+# over interactively and the launcher has nothing to wait for. A per-run parameter
+# is deleted by the host after it reads it; a persistent one supplied through
+# CREDENTIAL_PARAM is left alone, because the next run needs it.
+if [ -n "$CREDENTIAL_PARAM" ]; then
+  PARAM="$CREDENTIAL_PARAM"
+  PARAM_EPHEMERAL=0
+  echo "== using persistent credential $PARAM =="
+  cleanup() { [ -z "${USER_DATA:-}" ] || rm -f "$USER_DATA"; }
+else
+  PARAM="/jkp-data/$RUN_TAG/env"
+  PARAM_EPHEMERAL=1
+  echo "== staging credential (SecureString, deleted by the host after it reads it) =="
+  # On a clean exit the host owns the parameter and deletes it after reading. On
+  # any failure we cannot know a host is coming, so remove the secret rather than
+  # leave it sitting in Parameter Store.
+  cleanup() {
+    RC=$?
+    [ -z "${TMP:-}" ] || rm -f "$TMP"
+    [ -z "${USER_DATA:-}" ] || rm -f "$USER_DATA"
+    if [ "$RC" -ne 0 ]; then
+      aws ssm delete-parameter --region "$REGION" --name "$PARAM" >/dev/null 2>&1 || true
+      echo "launch failed; removed $PARAM" >&2
+    fi
+  }
+fi
 trap cleanup EXIT
-TMP="$(mktemp)"
-grep '^COMPUSTAT=' "$REPO/.env" > "$TMP"
-aws ssm put-parameter --region "$REGION" --name "$PARAM" --type SecureString \
-  --value "$(aws_file_uri "$TMP")" --overwrite >/dev/null
-rm -f "$TMP"
+if [ "$PARAM_EPHEMERAL" = "1" ]; then
+  TMP="$(mktemp)"
+  grep '^COMPUSTAT=' "$REPO/.env" > "$TMP"
+  aws ssm put-parameter --region "$REGION" --name "$PARAM" --type SecureString \
+    --value "$(aws_file_uri "$TMP")" --overwrite >/dev/null
+  rm -f "$TMP"
+fi
 
 AMI=$(aws ec2 describe-images --region "$REGION" --owners amazon \
   --filters "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" "Name=state,Values=available" \
@@ -154,7 +188,8 @@ sed -e "s|@@REGION@@|$REGION|g" -e "s|@@BUCKET@@|$BUCKET|g" -e "s|@@TOPIC@@|$TOP
     -e "s|@@IMAGE@@|$IMAGE|g" -e "s|@@RUN_TAG@@|$RUN_TAG|g" -e "s|@@COUNTRIES@@|$COUNTRIES|g" \
     -e "s|@@START_DATE@@|$START_DATE|g" -e "s|@@END_DATE@@|$END_DATE|g" -e "s|@@WORKERS@@|$WORKERS|g" \
     -e "s|@@KEEP_INTERIM@@|$KEEP_INTERIM|g" -e "s|@@PARAM@@|$PARAM|g" \
-    -e "s|@@MARKET@@|$MARKET|g" \
+    -e "s|@@MARKET@@|$MARKET|g" -e "s|@@PARAM_EPHEMERAL@@|$PARAM_EPHEMERAL|g" \
+    -e "s|@@UNATTENDED@@|$UNATTENDED|g" \
     "$HERE/user-data.sh" | tr -d '\r' > "$USER_DATA"
 
 MARKET_OPT=(); [ "$MARKET" = "spot" ] && MARKET_OPT=(--instance-market-options 'MarketType=spot')
@@ -182,9 +217,11 @@ cat <<EOF
 Launched. Instance: $INSTANCE   Artifacts: s3://$BUCKET/$RUN_TAG/
 Instance type: $INSTANCE_TYPE ($MARKET)   Workers: ${WORKERS:-config default}
 Keep interim: $KEEP_INTERIM   Countries to S3: ${COUNTRIES:-all (~95 GiB)}
+Credential: $PARAM $([ "$PARAM_EPHEMERAL" = 1 ] && echo "(per-run, host deletes it)" || echo "(persistent, host keeps it)")
+Unattended prep on host: $([ "$UNATTENDED" = 1 ] && echo "yes (readiness poll, FF refresh, identifier capture)" || echo "no")
 
-The host installs docker, pulls the image, reads $PARAM, deletes it, and starts
-the pipeline on its own. Expect "JKP RUN: started" in a few minutes, or
+The host installs docker, pulls the image, reads $PARAM, and starts the pipeline
+on its own. Expect "JKP RUN: started" in a few minutes, or
 "JKP RUN: BOOTSTRAP FAILED" with the reason if it cannot get that far.
 
 Watch:

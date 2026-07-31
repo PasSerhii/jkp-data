@@ -54,6 +54,24 @@ RUN apt-get update \
 # One copy of the finished environment, already byte-compiled by the builder.
 COPY --from=builder --chown=jkp:jkp /app/.venv /app/.venv
 
+# The monthly run's operational scripts: the readiness gate, the Fama-French
+# refresh, the identifier capture, and the runner that sequences them. Baked in
+# rather than cloned onto the host at boot, so the scripts that gate a build
+# cannot be a different commit from the build they gate -- the image tag is the
+# only version there is, and there is no git, no PyPI and no network to GitHub
+# in the path. production-run.sh needs bash/aws/docker, so the host lifts it out
+# with `docker cp`; the Python entry points run inside the container.
+#
+# Only the operational scripts, not all of scripts/ -- the rest are one-off
+# analyses that would drag unrelated churn into every image rebuild.
+#
+# Left root-owned: the container runs as jkp, which needs to read and execute
+# these but must not be able to rewrite the scripts it is about to run.
+COPY sql /opt/jkp/sql
+COPY scripts/check_source_ready.py scripts/production-run.sh /opt/jkp/scripts/
+# The repo is developed on Windows, where git stores no exec bit.
+RUN chmod 0755 /opt/jkp/scripts/production-run.sh
+
 USER jkp
 
 # Bake the extension into the image so an EC2 job does not need access to the

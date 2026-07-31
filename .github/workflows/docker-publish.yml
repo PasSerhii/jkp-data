@@ -13,7 +13,12 @@ on:
     paths:
       - "src/**"
       - "sql/**"
+      # Only the operational scripts the image bakes in, not all of scripts/:
+      # the rest are one-off analyses that must not trigger a rebuild.
+      - "scripts/check_source_ready.py"
+      - "scripts/production-run.sh"
       - "Dockerfile"
+      - ".dockerignore"
       - "pyproject.toml"
       - "uv.lock"
       - ".python-version"
@@ -70,6 +75,12 @@ jobs:
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:production
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:git-${{ steps.sha.outputs.short }}
+          # The run host reads this back off the pulled image and logs it, so a
+          # finished run says which commit produced it without anyone having to
+          # map the mutable :production tag to a digest after the fact.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -87,7 +98,28 @@ jobs:
             printf '%s' "$HELP" | grep -q -- "${flag:0:14}" \
               || { echo "::error::published image is missing $flag"; exit 1; }
           done
-          echo "image verified: $IMAGE"
+
+          # The unattended run lifts these out of the image with `docker cp` and
+          # executes them on the host. A .dockerignore rule silently dropping one
+          # would only surface at 09:00 on the 1st.
+          for f in /opt/jkp/scripts/production-run.sh \
+                   /opt/jkp/scripts/check_source_ready.py \
+                   /opt/jkp/sql/xpressfeed_views/load_ff_factors.py \
+                   /opt/jkp/sql/xpressfeed_views/capture_sec_ids.py \
+                   /opt/jkp/sql/xpressfeed_views/gen_views.py; do
+            docker run --rm --entrypoint test "$IMAGE" -r "$f" \
+              || { echo "::error::published image is missing $f"; exit 1; }
+          done
+          docker run --rm --entrypoint test "$IMAGE" -x /opt/jkp/scripts/production-run.sh \
+            || { echo "::error::production-run.sh is not executable in the image"; exit 1; }
+          # psycopg 3 is what the two loaders import; the image has no `uv run --with`.
+          docker run --rm --entrypoint python "$IMAGE" -c "import psycopg" \
+            || { echo "::error::published image cannot import psycopg"; exit 1; }
+
+          REV=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
+          [ "$REV" = "${{ github.sha }}" ] \
+            || { echo "::error::revision label is '$REV', expected ${{ github.sha }}"; exit 1; }
+          echo "image verified: $IMAGE (revision $REV)"
 
       - name: Summary
         run: |

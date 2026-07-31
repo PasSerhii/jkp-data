@@ -22,8 +22,10 @@ processed
 *.ddb
 
 # Development and validation material is not required at runtime.
+# sql/ is the exception: the monthly run's Fama-French refresh and identifier
+# capture live in sql/xpressfeed_views/ and ship in the image so they cannot
+# drift from the pipeline they run alongside.
 tests
-sql
 documentation
 slurm
 *.md

@@ -37,7 +37,29 @@ for `JKP RUN: BOOTSTRAP FAILED`, which carries the reason.
 
 Overrides (environment variables): `INSTANCE_TYPE`, `VOLUME_GB`, `VOLUME_IOPS`,
 `VOLUME_MBPS`, `WORKERS`, `START_DATE`, `END_DATE`, `COUNTRIES`, `MARKET=ondemand`,
-`KEEP_INTERIM=0`.
+`KEEP_INTERIM=0`, `CREDENTIAL_PARAM`, `UNATTENDED=1`.
+
+`CREDENTIAL_PARAM` points the run at an existing SSM SecureString instead of
+staging one from `.env`. The host then *keeps* the parameter after reading it,
+which is what makes a run possible with no `.env` and no operator anywhere:
+
+```bash
+scripts/put-production-credentials.sh          # once, writes /jkp-data/production/env
+CREDENTIAL_PARAM=/jkp-data/production/env MARKET=ondemand \
+  scripts/ec2-benchmark/launch.sh prod-20260901
+```
+
+That parameter holds `COMPUSTAT` plus the `ENV_USERNAME`/`ENV_PASSWORD` pair the
+Fama-French refresh needs against WRDS. An IAM `Deny` keeps the instance role
+from deleting anything under `/jkp-data/production/*`, so a host cannot take the
+next month's run down with it.
+
+`UNATTENDED=1` runs `scripts/production-run.sh --unattended` on the host before
+the pipeline: the feed-readiness poll (up to 60 minutes, every 10), the
+Fama-French refresh, and the identifier capture. Attended runs do those on the
+operator's machine, which is why the default is `0`. The host takes those scripts
+out of the image with `docker cp` rather than cloning the repo, so the scripts
+that gate a build are always the same commit as the build they gate.
 
 `KEEP_INTERIM` defaults to `1`, passing `--keep-interim` so the run leaves
 `interim/` and `raw/` on the volume instead of deleting them, and ships the
