@@ -1,8 +1,18 @@
 # Docker and AWS ECR
 
+This file is about the image. To *run* the monthly production build — which
+script, which parameters, and where the credentials come from — see
+[OPERATIONS.md](OPERATIONS.md).
+
 The image runs the `jkp` CLI. It does not contain credentials, licensed source
 data, or generated output. Supply credentials at runtime and mount durable
 storage at `/data`.
+
+It also carries the monthly run's operational scripts at `/opt/jkp` — the
+readiness gate, the Fama-French refresh, the identifier capture, and the runner
+that sequences them. The EC2 host lifts those out with `docker cp` instead of
+cloning the repo, so the scripts that gate a build are always the same commit as
+the build they gate.
 
 The build is multi-stage: a builder resolves the virtualenv with `uv`, and the
 runtime stage copies only the finished `/app/.venv`. Neither `uv` nor the

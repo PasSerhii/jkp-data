@@ -125,6 +125,10 @@ Please see the release notes (`documentation/release_notes.html`) for a descript
 
 ### Docker and AWS
 
+To run the monthly production build on AWS — which script to use, what each
+parameter does, and where the credentials come from — see
+[OPERATIONS.md](OPERATIONS.md).
+
 For a reproducible container build, mounted-output layout, and Amazon ECR/EC2
 commands, see [DOCKER.md](DOCKER.md). Credentials and licensed/generated data
 are excluded from the image and Docker build context.

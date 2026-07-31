@@ -5,6 +5,11 @@ and reports wall-clock time from container start through the last production CSV
 Used to validate performance changes and to check parity fixes against
 `research.dbo.characteristicsproduction`.
 
+**This is the benchmark entry point, not the production one.** For a monthly
+production build use `scripts/production-run.sh`, which runs every gate,
+refreshes Fama-French, captures identifiers, and then calls `launch.sh` for you.
+See [OPERATIONS.md](../../OPERATIONS.md).
+
 ## Rerun
 
 ```bash
