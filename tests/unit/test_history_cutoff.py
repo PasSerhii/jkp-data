@@ -45,9 +45,7 @@ def test_age_anchor_query_rejects_untrusted_schema() -> None:
 def test_age_anchor_download_runs_remotely_and_writes_parquet() -> None:
     conn = MagicMock()
 
-    download_compustat_age_anchor_attached(
-        conn, "source_db", "age.parquet", raw_schema="public"
-    )
+    download_compustat_age_anchor_attached(conn, "source_db", "age.parquet", raw_schema="public")
 
     sql = conn.execute.call_args.args[0]
     assert "postgres_query('source_db'" in sql

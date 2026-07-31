@@ -64,8 +64,9 @@ def test_reads_repository_style_dotenv_without_mutating_environment(monkeypatch,
 def test_missing_xpressfeed_setting_has_actionable_error(monkeypatch, tmp_path):
     monkeypatch.delenv("COMPUSTAT", raising=False)
 
-    with pytest.raises(RuntimeError, match="COMPUSTAT is not set"), patch(
-        "jkp.data.database_sources._find_dotenv", return_value=None
+    with (
+        pytest.raises(RuntimeError, match="COMPUSTAT is not set"),
+        patch("jkp.data.database_sources._find_dotenv", return_value=None),
     ):
         get_xpressfeed_connection_info(dotenv_path=Path(tmp_path / "missing.env"))
 

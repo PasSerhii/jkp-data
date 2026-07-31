@@ -219,9 +219,7 @@ class TestHgicsJoin:
         intermediates with a deliberate duplicate to verify that ``hgics_join``'s
         own ``.unique()`` catches it.
         """
-        monkeypatch.setattr(
-            aux_functions, "comp_hgics", lambda _paths, _lib, **_kwargs: None
-        )
+        monkeypatch.setattr(aux_functions, "comp_hgics", lambda _paths, _lib, **_kwargs: None)
 
         na_expanded = pl.DataFrame(
             {
