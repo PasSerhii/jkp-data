@@ -116,7 +116,13 @@ DAILY_COMPUSTAT_PAIR_HEADERS = {
     "comp.secd": "comp.security",
     "comp.g_secd": "comp.g_security",
 }
-DAILY_COMPUSTAT_BATCH_SIZE = 250
+# 350 pairs per batch. Each batch is one query against the secd/g_secd views, and
+# only g_secd carries a measurable fixed cost per query (~2.5s, against ~1.79s per
+# MiB of payload), so larger batches amortise that away. The ceiling is the 300s
+# statement timeout in with_pg_statement_timeout: at 250 pairs the slowest observed
+# batch was 64.6s, so 350 projects to ~90s and leaves a 3.3x margin before a batch
+# would be killed. Raise this only with that margin recomputed from a real run.
+DAILY_COMPUSTAT_BATCH_SIZE = 350
 DAILY_COMPUSTAT_BATCH_MAX_RETRIES = 3
 DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0)
 
@@ -2145,6 +2151,46 @@ def download_raw_data_tables(
             )
         except Exception as e:
             _raise_redacted_source_error(source_label, "connection", e)
+        # The SECD/G_SECD queue needs only the two security header parquets, so it
+        # starts as soon as those exist and drains while the remaining headers and
+        # the age anchor download on the main thread. Without this the phase is
+        # strictly serial and the source database sits at one busy core out of
+        # eight for the ~9 minutes of header downloads, then one again for the
+        # anchor. The same overlap already existed in the postgres_scan branch
+        # below; production runs with --persistent-connection and so never got it.
+        cancel_event = threading.Event()
+        run_context = contextvars.copy_context()  # the monitor ContextVar is not thread-inherited
+        queue_future: Future[None] | None = None
+
+        def run_daily_queue() -> None:
+            # Its own connection and its own ATTACH. `con` stays with the main
+            # thread for the remaining headers, and one DuckDB connection cannot
+            # serve both without serialising them back together.
+            queue_connection = duckdb.connect(":memory:")
+            try:
+                queue_connection.execute("LOAD postgres;")
+                queue_connection.execute(
+                    f"ATTACH {_sql_literal(source_connection_info)} "
+                    "AS source_db (TYPE postgres, READ_ONLY)"
+                )
+                download_wrds_daily_tables_parallel(
+                    source_connection_info,
+                    queue_connection,
+                    paths,
+                    tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
+                    date_columns,
+                    start_date=start_date,
+                    end_date=end_date,
+                    worker_count=daily_download_workers,
+                    planning_db_alias="source_db",
+                    cancel_event=cancel_event,
+                )
+            finally:
+                queue_connection.close()
+
+        # Not a `with` block: the loop below would have to be re-indented, and the
+        # shutdown has to be ordered after cancel_event in the finally anyway.
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jkp-daily-queue")
         try:
             for table in table_names:
                 if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
@@ -2253,27 +2299,14 @@ def download_raw_data_tables(
                         retries=retries,
                         timeouts=timeouts,
                     )
-            if daily_download_workers > 1:
-                _report_progress(
-                    f"Downloading {source_label} daily Compustat tables with "
-                    f"{daily_download_workers} shared workers"
-                )
-                try:
-                    download_wrds_daily_tables_parallel(
-                        source_connection_info,
-                        con,
-                        paths,
-                        tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
-                        date_columns,
-                        start_date=start_date,
-                        end_date=end_date,
-                        worker_count=daily_download_workers,
-                        planning_db_alias="source_db",
+                # comp.security is the later of the two pair headers in table_names,
+                # so the queue's planner inputs are now on disk.
+                if daily_download_workers > 1 and table == "comp.security":
+                    _report_progress(
+                        f"Downloading {source_label} daily Compustat tables with "
+                        f"{daily_download_workers} shared workers"
                     )
-                except Exception as error:
-                    if isinstance(error, _DailyBatchDownloadError):
-                        raise
-                    _raise_redacted_source_error(source_label, "parallel daily download", error)
+                    queue_future = pool.submit(run_context.run, run_daily_queue)
             _report_progress(f"Downloading {source_label} full-history age anchor")
             anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
             anchor_started_at = datetime.now(UTC).isoformat()
@@ -2301,7 +2334,19 @@ def download_raw_data_tables(
                 started_at_utc=anchor_started_at,
                 started_monotonic=anchor_started,
             )
+            if queue_future is not None:
+                try:
+                    queue_future.result()
+                except _DailyBatchDownloadError:
+                    raise
+                except Exception as error:
+                    _raise_redacted_source_error(source_label, "parallel daily download", error)
         finally:
+            # Cancel before shutdown: shutdown(wait=True) would otherwise block for
+            # the rest of the queue after the main thread has already failed.
+            if queue_future is not None and not queue_future.done():
+                cancel_event.set()
+            pool.shutdown(wait=True)
             con.execute("DETACH source_db")
     else:
         # Use postgres_scan() which creates a new connection per query (default).

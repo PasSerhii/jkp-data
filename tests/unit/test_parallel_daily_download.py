@@ -323,17 +323,39 @@ def _install_orchestration_fakes(monkeypatch, *, table_stub, parallel_stub) -> N
     monkeypatch.setattr(aux, "download_wrds_table", table_stub)
     monkeypatch.setattr(aux, "download_wrds_daily_tables_parallel", parallel_stub)
 
+    # --persistent-connection takes a different branch that calls the *_attached
+    # variants. Faking only the postgres_scan ones let every orchestration test
+    # below pass while the branch production actually runs had no overlap at all:
+    # its daily queue ran after the header loop, not alongside it, so the source
+    # database sat at one busy core for the first nine minutes of the phase.
+    def attached_table_stub(duckdb_conn, db_alias, table_name, filename, **kwargs) -> None:
+        table_stub(SECRET_CONNINFO, duckdb_conn, table_name, filename, **kwargs)
 
-def _download_raw(paths: DataPaths, workers: int = 2) -> None:
+    monkeypatch.setattr(aux, "download_wrds_table_attached", attached_table_stub)
+    monkeypatch.setattr(aux, "download_compustat_age_anchor_attached", lambda *a, **k: None)
+
+
+def _download_raw(paths: DataPaths, workers: int = 2, *, persistent: bool = False) -> None:
     aux.download_raw_data_tables(
         paths,
         connection_info=SECRET_CONNINFO,
         bypass_crsp=True,
         daily_download_workers=workers,
+        persistent_connection=persistent,
     )
 
 
-def test_daily_queue_overlaps_remaining_sequential_tables(tmp_path, monkeypatch) -> None:
+# Both source branches must behave identically here. Production passes
+# --persistent-connection; the tests only ever covered the other one.
+both_branches = pytest.mark.parametrize(
+    "persistent", [False, True], ids=["postgres_scan", "persistent_connection"]
+)
+
+
+@both_branches
+def test_daily_queue_overlaps_remaining_sequential_tables(
+    tmp_path, monkeypatch, persistent
+) -> None:
     paths = _paths(tmp_path)
     queue_started = threading.Event()
     release_queue = threading.Event()
@@ -351,14 +373,19 @@ def test_daily_queue_overlaps_remaining_sequential_tables(tmp_path, monkeypatch)
             release_queue.set()
 
     _install_orchestration_fakes(monkeypatch, table_stub=table_stub, parallel_stub=parallel_stub)
-    _download_raw(paths)
+    _download_raw(paths, persistent=persistent)
 
     assert queue_kwargs["worker_count"] == 2
-    assert queue_kwargs.get("planning_db_alias") is None
+    # The attached branch plans through its own ATTACH; the other resolves columns
+    # over postgres_scan and has no alias to name.
+    assert queue_kwargs.get("planning_db_alias") == ("source_db" if persistent else None)
     assert isinstance(queue_kwargs["cancel_event"], threading.Event)
 
 
-def test_background_queue_daily_error_propagates_unwrapped(tmp_path, monkeypatch) -> None:
+@both_branches
+def test_background_queue_daily_error_propagates_unwrapped(
+    tmp_path, monkeypatch, persistent
+) -> None:
     paths = _paths(tmp_path)
 
     def parallel_stub(*args, **kwargs) -> None:
@@ -368,10 +395,11 @@ def test_background_queue_daily_error_propagates_unwrapped(tmp_path, monkeypatch
         monkeypatch, table_stub=lambda *args, **kwargs: None, parallel_stub=parallel_stub
     )
     with pytest.raises(aux._DailyBatchDownloadError, match="boom"):
-        _download_raw(paths)
+        _download_raw(paths, persistent=persistent)
 
 
-def test_background_queue_error_is_redacted(tmp_path, monkeypatch) -> None:
+@both_branches
+def test_background_queue_error_is_redacted(tmp_path, monkeypatch, persistent) -> None:
     paths = _paths(tmp_path)
 
     def parallel_stub(*args, **kwargs) -> None:
@@ -381,13 +409,14 @@ def test_background_queue_error_is_redacted(tmp_path, monkeypatch) -> None:
         monkeypatch, table_stub=lambda *args, **kwargs: None, parallel_stub=parallel_stub
     )
     with pytest.raises(RuntimeError) as excinfo:
-        _download_raw(paths)
+        _download_raw(paths, persistent=persistent)
 
     assert "parallel daily download" in str(excinfo.value)
     assert "hunter2" not in str(excinfo.value)
 
 
-def test_sequential_failure_cancels_background_queue(tmp_path, monkeypatch) -> None:
+@both_branches
+def test_sequential_failure_cancels_background_queue(tmp_path, monkeypatch, persistent) -> None:
     paths = _paths(tmp_path)
     queue_cancelled = threading.Event()
 
@@ -401,7 +430,7 @@ def test_sequential_failure_cancels_background_queue(tmp_path, monkeypatch) -> N
 
     _install_orchestration_fakes(monkeypatch, table_stub=table_stub, parallel_stub=parallel_stub)
     with pytest.raises(RuntimeError) as excinfo:
-        _download_raw(paths)
+        _download_raw(paths, persistent=persistent)
 
     assert "download of comp.company" in str(excinfo.value)
     assert "hunter2" not in str(excinfo.value)
@@ -467,6 +496,8 @@ def test_sequential_non_timeout_error_fails_immediately(tmp_path, monkeypatch) -
     _install_orchestration_fakes(
         monkeypatch, table_stub=table_stub, parallel_stub=lambda *args, **kwargs: None
     )
+    # postgres_scan branch only: the attached branch answers a non-timeout error
+    # with the postgres_scan fallback rather than failing outright.
     with pytest.raises(RuntimeError, match="download of comp.funda"):
         _download_raw(paths)
 
