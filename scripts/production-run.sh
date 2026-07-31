@@ -132,6 +132,34 @@ if [ "$CHECK_ONLY" = true ]; then
   exit 0
 fi
 
+# Fama-French refresh --------------------------------------------------------
+# Copies ff.factors_monthly from WRDS. Idempotent and atomic -- rows are staged
+# and validated before a transactional swap -- so a no-op costs seconds and a
+# reader never sees a partial month.
+#
+# Worth doing every run because the pipeline falls back to the last available
+# month for anything newer, exactly as the production SAS does
+# (project_macros.sas: coalesce(c.rf, &lffm.)). Each missing month is another
+# month of ret_exc carrying a stale rate, which is what put a 20bp gap between
+# the July run and Research. Not fatal if WRDS has nothing new: the run records
+# what it used in source_snapshot_manifest.json either way.
+echo
+echo "== refreshing ff.factors_monthly from WRDS =="
+if (cd "$REPO" && uv run --with "psycopg[binary]" python sql/xpressfeed_views/load_ff_factors.py); then
+  FF_AFTER=$(cd "$REPO" && uv run --quiet --with "psycopg[binary]" python -c "
+import re,pathlib,psycopg
+t=pathlib.Path('.env').read_text()
+dsn=re.search(r'^COMPUSTAT=(.*)\$',t,re.M).group(1).strip().strip('\"').replace('postgresql+psycopg2://','postgresql://')
+with psycopg.connect(dsn, connect_timeout=20) as c, c.cursor() as cur:
+    cur.execute('select max(date) from ff.factors_monthly')
+    print(cur.fetchone()[0])
+" 2>/dev/null || echo unknown)
+  echo "   ff.factors_monthly now runs through $FF_AFTER (was ${FF%% *})"
+else
+  # The run is still valid on the existing snapshot, so this does not stop it.
+  warn "FF refresh failed; continuing on the snapshot already in the database"
+fi
+
 # Identifier capture ---------------------------------------------------------
 # Must precede the download. Skipping does not fail the build, but that month's
 # identifier changes are then lost for good: the feed only exposes current values.
