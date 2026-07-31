@@ -241,11 +241,33 @@ production-correct value; override only for a reason.
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
 | `MARKET` | `ondemand` | `spot` is available for a throwaway re-run; a reclaim on a delivery loses the run. |
-| `INSTANCE_TYPE` | `m6a.32xlarge` | 128 vCPU / 512 GiB. `m7i.16xlarge` is cheaper but carries 256 GiB against a ~351 GiB peak, so it OOMs. |
+| `INSTANCE_TYPE` | `r7i.16xlarge` | 64 vCPU / 512 GiB. Cheaper *and* faster than `m6a.32xlarge` — see below. Do not move to `m7i.16xlarge`: 256 GiB against a ~351 GiB peak, so it OOMs. |
 | `VOLUME_GB` / `VOLUME_IOPS` / `VOLUME_MBPS` | `750` / `8000` / `1000` | gp3 root volume. Peak disk was 471–485 GiB, so do not go below 750. |
 
 `production-run.sh --unattended` additionally reads `RUN_TAG`, `IMAGE` and
 `ENV_FILE` (default `/secure/jkp.env`), all set by `user-data.sh`.
+
+### Why `r7i.16xlarge` and not something with more cores
+
+Counter-intuitive, so it is worth stating: the 64-vCPU `r7i.16xlarge` beats the
+128-vCPU `m6a.32xlarge` on both time and money.
+
+| | on demand | vCPU | RAM | run | cost/run |
+|---|---:|---:|---:|---:|---:|
+| `r7i.16xlarge` | $5.107/h | 64 | 512 GiB | 1h55m | **$9.80** |
+| `m6a.32xlarge` | $6.624/h | 128 | 512 GiB | ~2h30m | $16.60 |
+
+Only `source_download` scales with core count. The middle phases —
+`security_panels`, `market_returns`, `accounting_characteristics` — are lightly
+threaded and run at single-digit CPU, so they are bound by per-core speed, where
+Sapphire Rapids beats EPYC decisively: `security_panels` 760s against ~1,300s,
+`market_returns` 449s against ~770s.
+
+`m6a.32xlarge` was correct only while `MARKET` defaulted to `spot`, where its
+~77% discount beat r7i's ~49%. On demand that inverts. **If you ever switch back
+to spot, re-check both prices before assuming the type follows** — at the time of
+writing spot is $1.53/h for m6a against $2.64/h for r7i, which reverses the
+ranking again.
 
 Notes on the two easiest to get wrong:
 

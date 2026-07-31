@@ -36,9 +36,23 @@ PROFILE=jkp-data-run-profile
 VPC=vpc-0712bd9cff9966754
 SUBNET=subnet-0a74f7b1e230a2f12
 
-# m6a.32xlarge: 128 vCPU / 512 GiB. m7i.16xlarge is cheaper but carries only
-# 256 GiB against a ~351 GiB peak, so it OOMs.
-INSTANCE_TYPE="${INSTANCE_TYPE:-m6a.32xlarge}"
+# r7i.16xlarge: 64 vCPU / 512 GiB, $5.107/h on demand in eu-central-1.
+#
+# Cheaper AND faster than m6a.32xlarge for this workload, which is not the
+# obvious result -- m6a has twice the vCPUs. The middle phases (security_panels,
+# market_returns, accounting_characteristics) are lightly threaded and run at
+# single-digit CPU, so they are bound by per-core speed, where Sapphire Rapids
+# beats EPYC decisively: security_panels 760s on r7i against ~1,300s on m6a,
+# market_returns 449s against ~770s. Whole run 1h55m against ~2h30m, at
+# $5.107/h against $6.624/h -- about $9.80 per run against $16.60.
+#
+# m6a was the right default only while MARKET defaulted to spot, where its ~77%
+# discount beat r7i's ~49% and made it cheaper per hour. On demand that inverts.
+# If you ever switch this back to spot, re-check both prices before assuming the
+# type should change with it.
+#
+# Do not "upgrade" to m7i.16xlarge: 256 GiB against a ~351 GiB peak, so it OOMs.
+INSTANCE_TYPE="${INSTANCE_TYPE:-r7i.16xlarge}"
 VOLUME_GB="${VOLUME_GB:-750}"
 VOLUME_IOPS="${VOLUME_IOPS:-8000}"
 VOLUME_MBPS="${VOLUME_MBPS:-1000}"
