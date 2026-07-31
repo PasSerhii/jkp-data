@@ -211,24 +211,11 @@ def run_pipeline(
     """
     paths = DataPaths(base_dir=output_dir.resolve())
     source = CompustatSource(compustat_source)
-    if source is CompustatSource.xpressfeed:
-        if not bypass_crsp:
-            raise ValueError(
-                "The XpressFeed RDS contains Compustat and Fama-French data but not CRSP. "
-                "Use --bypass-crsp, or select --compustat-source wrds for a CRSP build."
-            )
-        source_connection_info = get_xpressfeed_connection_info()
-        source_label = "XpressFeed RDS"
-        raw_schema = "public"
-        username = None
-        password = None
-    else:
-        creds = get_wrds_credentials()
-        source_connection_info = None
-        source_label = "WRDS"
-        raw_schema = "comp"
-        username = creds.username
-        password = creds.password
+
+    # Argument validation first, before any credential lookup. Resolving the
+    # source needs a configured COMPUSTAT string, so leaving these checks after it
+    # meant a caller who passed contradictory dates on a machine with no
+    # credential got told about the credential and never heard about the dates.
     effective_end_date = DEFAULT_END_DATE if end_date is None else end_date
     effective_start_date, source_window = _resolve_source_window(
         start_date, effective_end_date, full_history
@@ -241,6 +228,25 @@ def run_pipeline(
         raise ValueError(
             f"start_date ({effective_start_date}) must be on or before end_date ({effective_end_date})"
         )
+    if source is CompustatSource.xpressfeed and not bypass_crsp:
+        raise ValueError(
+            "The XpressFeed RDS contains Compustat and Fama-French data but not CRSP. "
+            "Use --bypass-crsp, or select --compustat-source wrds for a CRSP build."
+        )
+
+    if source is CompustatSource.xpressfeed:
+        source_connection_info = get_xpressfeed_connection_info()
+        source_label = "XpressFeed RDS"
+        raw_schema = "public"
+        username = None
+        password = None
+    else:
+        creds = get_wrds_credentials()
+        source_connection_info = None
+        source_label = "WRDS"
+        raw_schema = "comp"
+        username = creds.username
+        password = creds.password
 
     monitor = get_active_monitor()
     if monitor is None:  # pragma: no cover - run_pipeline always installs one
