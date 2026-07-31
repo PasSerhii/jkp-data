@@ -77,7 +77,7 @@ def test_failure_propagates_after_all_jobs_settle(monkeypatch) -> None:
 def test_concurrent_step_rows_are_not_interleaved(tmp_path) -> None:
     """Concurrent step_finished calls produce complete, well-formed CSV rows.
 
-    step_timings.csv is where the benchmark timings are read from, so parallel
+    step_timings.csv is where the run timings are read from, so parallel
     steps must not lose or split rows. Note this asserts the invariant rather
     than proving the lock in _append_step_row is what upholds it: short rows
     append atomically even unlocked, so the test still passes without it. The

@@ -5,8 +5,8 @@
 #   scripts/put-production-credentials.sh --show   # print what is stored now
 #
 # Writes one SSM SecureString holding COMPUSTAT (the XpressFeed RDS) plus
-# ENV_USERNAME/ENV_PASSWORD (WRDS, for the Fama-French refresh). The benchmark
-# kit stages a per-run parameter and deletes it after the host reads it, which
+# ENV_USERNAME/ENV_PASSWORD (WRDS, for the Fama-French refresh). By default a
+# launch stages a per-run parameter and the host deletes it after reading, which
 # works only because a human runs the launcher. An unattended run has no such
 # human, so this parameter persists and the host keeps it after reading.
 #
@@ -51,4 +51,4 @@ aws ssm put-parameter --region "$REGION" --name "$PARAM" --type SecureString \
 echo "stored $PARAM ($(wc -l < "$TMP" | tr -d ' ') keys)"
 echo
 echo "Use it by pointing a launch at the parameter instead of staging one:"
-echo "  CREDENTIAL_PARAM=$PARAM MARKET=ondemand scripts/ec2-benchmark/launch.sh <tag>"
+echo "  CREDENTIAL_PARAM=$PARAM scripts/aws/launch.sh <tag>"

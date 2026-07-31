@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Progress snapshot for a running benchmark: scripts/ec2-benchmark/status.sh <instance-id>
+# Progress snapshot for a run in flight: scripts/aws/status.sh <instance-id>
 #
 # Step totals sum only depth-0 rows. Nested steps (export_production contains five
 # children; rolling_daily_fanout contains nineteen) would otherwise be counted

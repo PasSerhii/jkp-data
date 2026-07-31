@@ -1,9 +1,9 @@
 # Running the pipeline on AWS
 
 How the monthly production build is started, what each script is for, and where
-its credentials come from. For the image itself see [DOCKER.md](DOCKER.md); for
-benchmark-specific detail (instance sizing, baselines, spot behaviour) see
-[scripts/ec2-benchmark/README.md](scripts/ec2-benchmark/README.md).
+its credentials come from. For the image itself see [DOCKER.md](DOCKER.md).
+
+There is one job: the monthly production build. Everything below serves it.
 
 ---
 
@@ -14,21 +14,21 @@ benchmark-specific detail (instance sizing, baselines, spot behaviour) see
 | The monthly production build | `scripts/production-run.sh` | your machine, VPN up |
 | Check whether it *could* run, change nothing | `scripts/production-run.sh --check-only` | your machine |
 | Just the feed-readiness verdict | `uv run python scripts/check_source_ready.py` | your machine |
-| A timing benchmark on spot | `scripts/ec2-benchmark/launch.sh run-YYYYMMDD` | your machine |
-| Watch a run in flight | `scripts/ec2-benchmark/status.sh <instance-id>` | your machine |
+| Watch a run in flight | `scripts/aws/status.sh <instance-id>` | your machine |
 | Store credentials for unattended runs | `scripts/put-production-credentials.sh` | your machine, once |
+| Re-launch a month already prepared | `scripts/aws/launch.sh <run-tag>` | your machine |
 
-`production-run.sh` is the only entry point you need for a production build. It
-runs every gate, refreshes Fama-French, captures identifiers, and *then* calls
-`launch.sh` for you. Calling `launch.sh` directly skips all of that — it is the
-benchmark entry point, not the production one.
+`production-run.sh` is the entry point. It runs every gate, refreshes
+Fama-French, captures identifiers, and *then* calls `launch.sh` for you. Calling
+`launch.sh` directly skips all of that — right only when you have already
+prepared that month and just need another host.
 
 ---
 
 ## 2. Where the credentials come from
 
-This is the part that has no obvious answer from reading the code, so it is
-spelled out in full.
+This is the part with no obvious answer from reading the code, so it is spelled
+out in full.
 
 ### The three variables
 
@@ -65,7 +65,9 @@ your machine                          EC2 host                    container
 ```
 
 The per-run parameter carries `COMPUSTAT` and nothing else, because in this mode
-the host never needs WRDS — you already ran the FF refresh locally.
+the host never needs WRDS — you already ran the FF refresh locally. The
+credential's plaintext never appears in an SSM command, in CloudTrail, or in the
+launcher's terminal, and there is no handshake that can stall.
 
 ### Unattended: credentials live on AWS, `.env` is only the seed
 
@@ -95,16 +97,15 @@ is then irrelevant — no laptop, no VPN and no operator is in the path.
 Why Parameter Store and not Secrets Manager: functionally identical here (both
 KMS-encrypted, both IAM-scoped, both in CloudTrail). Secrets Manager adds
 automatic rotation and resource policies; we use neither, and a WRDS password
-cannot be rotated by a Lambda anyway. Parameter Store is also what the kit
-already used. If rotation ever matters, switching is a one-line change to the
-host's fetch plus an IAM statement.
+cannot be rotated by a Lambda anyway. If rotation ever matters, switching is a
+one-line change to the host's fetch plus an IAM statement.
 
 ### How the code finds them
 
-Two different mechanisms, which is worth knowing when something is `None`:
+Two different mechanisms, worth knowing when something comes back `None`:
 
 - **The pipeline** — `get_xpressfeed_connection_info()` reads `os.environ["COMPUSTAT"]`,
-  falling back to a `.env` file found by walking up from the working directory.
+  falling back to a `.env` found by walking up from the working directory.
 - **The loaders** (`load_ff_factors.py`, `capture_sec_ids.py`) — `gen_views.load_env()`
   reads the repo-root `.env` if present, then lets the environment override it.
   The runtime image ships no `.env`, so in a container the environment is the
@@ -117,10 +118,8 @@ The instance role holds `ssm:GetParameter` and `ssm:DeleteParameter` on
 `/jkp-data/production/*`. A host deleting that parameter would take the *next*
 month's run down, and nobody would notice until it failed to start.
 
-Inspect what is stored (names and lengths only, never values):
-
 ```bash
-scripts/put-production-credentials.sh --show
+scripts/put-production-credentials.sh --show   # names and lengths, never values
 ```
 
 ---
@@ -153,9 +152,14 @@ The gates, in order. Every fatal one must pass or nothing launches:
 | 7 | No other run in flight | yes |
 | 8 | Fama-French vintage | no — reports the fallback |
 
-Then: FF refresh → identifier capture → launch. The capture **must** precede the
-download; skipping it loses that month's identifier changes permanently, because
-the feed exposes only current values.
+Then: FF refresh → identifier capture → launch.
+
+`capture_sec_ids.py` **must** run before the build downloads its raw tables. It
+appends any identifier changes since the last run to `comp.sec_id_history`,
+which is what gives historical rows their point-in-time CUSIP/ISIN/SEDOL instead
+of today's value. Skipping it does not fail the build — the run falls back to
+the security header — but that month's identifier changes are lost for good,
+since the feed only ever exposes the current value.
 
 `--unattended` is the same gates in the same order, run on the host instead of a
 laptop: credentials come from the env file the host fetched from SSM, the Python
@@ -193,32 +197,32 @@ would silently build a month with most securities missing.
 
 `--wait-minutes` is a deadline, not an attempt count — a slow query eats the
 budget rather than pushing past the hour you allowed. Defaults to 0 (single
-shot), so existing callers are unaffected.
+shot).
 
-### `scripts/ec2-benchmark/launch.sh`
+### `scripts/aws/launch.sh`
 
 ```bash
-scripts/ec2-benchmark/launch.sh [RUN_TAG]
+scripts/aws/launch.sh [RUN_TAG]
 ```
 
 Idempotent: reuses the bucket, IAM role/profile and security group if they
-exist. Blocks only on spot capacity; everything after that the host does itself
-and reports by email.
+exist. Blocks only on capacity; everything after that the host does itself and
+reports by email. Default run tag `prod-<UTC date>`, and it refuses to start if
+that tag already has objects in S3 — pass a distinct tag for a same-day re-run.
 
-### `scripts/ec2-benchmark/status.sh`
+Email arrives on start, on completion (with elapsed time), on failure, and on
+bootstrap failure. **A missing "started" email means the host never got that
+far** — the bootstrap fails loudly rather than idling, so look for
+`JKP RUN: BOOTSTRAP FAILED`, which carries the reason.
+
+### `scripts/aws/status.sh`
 
 ```bash
-scripts/ec2-benchmark/status.sh <instance-id>
+scripts/aws/status.sh <instance-id>
 ```
 
 Step totals sum only depth-0 rows — nested steps would be double-counted. For
 authoritative phase durations read `phase_timings_seconds` in `run_summary.json`.
-
-### `scripts/ec2-benchmark/verify_output.py`
-
-An ad-hoc post-run spot check, not a gate: it hardcodes three countries and the
-June 2026 month ends. Copy it to the host and edit the constants when you want
-that particular check. Nothing in the pipeline calls it.
 
 ---
 
@@ -229,41 +233,101 @@ production-correct value; override only for a reason.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MARKET` | `spot` | `ondemand` for production — a reclaim costs a delivery. `production-run.sh` sets this for you. |
-| `COUNTRIES` | *(empty)* | Empty uploads every country (~95 GiB). A space-separated list uploads only those; the rest die with the volume. |
-| `START_DATE` | *(empty)* | Empty gives the rolling `ROLLING_INPUT_YEARS` (23) window. Pin only to reproduce an older run — under 240 months silently nulls the seasonality columns. |
+| `COUNTRIES` | *(empty)* | Empty uploads every country. A space-separated list uploads only those; the six cross-country files still ship. |
+| `START_DATE` | *(empty)* | Empty gives the rolling `ROLLING_INPUT_YEARS` (23) window. |
 | `END_DATE` | `2026-06-30` | Last month end to build. |
-| `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). Set only to A/B a count. |
+| `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). |
 | `KEEP_INTERIM` | `1` | Keeps `interim/` and `raw/` and ships the accounting artefacts to S3. |
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
-| `INSTANCE_TYPE` | `m6a.32xlarge` | 512 GiB, 128 vCPU. |
-| `VOLUME_GB` / `VOLUME_IOPS` / `VOLUME_MBPS` | `750` / `8000` / `1000` | gp3 root volume. |
+| `MARKET` | `ondemand` | `spot` is available for a throwaway re-run; a reclaim on a delivery loses the run. |
+| `INSTANCE_TYPE` | `m6a.32xlarge` | 128 vCPU / 512 GiB. `m7i.16xlarge` is cheaper but carries 256 GiB against a ~351 GiB peak, so it OOMs. |
+| `VOLUME_GB` / `VOLUME_IOPS` / `VOLUME_MBPS` | `750` / `8000` / `1000` | gp3 root volume. Peak disk was 471–485 GiB, so do not go below 750. |
 
 `production-run.sh --unattended` additionally reads `RUN_TAG`, `IMAGE` and
 `ENV_FILE` (default `/secure/jkp.env`), all set by `user-data.sh`.
 
+Notes on the two easiest to get wrong:
+
+- **`START_DATE`.** 23 years is the shortest window that nulls no
+  characteristic: `seas_16_20` needs 240 monthly *observations*, and its gate
+  counts a security's own rows rather than calendar months, so gappy securities
+  need more than 20 calendar years to reach 240. A shorter window silently nulls
+  the seasonality columns (the pipeline warns). For a complete-history build —
+  re-seeding a downstream store, or reissuing after a change that rewrites
+  history — pass `jkp build --full-history` rather than guessing a date.
+- **`KEEP_INTERIM`.** Without it, `save_full_files_and_cleanup` wipes `interim/`
+  and `raw/` at the end of the run and there is nothing left to upload. The host
+  probes the image for the flag first, so an older image degrades to the
+  `processed/` copies rather than failing.
+
 ---
 
-## 5. Fixed infrastructure
+## 5. Output
+
+`processed/production/` is the entire deliverable:
+
+```
+processed/production/
+    monthly/<country>.csv          # 455-column characteristics
+    daily/<country>.csv            # returns, prices, identifiers
+    market_returns.csv  market_returns_daily.csv
+    nyse_cutoffs.csv    return_cutoffs.csv  return_cutoffs_daily.csv
+    world_ret_monthly.csv
+```
+
+The per-country CSVs carry `config.PRODUCTION_OUTPUT_YEARS` (3) of history, not
+the whole panel — the loader downstream only reads rows past its own high-water
+mark, so the rest was written and shipped unread. `jkp build --production-years 0`
+emits everything for a re-seed. This bounds the *output* only: characteristics
+are computed over the full source window either way, so the retained rows are
+identical. The six cross-country files keep full history.
+
+After the completion email:
+
+```bash
+aws s3 sync s3://jkp-data-runs-485357734136-eu-central-1/<run-tag>/ \
+    "D:/jkp-run-<date>/" --exclude "production/*"        # logs only
+aws ec2 terminate-instances --region eu-central-1 --instance-ids i-0abc...
+```
+
+**Terminating destroys the volume.** By default the whole of
+`processed/production/` reaches S3 first (~12 GiB with the 3-year window,
+against ~95 GiB unbounded). Whatever was not uploaded — the remaining CSVs and
+all parquet output — is lost, and recovering it means a full rerun.
+
+**The sasWrds uploader needs updating to match.** Its `Folder` enum walks
+`CharacteristicsProduction/` and `DailyReturnsProduction/`; the layout above uses
+`monthly/` and `daily/`. `FileFactory` returns `None` for unrecognised names and
+`WrdsUpdater` logs nothing, so anything unmatched is skipped silently while the
+job still reports success — point `FILE_PATH` at `processed/production/` and
+rename the two folder constants.
+
+---
+
+## 6. Fixed infrastructure
 
 | | |
 |---|---|
 | Account / region | `485357734136` / `eu-central-1` |
-| Artifact bucket | `jkp-data-runs-485357734136-eu-central-1` |
 | Image | `485357734136.dkr.ecr.eu-central-1.amazonaws.com/jkp-data:production` |
-| Alerts topic | `arn:aws:sns:eu-central-1:485357734136:jkp-spot-run-alerts` |
-| Instance role / profile | `jkp-data-run-role` / `jkp-data-run-profile` |
-| VPC / subnet | `vpc-0712bd9cff9966754` / `subnet-0a74f7b1e230a2f12` |
+| VPC / subnet | `vpc-0712bd9cff9966754` / `subnet-0a74f7b1e230a2f12` (eu-central-1b) |
+| Security group | `jkp-data-run-sg` — egress only, no inbound |
+| IAM | role `jkp-data-run-role`, profile `jkp-data-run-profile` |
+| S3 | `jkp-data-runs-485357734136-eu-central-1` (AES256, public access blocked) |
+| SNS | `jkp-spot-run-alerts` → serhii@alpha-beta.co.il |
 | Credential (unattended) | SSM SecureString `/jkp-data/production/env` |
+| Instance tag | `Purpose=jkp-data-production` — the in-flight interlock filters on it |
 
-The subnet is in the RDS's AZ and routes outbound through the NAT gateway, which
-the ECR pull and the S3 uploads need. The RDS has no public endpoint, so the
-instance must sit in that VPC.
+**The subnet is not optional.** The Compustat RDS has no public endpoint; its
+security group admits `10.10.0.0/16` on 5432, so the instance must sit in that
+VPC. This subnet is in the RDS's AZ *and* routes outbound via the NAT gateway,
+which the ECR pull and S3 uploads require. Host access is SSM only — no key
+pair, no public IP, nothing inbound.
 
 ---
 
-## 6. How the image and the scripts stay in step
+## 7. How the image and the scripts stay in step
 
 `check_source_ready.py`, `production-run.sh` and `sql/` are baked into the
 runtime image at `/opt/jkp`. The host lifts them out with `docker cp` rather
@@ -284,7 +348,35 @@ script, `Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock` or
 
 ---
 
-## 7. What is not automated
+## 8. Gotchas
+
+- **Git Bash mangles paths.** `MSYS_NO_PATHCONV=1` is required for
+  `--block-device-mappings ... /dev/xvda` and for `docker run --entrypoint
+  /app/.venv/bin/python`; otherwise they become `C:/Program Files/Git/...`.
+  The scripts export it. The same trap bit `production-run.sh`, which must pass
+  script paths *relative to the repo* because a Git Bash `/d/projects/...` path
+  is not something native `python.exe` can open.
+- **Don't inline Python in `ssm send-command`** — nested quotes break the JSON
+  parameter parser. Base64-encode the script and decode on the host.
+- **`ff.factors_monthly` lags roughly a month.** The last month of a run uses
+  the last-available-RF fallback; the run records what it used in
+  `source_snapshot_manifest.json`. `production-run.sh` refreshes it and reports
+  the vintage, but Ken French genuinely publishes late — the fallback is not a
+  bug.
+- **A running spot instance cannot become on-demand.** The market type is fixed
+  at launch and there is no conversion API; recovery always means a new
+  instance. `stop`/`hibernate` interruption behaviours do not help — cloud-init
+  runs user-data once per instance, `jkp build` has no mid-phase resume, and
+  hibernate caps at 150 GiB of RAM. On reclaim the host flushes `run_logs` and
+  emails; 200+ GB cannot leave in 120 seconds. This is why `MARKET` defaults to
+  `ondemand`.
+- **The spot discount is very type-specific**, if you do opt into it. In
+  eu-central-1b: `m6a.32xlarge` was ~77% off on demand but `r7i.16xlarge` only
+  ~49%. Check `describe-spot-price-history` rather than assuming.
+
+---
+
+## 9. What is not automated
 
 The build is one command; nothing runs on a schedule yet. Still manual:
 

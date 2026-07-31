@@ -196,7 +196,7 @@ if [ "$UNATTENDED" = true ]; then
   [ -n "$SELF" ] || SELF=__none__
 fi
 RUNNING=$(aws ec2 describe-instances --region "$REGION" \
-  --filters Name=tag:Purpose,Values=jkp-data-timing-benchmark \
+  --filters Name=tag:Purpose,Values=jkp-data-production \
             Name=instance-state-name,Values=running,pending \
   --query "Reservations[].Instances[].InstanceId" --output text 2>/dev/null \
   | tr '\t' '\n' | grep -vx "$SELF" | tr '\n' ' ' | sed 's/ *$//' || true)
@@ -259,8 +259,10 @@ if [ "$UNATTENDED" = true ]; then
 fi
 
 # Launch ---------------------------------------------------------------------
-# On demand, not spot: a reclaim on a production run costs a delivery.
+# MARKET is redundant -- launch.sh already defaults to ondemand -- and stated
+# anyway: a reclaim here costs a delivery, so this path should not silently
+# follow a default someone else can change.
 # COUNTRIES unset uploads every country. START_DATE unset gives the rolling window.
 echo
 echo "== launching (on demand, all countries) =="
-MARKET=ondemand "$HERE/ec2-benchmark/launch.sh" "$RUN_TAG"
+MARKET=ondemand "$HERE/aws/launch.sh" "$RUN_TAG"

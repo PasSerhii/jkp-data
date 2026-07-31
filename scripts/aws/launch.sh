@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Launch a full jkp-data timing benchmark on EC2 (spot by default).
+# Launch a full jkp-data run on EC2.
 #
-#   scripts/ec2-benchmark/launch.sh [RUN_TAG]
+#   scripts/aws/launch.sh [RUN_TAG]
+#
+# This is the launcher, not the entry point. A monthly production build starts
+# at scripts/production-run.sh, which runs every gate, refreshes Fama-French and
+# captures identifiers before calling this. Invoking this directly skips all of
+# that, which is right only for a one-off re-run of a month already prepared.
 #
 # Idempotent: reuses the S3 bucket, IAM role/profile and security group if they
 # already exist. Ships the COMPUSTAT credential via an SSM SecureString that is
@@ -15,7 +20,7 @@ set -euo pipefail
 # Git Bash rewrites bare /dev/... and /app/... arguments into Windows paths.
 export MSYS_NO_PATHCONV=1
 
-RUN_TAG="${1:-run-$(date -u +%Y%m%d)}"
+RUN_TAG="${1:-prod-$(date -u +%Y%m%d)}"
 REGION=eu-central-1
 ACCOUNT=485357734136
 REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
@@ -31,10 +36,8 @@ PROFILE=jkp-data-run-profile
 VPC=vpc-0712bd9cff9966754
 SUBNET=subnet-0a74f7b1e230a2f12
 
-# m6a.32xlarge, not r7i.16xlarge: both carry 512 GiB, but m6a spot runs ~77% off
-# on-demand in eu-central-1b against r7i's ~49%, so it is cheaper per hour *and*
-# has twice the vCPUs. Re-check with describe-spot-price-history before assuming
-# this still holds.
+# m6a.32xlarge: 128 vCPU / 512 GiB. m7i.16xlarge is cheaper but carries only
+# 256 GiB against a ~351 GiB peak, so it OOMs.
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6a.32xlarge}"
 VOLUME_GB="${VOLUME_GB:-750}"
 VOLUME_IOPS="${VOLUME_IOPS:-8000}"
@@ -53,10 +56,11 @@ END_DATE="${END_DATE:-2026-06-30}"
 # COUNTRIES="usa can deu ita jpn hkg fra gbr ind nor" for the ten-country subset.
 # Whatever is not uploaded dies with the volume.
 COUNTRIES="${COUNTRIES:-}"
-# Spot is the default because this kit runs timing benchmarks, i.e. tests. Use
-# MARKET=ondemand for production runs, where a reclaim costs a delivery rather
-# than a rerun. A reclaim also voids the timing measurement outright.
-MARKET="${MARKET:-spot}"
+# On demand by default: every run this launches is a delivery, and a spot reclaim
+# costs one outright -- the 200+ GB on the volume cannot leave in the 120 seconds
+# the notice gives. MARKET=spot remains available for a throwaway re-run where
+# losing the host only costs the time; the host arms a reclaim watcher when set.
+MARKET="${MARKET:-ondemand}"
 # Retain interim/ and raw/ so the accounting artefacts survive the run. Ignored
 # by images that predate --keep-interim; the host probes for it before starting.
 KEEP_INTERIM="${KEEP_INTERIM:-1}"
@@ -67,7 +71,7 @@ KEEP_INTERIM="${KEEP_INTERIM:-1}"
 CREDENTIAL_PARAM="${CREDENTIAL_PARAM:-}"
 # 1 runs scripts/production-run.sh --unattended on the host before the pipeline:
 # the readiness poll, the FF refresh and the identifier capture. 0 assumes a human
-# already did those on their own machine, which is how the benchmark kit works.
+# already did those on their own machine, which is what production-run.sh does.
 UNATTENDED="${UNATTENDED:-0}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -202,7 +206,7 @@ INSTANCE=$(aws ec2 run-instances --region "$REGION" \
   --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=$VOLUME_GB,VolumeType=gp3,Iops=$VOLUME_IOPS,Throughput=$VOLUME_MBPS,DeleteOnTermination=true,Encrypted=true}" \
   --metadata-options 'HttpTokens=required,HttpEndpoint=enabled' \
   --user-data "$(aws_file_uri "$USER_DATA")" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=jkp-$RUN_TAG},{Key=Purpose,Value=jkp-data-timing-benchmark}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=jkp-$RUN_TAG},{Key=Purpose,Value=jkp-data-production}]" \
   --query "Instances[0].InstanceId" --output text)
 rm -f "$USER_DATA"
 echo "instance: $INSTANCE"
@@ -225,7 +229,7 @@ on its own. Expect "JKP RUN: started" in a few minutes, or
 "JKP RUN: BOOTSTRAP FAILED" with the reason if it cannot get that far.
 
 Watch:
-  scripts/ec2-benchmark/status.sh $INSTANCE
+  scripts/aws/status.sh $INSTANCE
 
 When finished (email arrives with the elapsed time):
   aws s3 sync s3://$BUCKET/$RUN_TAG/ "D:/jkp-full-run-${RUN_TAG#run-}/" --exclude "production/*"

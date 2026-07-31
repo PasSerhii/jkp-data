@@ -1,6 +1,6 @@
 """Step nesting, parallel fan-out instrumentation, and memory reporting.
 
-Covers the defects found in the 2026-07-29 benchmark: the 19 rolling-daily jobs ran
+Covers the defects found in the 2026-07-29 run: the 19 rolling-daily jobs ran
 on ThreadPoolExecutor threads where the monitor ContextVar did not propagate, so
 none of them was recorded, while nested steps under ``export_production`` were
 counted twice. The two errors nearly cancelled, so the totals looked healthy.

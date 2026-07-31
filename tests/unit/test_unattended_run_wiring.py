@@ -21,8 +21,8 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[2]
 VIEW_DIR = ROOT / "sql" / "xpressfeed_views"
-LAUNCH = ROOT / "scripts" / "ec2-benchmark" / "launch.sh"
-USER_DATA = ROOT / "scripts" / "ec2-benchmark" / "user-data.sh"
+LAUNCH = ROOT / "scripts" / "aws" / "launch.sh"
+USER_DATA = ROOT / "scripts" / "aws" / "user-data.sh"
 PRODUCTION_RUN = ROOT / "scripts" / "production-run.sh"
 DOCKERFILE = ROOT / "Dockerfile"
 DOCKERIGNORE = ROOT / ".dockerignore"

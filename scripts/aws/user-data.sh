@@ -43,7 +43,7 @@ fail() {
   notify "JKP RUN: BOOTSTRAP FAILED" \
 "$1
 
-The pipeline never started, so there is no timing to report.
+The pipeline never started, so no output was produced.
 Setup log: /var/log/jkp-setup.log
 Instance still RUNNING for diagnosis — terminate it when done."
   exit 1
@@ -98,13 +98,13 @@ while true; do
     WARNED=1
     aws sns publish --region "$REGION" --topic-arn "$TOPIC" \
       --subject "JKP RUN: spot rebalance recommendation" \
-      --message "EC2 recommends moving off this host: capacity is tightening and a reclaim is likely, though not certain and not necessarily soon. The run is still going. If the timing matters, relaunch on demand now rather than waiting: MARKET=ondemand scripts/ec2-benchmark/launch.sh <new-tag>"
+      --message "EC2 recommends moving off this host: capacity is tightening and a reclaim is likely, though not certain and not necessarily soon. The run is still going. If this run is a delivery, relaunch it on demand now rather than waiting: scripts/aws/launch.sh <new-tag>"
   fi
   if [ "\$(curl -s -o /dev/null -w "%{http_code}" -H "X-aws-ec2-metadata-token: \$T" \$IMDS/latest/meta-data/spot/instance-action)" = "200" ]; then
     aws s3 sync /mnt/jkp-data/run_logs "$RUN_PREFIX/run_logs/" --only-show-errors
     aws sns publish --region "$REGION" --topic-arn "$TOPIC" \
       --subject "JKP RUN INTERRUPTED (spot reclaim)" \
-      --message "Spot reclaim, 2-minute notice. Logs flushed to $RUN_PREFIX/run_logs/. The run did NOT finish and the timing measurement is void; the volume goes with the host."
+      --message "Spot reclaim, 2-minute notice. Logs flushed to $RUN_PREFIX/run_logs/. The run did NOT finish; the volume goes with the host. Relaunch on demand (the default)."
     break
   fi
   sleep 5
@@ -210,7 +210,7 @@ for f in container.log ELAPSED STARTED_AT FINISHED_AT source_snapshot_manifest.j
 done
 
 # Accounting artefacts for the post-run tests. All of this runs after ELAPSED is
-# recorded, so upload time is excluded from the benchmark.
+# recorded, so upload time is excluded from the reported elapsed.
 #
 # processed/accounting_data and processed/other_output are written by
 # save_accounting_data/save_output_files and survive regardless of --keep-interim;

@@ -116,7 +116,7 @@ def _roll_label(var: str, sfx: str, min_obs: int) -> str:
     one another in step_timings.csv.
 
     Fields are separated by ``;`` rather than ``,``: step names land in a CSV column,
-    and the awk readers in scripts/ec2-benchmark split on every comma irrespective of
+    and the awk readers in scripts/aws split on every comma irrespective of
     quoting, which would shift every later field on these rows.
     """
     return f"roll_apply_daily[stat={var};window={sfx.lstrip('_')};min_obs={min_obs}]"

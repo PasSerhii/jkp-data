@@ -67,7 +67,7 @@ def _read_cgroup_memory() -> tuple[float | None, float | None]:
     cgroup counter is the number the kernel would enforce a limit against, so it is
     the honest one when the pipeline runs in a container.
 
-    ``memory.max`` reads ``max`` when the container is unlimited (the benchmark
+    ``memory.max`` reads ``max`` when the container is unlimited (the run
     passes no ``docker run -m``), which is reported as None rather than a number:
     there is no denominator to compute headroom against.
     """
