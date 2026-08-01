@@ -50,6 +50,14 @@ for arg in "$@"; do
 done
 RUN_TAG="${RUN_TAG:-prod-$(date -u +%Y%m%d)}"
 
+# The month being built. Passed explicitly to both the readiness check and the
+# launcher, so the month that was verified is the month that gets built. They
+# each defaulted to "last month end" independently before, which agreed only by
+# coincidence -- and launch.sh's default was a hardcoded literal date, so after
+# the month rolled over it would quietly rebuild and redeliver the month before.
+TARGET_MONTH_END="${END_DATE:-$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m-%d)}"
+export END_DATE="$TARGET_MONTH_END"
+
 # Set by user-data.sh in unattended mode; unused otherwise.
 IMAGE="${IMAGE:-}"
 ENV_FILE="${ENV_FILE:-/secure/jkp.env}"
@@ -89,7 +97,7 @@ with psycopg.connect(get_xpressfeed_connection_info(), connect_timeout=20) as c,
 " 2>/dev/null || echo unavailable
 }
 
-echo "== preflight for $RUN_TAG ($([ "$UNATTENDED" = true ] && echo unattended || echo attended)) =="
+echo "== preflight for $RUN_TAG, month end $TARGET_MONTH_END ($([ "$UNATTENDED" = true ] && echo unattended || echo attended)) =="
 
 # 1. AWS ---------------------------------------------------------------------
 if ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); then
@@ -165,14 +173,14 @@ fi
 # a bounded poll, because nobody will.
 if [ "$UNATTENDED" = true ]; then
   echo "  .... waiting for the feed (up to ${WAIT_MINUTES} min, checking every ${POLL_INTERVAL})"
-  if py "$SCRIPTS/check_source_ready.py" \
+  if py "$SCRIPTS/check_source_ready.py" "$TARGET_MONTH_END" \
        --wait-minutes "$WAIT_MINUTES" --poll-interval "$POLL_INTERVAL" 2>&1 | sed 's/^/       /'; then
-    pass "Compustat feed complete for the target month"
+    pass "Compustat feed complete for $TARGET_MONTH_END"
   else
     fail "feed still incomplete after ${WAIT_MINUTES} min - the delivery is late"
   fi
-elif py "$SCRIPTS/check_source_ready.py" >/tmp/src_ready.log 2>&1; then
-  pass "Compustat feed complete for the target month"
+elif py "$SCRIPTS/check_source_ready.py" "$TARGET_MONTH_END" >/tmp/src_ready.log 2>&1; then
+  pass "Compustat feed complete for $TARGET_MONTH_END"
 else
   fail "check_source_ready.py failed: $(tail -3 /tmp/src_ready.log | tr '\n' ' ')"
 fi
@@ -264,5 +272,5 @@ fi
 # follow a default someone else can change.
 # COUNTRIES unset uploads every country. START_DATE unset gives the rolling window.
 echo
-echo "== launching (on demand, all countries) =="
+echo "== launching (on demand, all countries, month end $TARGET_MONTH_END) =="
 MARKET=ondemand "$HERE/aws/launch.sh" "$RUN_TAG"

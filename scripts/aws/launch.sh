@@ -64,7 +64,11 @@ WORKERS="${WORKERS:-}"
 # Pin it only to reproduce an older run; a window shorter than 240 months nulls
 # the seasonality characteristics.
 START_DATE="${START_DATE:-}"
-END_DATE="${END_DATE:-2026-06-30}"
+# Last month end, computed rather than pinned. This was hardcoded to a literal
+# date, which is silent and wrong the moment the month rolls over: the run
+# succeeds, uploads, and delivers the previous month again. It matches the target
+# check_source_ready.py tests, so the month that was verified is the month built.
+END_DATE="${END_DATE:-$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m-%d)}"
 # Empty means every country the run produces (~95 GiB, ~$2.20/month in S3).
 # Set it to a space-separated list to upload only those, e.g.
 # COUNTRIES="usa can deu ita jpn hkg fra gbr ind nor" for the ten-country subset.
