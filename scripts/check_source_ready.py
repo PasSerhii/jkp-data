@@ -9,10 +9,14 @@ Exits 0 when every gate passes, 1 otherwise, so it can gate an automated run.
 Why not just look at ``max(datadate)``: the monthly table ``sec_mth`` stamps rows
 with the month-end date as they arrive, so it reports the *current* month end
 from the first day of that month while holding only a fraction of the universe.
-Trusting it would silently build a month with most securities missing. The
-decisive signal is the securities count at the target month end measured against
-the month before, combined with the daily frontier having reached the month's
-last trading day.
+Trusting it would silently build a month with most securities missing.
+
+So the daily side is measured directly instead: find the month's last real
+trading day and check it carries a full cross-section. An earlier version asked
+whether the feed's frontier had moved *past* the month end, which sounds
+equivalent and is not -- the last trading day generally *is* the month end, so
+the frontier cannot pass it until the next month starts delivering. That test
+failed every month on the 1st, which is precisely when the monthly build runs.
 
 ``--wait-minutes`` turns the single verdict into a bounded poll, for the
 unattended monthly run that starts at a fixed hour and cannot ask a human to
@@ -23,6 +27,7 @@ behaviour.
 from __future__ import annotations
 
 import argparse
+import statistics
 import sys
 import time
 from datetime import date, timedelta
@@ -32,14 +37,48 @@ import duckdb
 from jkp.data.database_sources import get_xpressfeed_connection_info
 
 # A completed month must hold at least this share of the previous month's rows /
-# trading dates. Real month-over-month drift is well under 5%.
+# trading dates, and its last trading day this share of the month's typical
+# cross-section. Real drift is well under 5%.
 COVERAGE_MIN = 0.95
+# How far the last full trading day may sit before the calendar month end.
+# Covers a Saturday or Sunday month end plus a global holiday.
+DAILY_TAIL_DAYS = 4
+# Separates real trading days from thin ones. Sundays carry ~1.3% of a weekday's
+# rows (Middle-East markets only) and must not drag the median down.
+FULL_DAY_SHARE = 0.5
 
 Gate = tuple[str, bool, str]
+DayCounts = list[tuple[date, int]]
+
+DAILY_GATE = "daily prices through month end"
 
 
 def _previous_month_end(today: date) -> date:
     return today.replace(day=1) - timedelta(days=1)
+
+
+def assess_daily_month(counts: DayCounts, target: date) -> Gate:
+    """Is the month's final trading day present and carrying a full cross-section?
+
+    ``counts`` is (datadate, row count) for every date in the target month.
+    Pure so it can be tested without a database.
+    """
+    if not counts:
+        return (DAILY_GATE, False, "no daily rows in the target month")
+    median = statistics.median(n for _, n in counts)
+    full = [(d, n) for d, n in counts if n >= FULL_DAY_SHARE * median]
+    if not full:
+        return (DAILY_GATE, False, f"no full trading day (median {median:,})")
+    last_day, last_n = max(full)
+    lag = (target - last_day).days
+    share = last_n / median if median else 0.0
+    ok = lag <= DAILY_TAIL_DAYS and share >= COVERAGE_MIN
+    return (
+        DAILY_GATE,
+        ok,
+        f"last full day {last_day} ({lag}d before month end), "
+        f"{last_n:,} rows = {share:.0%} of median",
+    )
 
 
 def evaluate(target: date) -> tuple[list[Gate], str]:
@@ -49,6 +88,7 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
     a snapshot taken before the delivery landed.
     """
     prev = _previous_month_end(target.replace(day=1))
+    month_start = target.replace(day=1)
     con = duckdb.connect()
     try:
         con.execute("INSTALL postgres; LOAD postgres;")
@@ -59,17 +99,33 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
         def scalar(sql: str):
             return con.sql(f"SELECT * FROM postgres_query('src', $q${sql}$q$)").fetchone()[0]
 
-        daily_max = scalar("SELECT max(datadate) FROM public.sec_dprc")
-        fx_max = scalar("SELECT max(datadate) FROM public.exrt_dly")
+        def rows(sql: str):
+            return con.sql(f"SELECT * FROM postgres_query('src', $q${sql}$q$)").fetchall()
+
+        def as_date(value):
+            return value.date() if hasattr(value, "date") else value
+
+        daily_counts: DayCounts = [
+            (as_date(d), int(n))
+            for d, n in rows(
+                "SELECT datadate, count(*) FROM public.sec_dprc "
+                f"WHERE datadate BETWEEN date '{month_start}' AND date '{target}' "
+                "GROUP BY 1"
+            )
+        ]
+        fx_counts: DayCounts = [
+            (as_date(d), int(n))
+            for d, n in rows(
+                "SELECT datadate, count(*) FROM public.exrt_dly "
+                f"WHERE datadate BETWEEN date '{month_start}' AND date '{target}' "
+                "GROUP BY 1"
+            )
+        ]
         ff_max = scalar("SELECT max(date) FROM ff.factors_monthly")
         rows_target = scalar(
             f"SELECT count(*) FROM public.sec_mth WHERE datadate = date '{target}'"
         )
         rows_prev = scalar(f"SELECT count(*) FROM public.sec_mth WHERE datadate = date '{prev}'")
-        days_target = scalar(
-            "SELECT count(DISTINCT datadate) FROM public.sec_dprc "
-            f"WHERE datadate BETWEEN date '{target.replace(day=1)}' AND date '{target}'"
-        )
         days_prev = scalar(
             "SELECT count(DISTINCT datadate) FROM public.sec_dprc "
             f"WHERE datadate BETWEEN date '{prev.replace(day=1)}' AND date '{prev}'"
@@ -77,17 +133,22 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
     finally:
         con.close()
 
-    daily_d = daily_max.date() if hasattr(daily_max, "date") else daily_max
-    fx_d = fx_max.date() if hasattr(fx_max, "date") else fx_max
     monthly_cov = rows_target / rows_prev if rows_prev else 0.0
-    daily_cov = days_target / days_prev if days_prev else 0.0
+    daily_cov = len(daily_counts) / days_prev if days_prev else 0.0
+
+    # FX publishes on every calendar day, weekends included, so the month end
+    # itself must be present rather than the last trading day before it.
+    fx_by_date = dict(fx_counts)
+    fx_median = statistics.median(n for _, n in fx_counts) if fx_counts else 0
+    fx_target = fx_by_date.get(target, 0)
 
     gates: list[Gate] = [
-        # The feed must have moved past the target month end; that is the only
-        # proof the month's final trading day has been delivered without needing
-        # an exchange calendar.
-        ("daily prices past month end", daily_d > target, f"max {daily_d} vs target {target}"),
-        ("FX past month end", fx_d > target, f"max {fx_d} (gates USD conversion)"),
+        assess_daily_month(daily_counts, target),
+        (
+            "FX through month end",
+            bool(fx_median) and fx_target >= COVERAGE_MIN * fx_median,
+            f"{fx_target:,} rows on {target} vs median {fx_median:,} (gates USD conversion)",
+        ),
         (
             "monthly universe complete",
             monthly_cov >= COVERAGE_MIN,
@@ -96,7 +157,7 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
         (
             "daily trading days complete",
             daily_cov >= COVERAGE_MIN,
-            f"{days_target} dates vs {days_prev} prior ({daily_cov:.1%})",
+            f"{len(daily_counts)} dates vs {days_prev} prior ({daily_cov:.1%})",
         ),
     ]
     # RF lags roughly a month by design; the build falls back to the last

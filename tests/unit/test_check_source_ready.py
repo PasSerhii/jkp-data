@@ -148,6 +148,69 @@ class TestBoundedPoll:
         assert clock["t"] - start <= 3600 + 8 * 60
 
 
+class TestDailyCompleteness:
+    """The month's last real trading day must be present and carry a full cross-section.
+
+    The predecessor asked whether the feed's frontier had moved *past* the month
+    end. It cannot: the last trading day generally *is* the month end, so that
+    test failed every month on the 1st -- exactly when the monthly build runs.
+    July 2026 was the case that exposed it: 105,367 rows on 2026-07-31, the
+    highest of the fortnight, and the gate still said NOT READY.
+    """
+
+    @staticmethod
+    def _month(mod, days, rows=105_000, sundays=()):
+        """Per-date counts for July 2026; Sundays carry ~1.3% of a weekday."""
+        out = []
+        for d in days:
+            day = date(2026, 7, d)
+            out.append((day, 1_400 if d in sundays else rows))
+        return out
+
+    def test_month_ending_on_a_trading_day_is_ready(self, mod):
+        counts = self._month(mod, [27, 28, 29, 30, 31], sundays=(26,))
+        name, ok, detail = mod.assess_daily_month(counts, date(2026, 7, 31))
+        assert ok, detail
+
+    def test_the_july_2026_case_that_was_wrongly_rejected(self, mod):
+        counts = self._month(mod, [24, 26, 27, 28, 29, 30, 31], sundays=(26,))
+        counts[-1] = (date(2026, 7, 31), 105_367)
+        _, ok, _ = mod.assess_daily_month(counts, date(2026, 7, 31))
+        assert ok
+
+    def test_sundays_do_not_drag_the_median_down(self, mod):
+        """A thin Sunday must not become the reference for a "full" day."""
+        counts = self._month(mod, [19, 20, 21, 26, 27, 28], sundays=(19, 26))
+        _, ok, detail = mod.assess_daily_month(counts, date(2026, 7, 28))
+        assert ok, detail
+
+    def test_month_ending_at_a_weekend_uses_the_last_trading_day(self, mod):
+        """2026-08-31 is a Monday; construct a Saturday month end instead."""
+        counts = [(date(2026, 7, d), 105_000) for d in (28, 29, 30, 31)]
+        # pretend the month ends Sunday 2026-08-02, two days after the last full day
+        _, ok, detail = mod.assess_daily_month(counts, date(2026, 8, 2))
+        assert ok, detail
+
+    def test_feed_stalled_mid_month_is_rejected(self, mod):
+        counts = self._month(mod, [20, 21, 22, 23, 24])
+        _, ok, detail = mod.assess_daily_month(counts, date(2026, 7, 31))
+        assert not ok
+        assert "7d before month end" in detail
+
+    def test_partially_delivered_final_day_is_rejected(self, mod):
+        """The date exists but only a slice of the universe has landed."""
+        counts = self._month(mod, [28, 29, 30])
+        counts.append((date(2026, 7, 31), 60_000))  # 57% of median
+        _, ok, detail = mod.assess_daily_month(counts, date(2026, 7, 31))
+        assert not ok
+        assert "57% of median" in detail
+
+    def test_empty_month_is_rejected(self, mod):
+        _, ok, detail = mod.assess_daily_month([], date(2026, 7, 31))
+        assert not ok
+        assert "no daily rows" in detail
+
+
 class TestArguments:
     @pytest.mark.parametrize(
         "argv",
