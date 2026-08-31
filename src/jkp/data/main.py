@@ -66,7 +66,12 @@ from .config import (
 from .config import (
     END_DATE as DEFAULT_END_DATE,
 )
-from .database_sources import CompustatSource, get_xpressfeed_connection_info
+from .database_sources import (
+    CompustatSource,
+    get_research_update_connection_info,
+    get_xpressfeed_connection_info,
+)
+from .dataupdate import update_research_db
 from .paths import DataPaths
 from .production import export_production
 from .runtime_monitor import get_active_monitor, monitor_pipeline
@@ -200,6 +205,7 @@ def run_pipeline(
     keep_interim: bool = False,
     full_history: bool = False,
     production_years: int = PRODUCTION_OUTPUT_YEARS,
+    db_update: bool = False,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -233,6 +239,14 @@ def run_pipeline(
             "The XpressFeed RDS contains Compustat and Fama-French data but not CRSP. "
             "Use --bypass-crsp, or select --compustat-source wrds for a CRSP build."
         )
+    if db_update and not production_output:
+        raise ValueError(
+            "db_update uploads the production CSVs, but production_output is off. "
+            "Pass --production with --db-update."
+        )
+    # Resolved before any download work so a missing RESEARCH_UPDATE fails the
+    # run at minute 0, not after hours of pipeline time.
+    research_update_url = get_research_update_connection_info() if db_update else None
 
     if source is CompustatSource.xpressfeed:
         source_connection_info = get_xpressfeed_connection_info()
@@ -264,6 +278,7 @@ def run_pipeline(
         keep_interim=keep_interim,
         source_window=source_window,
         production_years=production_years,
+        db_update=db_update,
     )
     # The published window cannot exceed the window the data was built from; the
     # CSVs would silently stop at the source bound instead of the requested span.
@@ -468,3 +483,7 @@ def run_pipeline(
     if production_output:
         export_production(paths, end_date=effective_end_date, production_years=production_years)
     save_full_files_and_cleanup(paths, clear_interim=not keep_interim)
+    if db_update:
+        monitor.set_phase("database_update")
+        assert research_update_url is not None
+        update_research_db(paths, connection_url=research_update_url)

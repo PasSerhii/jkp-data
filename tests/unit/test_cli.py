@@ -109,7 +109,14 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_db_update_flag_forwarded(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--db-update"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["db_update"] is True
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection(self, mock_run_pipeline, tmp_path):
@@ -129,6 +136,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -149,6 +157,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -169,6 +178,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -189,6 +199,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -209,6 +220,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -239,6 +251,7 @@ class TestBuildCommand:
             keep_interim=False,
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
         )
 
     @patch("jkp.data.main.run_pipeline")

@@ -37,10 +37,14 @@ out in full.
 | `COMPUSTAT` | Connection URL for the private XpressFeed RDS | the pipeline, every gate, both loaders |
 | `ENV_USERNAME` | WRDS username | the Fama-French refresh only |
 | `ENV_PASSWORD` | WRDS password | the Fama-French refresh only |
+| `RESEARCH_UPDATE` | `mssql+pyodbc` URL of the research database the production CSVs are uploaded to | the database-update phase only (`jkp build --db-update`) |
 
 Only `COMPUSTAT` is required. Without the WRDS pair the run still completes; it
 skips the FF refresh and falls back to the last rate already in the database,
-exactly as the production SAS does.
+exactly as the production SAS does. `RESEARCH_UPDATE` is optional and only
+consulted when `--db-update` is passed; it currently points at `research_test`,
+and switching the upload to the production `research` database is a change to
+this value only.
 
 ### Today: attended run, credentials start on your machine
 

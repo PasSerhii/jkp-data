@@ -142,6 +142,13 @@ def build(
         "Needed to inspect or test against intermediate artefacts; costs several "
         "hundred GB of disk.",
     ),
+    db_update: bool = typer.Option(
+        False,
+        "--db-update/--no-db-update",
+        help="After the run, upload the production CSVs to the research MSSQL database "
+        "(incremental delete-and-insert; target comes from the RESEARCH_UPDATE "
+        "environment variable). Requires production output. Default off.",
+    ),
 ) -> None:
     """Run the full data generation pipeline."""
     from .config import (
@@ -176,6 +183,7 @@ def build(
         production_years=(
             PRODUCTION_OUTPUT_YEARS if production_years is None else production_years
         ),
+        db_update=db_update,
     )
 
 

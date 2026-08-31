@@ -1,9 +1,11 @@
-"""Database-source configuration for pipeline downloads.
+"""Database-source configuration for pipeline downloads and the research upload.
 
 Connection secrets are resolved at runtime and are never logged.  The
 XpressFeed URL can be supplied directly in the ``COMPUSTAT`` environment
 variable or in a ``.env`` file in the current directory (or one of its
-parents).  Environment variables take precedence over the file.
+parents).  Environment variables take precedence over the file.  The research
+database the ``--db-update`` phase writes to is resolved the same way from
+``RESEARCH_UPDATE``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ class CompustatSource(StrEnum):
 
 
 COMPUSTAT_ENV_VAR = "COMPUSTAT"
+RESEARCH_UPDATE_ENV_VAR = "RESEARCH_UPDATE"
 RDS_STATEMENT_TIMEOUT_MS = "300000"
 
 
@@ -104,3 +107,32 @@ def get_xpressfeed_connection_info(*, dotenv_path: Path | None = None) -> str:
             "Set it in the environment or in the repository .env file."
         )
     return _normalise_xpressfeed_url(value)
+
+
+def get_research_update_connection_info(*, dotenv_path: Path | None = None) -> str:
+    """Resolve the research MSSQL connection URL for the database-update phase.
+
+    The value is returned unmodified: the target database is chosen solely by
+    this URL, so switching research_test -> research is a configuration change
+    only.  Special characters in the password must be percent-encoded, the same
+    constraint ``COMPUSTAT`` already carries.
+    """
+    value = os.environ.get(RESEARCH_UPDATE_ENV_VAR)
+    if not value:
+        env_file = dotenv_path or _find_dotenv()
+        if env_file is not None and env_file.is_file():
+            value = _read_dotenv_value(env_file, RESEARCH_UPDATE_ENV_VAR)
+    if not value:
+        raise RuntimeError(
+            f"Database update requested but {RESEARCH_UPDATE_ENV_VAR} is not set. "
+            "Set it in the environment or in the repository .env file."
+        )
+    parsed = urlsplit(value)
+    if parsed.scheme != "mssql+pyodbc":
+        raise ValueError(
+            f"{RESEARCH_UPDATE_ENV_VAR} must be an mssql+pyodbc SQLAlchemy URL; "
+            f"got scheme {parsed.scheme or '<missing>'!r}."
+        )
+    if not parsed.hostname or not parsed.path.strip("/"):
+        raise ValueError(f"{RESEARCH_UPDATE_ENV_VAR} must include a host and database name.")
+    return value

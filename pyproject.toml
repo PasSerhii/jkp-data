@@ -43,6 +43,9 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pyarrow>=16.1.0",
     "pycryptodomex>=3.23.0",
+    # Serves only dataupdate.py (research MSSQL upload). The Microsoft ODBC
+    # Driver for SQL Server must be installed on the host running --db-update.
+    "pyodbc>=5.0",
     "sqlalchemy>=1.4.49",
     "tqdm>=4.66.5",
     "typer>=0.15.0",

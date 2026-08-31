@@ -29,6 +29,7 @@ PIPELINE_PHASES = (
     "factor_models",
     "daily_characteristics",
     "final_outputs",
+    "database_update",
 )
 
 _F = TypeVar("_F", bound=Callable[..., Any])
