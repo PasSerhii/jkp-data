@@ -30,7 +30,7 @@ prepared that month and just need another host.
 This is the part with no obvious answer from reading the code, so it is spelled
 out in full.
 
-### The three variables
+### The four variables
 
 | Variable | What it is | Used by |
 |---|---|---|
@@ -51,12 +51,12 @@ this value only.
 ```
 your machine                          EC2 host                    container
 ────────────                          ────────                    ─────────
-.env  (3 keys)
+.env  (4 keys)
  │
  ├─ production-run.sh reads it directly for the gates,
  │  the FF refresh and the identifier capture
  │
- └─ launch.sh copies ONLY the COMPUSTAT line
+ └─ launch.sh copies the COMPUSTAT line (plus RESEARCH_UPDATE when DB_UPDATE=1)
         │
         ▼
     SSM SecureString  /jkp-data/<run-tag>/env
@@ -68,7 +68,11 @@ your machine                          EC2 host                    container
                                     └─ docker run --env-file ──▶ os.environ["COMPUSTAT"]
 ```
 
-The per-run parameter carries `COMPUSTAT` and nothing else, because in this mode
+The per-run parameter carries `COMPUSTAT` — plus `RESEARCH_UPDATE` when
+`DB_UPDATE=1` (the launcher requires it to name "ODBC Driver 18 for SQL
+Server", the driver baked into the image; the environment variable wins over
+the `.env` line, since a Windows workstation typically has driver 17) — and
+nothing else, because in this mode
 the host never needs WRDS — you already ran the FF refresh locally. The
 credential's plaintext never appears in an SSM command, in CloudTrail, or in the
 launcher's terminal, and there is no handshake that can stall.
@@ -78,12 +82,12 @@ launcher's terminal, and there is no handshake that can stall.
 ```
 your machine                          EC2 host                    container
 ────────────                          ────────                    ─────────
-.env  (3 keys)
+.env  (4 keys)
  │
  └─ put-production-credentials.sh   ← run ONCE, or again to rotate
         │
         ▼
-    SSM SecureString  /jkp-data/production/env   (all 3 keys, persistent)
+    SSM SecureString  /jkp-data/production/env   (all 4 keys, persistent)
         │
         │  read at every boot; the host does NOT delete it
         ▼
@@ -242,6 +246,7 @@ production-correct value; override only for a reason.
 | `END_DATE` | `2026-06-30` | Last month end to build. |
 | `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). |
 | `KEEP_INTERIM` | `1` | Keeps `interim/` and `raw/` and ships the accounting artefacts to S3. |
+| `DB_UPDATE` | `1` | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (currently `research_test`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
 | `MARKET` | `ondemand` | `spot` is available for a throwaway re-run; a reclaim on a delivery loses the run. |

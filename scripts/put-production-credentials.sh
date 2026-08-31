@@ -4,11 +4,21 @@
 #   scripts/put-production-credentials.sh          # from .env at the repo root
 #   scripts/put-production-credentials.sh --show   # print what is stored now
 #
-# Writes one SSM SecureString holding COMPUSTAT (the XpressFeed RDS) plus
-# ENV_USERNAME/ENV_PASSWORD (WRDS, for the Fama-French refresh). By default a
-# launch stages a per-run parameter and the host deletes it after reading, which
-# works only because a human runs the launcher. An unattended run has no such
-# human, so this parameter persists and the host keeps it after reading.
+# Writes one SSM SecureString holding COMPUSTAT (the XpressFeed RDS),
+# ENV_USERNAME/ENV_PASSWORD (WRDS, for the Fama-French refresh) and
+# RESEARCH_UPDATE (the research MSSQL database the --db-update phase writes
+# to). By default a launch stages a per-run parameter and the host deletes it
+# after reading, which works only because a human runs the launcher. An
+# unattended run has no such human, so this parameter persists and the host
+# keeps it after reading.
+#
+# A key exported in the environment overrides the .env line, matching the
+# precedence everywhere else in this repo. That is how RESEARCH_UPDATE gets
+# its container-specific form: the image ships "ODBC Driver 18 for SQL Server"
+# (bookworm has no driver 17), while a Windows workstation .env typically
+# names driver 17 -- so seed with the 18 form exported:
+#   RESEARCH_UPDATE='mssql+pyodbc://...?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes' \
+#     scripts/put-production-credentials.sh
 #
 # Run again to rotate: the parameter is overwritten in place and the next run
 # picks up the new value with no other change.
@@ -19,7 +29,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 REGION=eu-central-1
 PARAM=/jkp-data/production/env
-KEYS="COMPUSTAT ENV_USERNAME ENV_PASSWORD"
+KEYS="COMPUSTAT ENV_USERNAME ENV_PASSWORD RESEARCH_UPDATE"
 
 if [ "${1:-}" = "--show" ]; then
   # Names and lengths only. Printing the values would defeat the SecureString.
@@ -36,7 +46,11 @@ fi
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 for k in $KEYS; do
-  grep "^$k=" "$REPO/.env" >> "$TMP" || { echo "No $k= line in $REPO/.env" >&2; exit 1; }
+  if [ -n "${!k:-}" ]; then
+    printf '%s=%s\n' "$k" "${!k}" >> "$TMP"
+  else
+    grep "^$k=" "$REPO/.env" >> "$TMP" || { echo "No $k= line in $REPO/.env and \$$k not set" >&2; exit 1; }
+  fi
 done
 
 case "$(uname -s)" in

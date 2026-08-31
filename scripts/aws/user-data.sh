@@ -18,6 +18,7 @@ COUNTRIES="@@COUNTRIES@@"
 WORKERS="@@WORKERS@@"
 START_DATE="@@START_DATE@@"
 KEEP_INTERIM="@@KEEP_INTERIM@@"
+DB_UPDATE="@@DB_UPDATE@@"
 PARAM="@@PARAM@@"
 PARAM_EPHEMERAL="@@PARAM_EPHEMERAL@@"
 MARKET="@@MARKET@@"
@@ -178,6 +179,20 @@ The processed/ accounting copies are still uploaded; the interim originals are n
   fi
 fi
 
+# Same probe for --db-update: an older image would abort on the unknown option
+# and waste the entire run, so skip the upload rather than pass a flag the
+# image cannot parse.
+DB_FLAG=""
+if [ "$DB_UPDATE" = "1" ]; then
+  if docker run --rm "$IMAGE" build --help 2>/dev/null | grep -q -- "--db-update"; then
+    DB_FLAG="--db-update"
+  else
+    notify "JKP RUN: --db-update not supported by this image" \
+"$IMAGE predates --db-update, so the research database upload is skipped.
+The production CSVs are still written and uploaded to S3 as before."
+  fi
+fi
+
 START_EPOCH=$(date -u +%s)
 date -u -d "@$START_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" > /mnt/jkp-data/STARTED_AT
 notify "JKP RUN: started" "Started $(cat /mnt/jkp-data/STARTED_AT). Fresh download, no raw reuse."
@@ -196,6 +211,7 @@ docker run --name jkp-run \
   --production \
   ${WORKERS:+--daily-download-workers $WORKERS} \
   ${KEEP_FLAG} \
+  ${DB_FLAG} \
   --metrics-interval 30 \
   > /mnt/jkp-data/container.log 2>&1
 RC=$?

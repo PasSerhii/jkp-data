@@ -44,8 +44,21 @@ ENV PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:$PATH \
     HOME=/home/jkp
 
+# msodbcsql18: the Microsoft ODBC driver pyodbc needs for the --db-update
+# phase (research MSSQL upload). Driver 17 is not published for bookworm, so
+# the RESEARCH_UPDATE connection URL used in this container must name
+# "ODBC Driver 18 for SQL Server". curl/gnupg are only needed to add the
+# Microsoft apt repository and are purged again in the same layer.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libgomp1 tini \
+    && apt-get install --yes --no-install-recommends ca-certificates curl gnupg libgomp1 tini \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+       | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+       > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install --yes --no-install-recommends msodbcsql18 \
+    && apt-get purge --yes curl gnupg \
+    && apt-get autoremove --yes \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin jkp \
     && mkdir --parents /data /work \

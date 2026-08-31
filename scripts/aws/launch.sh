@@ -82,6 +82,13 @@ MARKET="${MARKET:-ondemand}"
 # Retain interim/ and raw/ so the accounting artefacts survive the run. Ignored
 # by images that predate --keep-interim; the host probes for it before starting.
 KEEP_INTERIM="${KEEP_INTERIM:-1}"
+# 1 passes --db-update: after the outputs are written, the production CSVs are
+# uploaded incrementally to the research MSSQL database named by the
+# RESEARCH_UPDATE URL in the credential parameter (currently research_test).
+# The URL must name "ODBC Driver 18 for SQL Server" -- that is the driver baked
+# into the image. Ignored by images that predate --db-update; the host probes
+# for it before starting. 0 skips the upload.
+DB_UPDATE="${DB_UPDATE:-1}"
 # Point at an existing SSM SecureString (see scripts/put-production-credentials.sh)
 # instead of staging one from .env. The host then keeps the parameter rather than
 # deleting it, which is what lets a scheduled run start with no human and no .env
@@ -111,8 +118,27 @@ if [ -n "$CREDENTIAL_PARAM" ]; then
   # check locally and a twenty-minute boot-and-die remotely.
   aws ssm get-parameter --region "$REGION" --name "$CREDENTIAL_PARAM" >/dev/null \
     || { echo "CREDENTIAL_PARAM $CREDENTIAL_PARAM not found in SSM; run scripts/put-production-credentials.sh" >&2; exit 1; }
+  if [ "$DB_UPDATE" = "1" ]; then
+    # The upload runs last, hours in; a wrong driver name would waste the whole
+    # run. The image ships only "ODBC Driver 18 for SQL Server". Grep, never
+    # print: the value is a SecureString for a reason.
+    aws ssm get-parameter --region "$REGION" --name "$CREDENTIAL_PARAM" --with-decryption \
+      --query Parameter.Value --output text \
+      | grep -q '^RESEARCH_UPDATE=.*ODBC+Driver+18+for+SQL+Server' \
+      || { echo "DB_UPDATE=1 but $CREDENTIAL_PARAM carries no RESEARCH_UPDATE naming ODBC Driver 18 (the image's driver). Re-seed with scripts/put-production-credentials.sh, or set DB_UPDATE=0." >&2; exit 1; }
+  fi
 else
   grep -q '^COMPUSTAT=' "$REPO/.env" || { echo "No COMPUSTAT= line in $REPO/.env" >&2; exit 1; }
+  if [ "$DB_UPDATE" = "1" ]; then
+    # Environment wins over the file, as everywhere in this repo. A workstation
+    # .env usually names driver 17 (the Windows install); the container has 18.
+    RESEARCH_UPDATE_VALUE="${RESEARCH_UPDATE:-$(grep '^RESEARCH_UPDATE=' "$REPO/.env" | cut -d= -f2- || true)}"
+    case "$RESEARCH_UPDATE_VALUE" in
+      *ODBC+Driver+18+for+SQL+Server*) ;;
+      "") echo "DB_UPDATE=1 but RESEARCH_UPDATE is not set (environment or .env). Set it or pass DB_UPDATE=0." >&2; exit 1 ;;
+      *) echo "DB_UPDATE=1 but RESEARCH_UPDATE does not name 'ODBC+Driver+18+for+SQL+Server' -- the only driver in the image. Export the driver-18 form (see scripts/put-production-credentials.sh) or pass DB_UPDATE=0." >&2; exit 1 ;;
+    esac
+  fi
 fi
 aws ecr describe-images --region "$REGION" --repository-name jkp-data \
   --image-ids imageTag=production >/dev/null \
@@ -196,6 +222,9 @@ trap cleanup EXIT
 if [ "$PARAM_EPHEMERAL" = "1" ]; then
   TMP="$(mktemp)"
   grep '^COMPUSTAT=' "$REPO/.env" > "$TMP"
+  if [ "$DB_UPDATE" = "1" ]; then
+    printf 'RESEARCH_UPDATE=%s\n' "$RESEARCH_UPDATE_VALUE" >> "$TMP"
+  fi
   aws ssm put-parameter --region "$REGION" --name "$PARAM" --type SecureString \
     --value "$(aws_file_uri "$TMP")" --overwrite >/dev/null
   rm -f "$TMP"
@@ -209,7 +238,7 @@ USER_DATA="$(mktemp)"
 sed -e "s|@@REGION@@|$REGION|g" -e "s|@@BUCKET@@|$BUCKET|g" -e "s|@@TOPIC@@|$TOPIC|g" \
     -e "s|@@IMAGE@@|$IMAGE|g" -e "s|@@RUN_TAG@@|$RUN_TAG|g" -e "s|@@COUNTRIES@@|$COUNTRIES|g" \
     -e "s|@@START_DATE@@|$START_DATE|g" -e "s|@@END_DATE@@|$END_DATE|g" -e "s|@@WORKERS@@|$WORKERS|g" \
-    -e "s|@@KEEP_INTERIM@@|$KEEP_INTERIM|g" -e "s|@@PARAM@@|$PARAM|g" \
+    -e "s|@@KEEP_INTERIM@@|$KEEP_INTERIM|g" -e "s|@@DB_UPDATE@@|$DB_UPDATE|g" -e "s|@@PARAM@@|$PARAM|g" \
     -e "s|@@MARKET@@|$MARKET|g" -e "s|@@PARAM_EPHEMERAL@@|$PARAM_EPHEMERAL|g" \
     -e "s|@@UNATTENDED@@|$UNATTENDED|g" \
     "$HERE/user-data.sh" | tr -d '\r' > "$USER_DATA"
@@ -238,7 +267,7 @@ cat <<EOF
 
 Launched. Instance: $INSTANCE   Artifacts: s3://$BUCKET/$RUN_TAG/
 Instance type: $INSTANCE_TYPE ($MARKET)   Workers: ${WORKERS:-config default}
-Keep interim: $KEEP_INTERIM   Countries to S3: ${COUNTRIES:-all (~95 GiB)}
+Keep interim: $KEEP_INTERIM   DB update: $DB_UPDATE   Countries to S3: ${COUNTRIES:-all (~95 GiB)}
 Credential: $PARAM $([ "$PARAM_EPHEMERAL" = 1 ] && echo "(per-run, host deletes it)" || echo "(persistent, host keeps it)")
 Unattended prep on host: $([ "$UNATTENDED" = 1 ] && echo "yes (readiness poll, FF refresh, identifier capture)" || echo "no")
 
