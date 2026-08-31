@@ -10104,8 +10104,17 @@ def save_monthly_ret(paths: DataPaths):
 
     Output:
         Parquet file with monthly returns by country/security.
+
+    Note:
+        Reads the UNFILTERED world_msf, not world_msf_output. The production SAS
+        (save_monthly_ret_csv) exports scratch.world_msf with no screen, so the
+        file includes non-common securities (ETFs, funds, preferred, warrants),
+        secondary listings, and non-main-exchange observations — roughly half
+        the rows. The main filters exist in this file only as flag inputs
+        further upstream; applying them here dropped ~53k rows per month
+        relative to the SAS output.
     """
-    data = pl.scan_parquet(paths.interim_dir / "world_msf_output.parquet").select(
+    data = pl.scan_parquet(paths.interim_dir / "world_msf.parquet").select(
         ["excntry", "id", "source_crsp", "eom", "ret_exc", "ret", "ret_local"]
     )
     monthly = data.select(pl.all().shrink_dtype()).collect()

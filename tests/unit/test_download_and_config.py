@@ -583,7 +583,7 @@ class TestSaveMonthlyRet:
                 "ret_local": [0.03],
                 "ret_exc_wins": [0.011],
             }
-        ).write_parquet(test_paths.interim_dir / "world_msf_output.parquet")
+        ).write_parquet(test_paths.interim_dir / "world_msf.parquet")
 
         save_monthly_ret(test_paths)
 
@@ -596,6 +596,45 @@ class TestSaveMonthlyRet:
         csv_out = test_paths.production_dir / "world_ret_monthly.csv"
         assert csv_out.exists()
         assert [c.strip('"') for c in csv_out.read_text().splitlines()[0].split(",")] == expected
+
+    def test_monthly_return_uses_unfiltered_world_msf(self, test_paths):
+        """The SAS export takes scratch.world_msf with no screen: non-main
+        securities (ETFs, secondary listings, non-main exchanges) must be kept."""
+        from jkp.data.aux_functions import save_monthly_ret
+
+        base = {
+            "source_crsp": [0, 0, 0],
+            "eom": [date(2020, 1, 31)] * 3,
+            "ret_exc": [0.01, 0.02, 0.03],
+            "ret": [0.02, 0.03, 0.04],
+            "ret_local": [0.03, 0.04, 0.05],
+        }
+        unfiltered = pl.DataFrame(
+            {
+                "excntry": ["USA", "USA", "DEU"],
+                "id": [1, 2, 3],
+                # id 2 is an ETF (common=0), id 3 a non-main-exchange listing.
+                "primary_sec": [1, 1, 1],
+                "common": [1, 0, 1],
+                "obs_main": [1, 1, 1],
+                "exch_main": [1, 1, 0],
+                **base,
+            }
+        )
+        unfiltered.write_parquet(test_paths.interim_dir / "world_msf.parquet")
+        unfiltered.filter(
+            (pl.col("primary_sec") == 1)
+            & (pl.col("common") == 1)
+            & (pl.col("obs_main") == 1)
+            & (pl.col("exch_main") == 1)
+        ).write_parquet(test_paths.interim_dir / "world_msf_output.parquet")
+
+        save_monthly_ret(test_paths)
+
+        output = pl.read_parquet(
+            test_paths.processed_dir / "return_data" / "world_ret_monthly.parquet"
+        )
+        assert sorted(output["id"].to_list()) == [1, 2, 3]
 
 
 class TestSaveOutputFiles:
