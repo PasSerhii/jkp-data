@@ -76,6 +76,46 @@ def test_compustat_delist_within_download_uses_last_nonzero_return(test_paths) -
     ]
 
 
+def test_delist_fires_when_vendor_date_trails_the_security_but_not_the_panel(
+    test_paths,
+) -> None:
+    """A mid-panel delist must be cut even though its vendor date is after its last trade.
+
+    Compustat stamps the inactivation date *after* the security's final observation
+    in 99.3% of delistings, so comparing it against that security's own coverage
+    never fires and silently drops both the truncation and the -0.30 delisting
+    return. The comparison must be against the end of the panel. The single-security
+    cases above cannot catch this: there, panel end and security end coincide.
+    """
+    pl.DataFrame(
+        {
+            "gvkey": ["001000", "002000"],
+            "iid": ["01", "01"],
+            "secstat": ["I", "A"],
+            "dlrsni": ["02", None],
+            # inactive 3 days after its own last trade, but well inside the panel
+            "dldtei": [date(2026, 6, 18), None],
+        }
+    ).write_parquet(test_paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
+    returns = pl.DataFrame(
+        {
+            "gvkey": ["001000", "001000", "002000"],
+            "iid": ["01", "01", "01"],
+            # 001000 stops trading on 06-15; 002000 carries the panel to 07-31
+            "datadate": [date(2026, 6, 12), date(2026, 6, 15), date(2026, 7, 31)],
+            "ret": [0.01, 0.02, 0.03],
+            "ret_local": [0.01, 0.02, 0.03],
+            "ret_lag_dif": [1, 1, 1],
+        }
+    )
+
+    result = gen_delist_df(test_paths, returns)
+
+    assert result.to_dicts() == [
+        {"gvkey": "001000", "iid": "01", "date_delist": date(2026, 6, 15), "dlret": -0.3}
+    ]
+
+
 def test_ff_portfolio_pivot_adds_missing_buckets_as_typed_nulls() -> None:
     """Sparse country samples must not fail when a size/characteristic bucket is absent."""
     pivoted = pl.DataFrame(
