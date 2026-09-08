@@ -55,6 +55,14 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
      sbatch slurm/submit_job_som_hpc.slurm
      ```
      to create the factor returns, stock returns, and firm characteristics.
+     The script writes to `data/` by default. To use a different output directory, pass
+     `--output-dir`: `sbatch slurm/submit_job_som_hpc.slurm --output-dir /path/to/output`.
+     Relative paths resolve against the directory you submit from, and the resolved
+     destination is echoed in the job log. The script rejects unrecognized options and
+     stray arguments, so a mistyped flag or an unquoted path containing a space fails
+     immediately instead of writing to the wrong place. It parses options with the
+     enhanced (util-linux) `getopt`, which is present by default on mainstream Linux
+     distributions but is not a dependency of the `jkp` package itself.
      Note that the batch script passes `--force` to `jkp build`, so it overwrites an
      existing output directory without prompting (an interactive `jkp build` asks first).
 
@@ -90,6 +98,9 @@ Please see the release notes (`documentation/release_notes.html`) for a descript
 
   # Slurm job (set environment variable)
   sbatch --export=ALL,PERSISTENT_WRDS_CONNECTION=1 slurm/submit_job_som_hpc.slurm
+
+  # Slurm job with a custom output directory
+  sbatch --export=ALL,PERSISTENT_WRDS_CONNECTION=1 slurm/submit_job_som_hpc.slurm --output-dir /path/to/output
   ```
   This reduces MFA prompts from ~26 (one per table) to just 1 (at connection time).
 
