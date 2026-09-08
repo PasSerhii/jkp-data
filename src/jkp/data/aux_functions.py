@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
+import hashlib
+import itertools
+import json
 import operator
 import os
+import queue
 import re
 import shutil
+import threading
 import time
-from datetime import date
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from math import exp, sqrt
 from pathlib import Path
 
@@ -18,9 +27,138 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
-from .config import COLLECT_CHUNK_SIZE, END_DATE, MAIN_FILTERS
+from .config import (
+    COLLECT_CHUNK_SIZE,
+    END_DATE,
+    MAIN_FILTERS,
+    MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
+)
 from .output_writer import write_dataframe
 from .paths import DataPaths
+from .runtime_monitor import get_active_monitor
+from .wrds_credentials import WRDS_DB, WRDS_HOST, WRDS_PORT
+
+# Frozen pipeline input contract for the three largest Compustat downloads.
+# Keeping the projection here makes the production downloader independent of
+# validation scripts and prevents unused WRDS-compatibility columns from being
+# transferred to every run.
+LARGE_COMPUSTAT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "comp.secd": (
+        "ajexdi",
+        "conm",
+        "cshoc",
+        "cshtrd",
+        "curcdd",
+        "curcddv",
+        "cusip",
+        "datadate",
+        "div",
+        "divd",
+        "divsp",
+        "exchg",
+        "gvkey",
+        "iid",
+        "prccd",
+        "prchd",
+        "prcld",
+        "prcod",
+        "prcstd",
+        "tpci",
+        "trfd",
+    ),
+    "comp.g_secd": (
+        "ajexdi",
+        "conm",
+        "cshoc",
+        "cshtrd",
+        "curcdd",
+        "curcddv",
+        "datadate",
+        "div",
+        "divd",
+        "divsp",
+        "exchg",
+        "gvkey",
+        "iid",
+        "isin",
+        "monthend",
+        "prccd",
+        "prchd",
+        "prcld",
+        "prcod",
+        "prcstd",
+        "qunit",
+        "sedol",
+        "tpci",
+        "trfd",
+    ),
+    "comp.secm": (
+        "ajexm",
+        "csfsm",
+        "cshom",
+        "cshoq",
+        "cshtrm",
+        "curcddvm",
+        "curcdm",
+        "datadate",
+        "dvpsxm",
+        "exchg",
+        "gvkey",
+        "iid",
+        "prccm",
+        "prchm",
+        "prclm",
+        "tpci",
+        "trfm",
+    ),
+}
+
+DAILY_COMPUSTAT_PAIR_HEADERS = {
+    "comp.secd": "comp.security",
+    "comp.g_secd": "comp.g_security",
+}
+# 350 pairs per batch. Each batch is one query against the secd/g_secd views, and
+# only g_secd carries a measurable fixed cost per query (~2.5s, against ~1.79s per
+# MiB of payload), so larger batches amortise that away. The ceiling is the 300s
+# statement timeout in with_pg_statement_timeout: at 250 pairs the slowest observed
+# batch was 64.6s, so 350 projects to ~90s and leaves a 3.3x margin before a batch
+# would be killed. Raise this only with that margin recomputed from a real run.
+DAILY_COMPUSTAT_BATCH_SIZE = 350
+DAILY_COMPUSTAT_BATCH_MAX_RETRIES = 3
+DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0)
+
+REUSABLE_COMPUSTAT_TABLES: tuple[str, ...] = (
+    "comp.exrt_dly",
+    "ff.factors_monthly",
+    "comp.g_security",
+    "comp.security",
+    "comp.r_ex_codes",
+    "comp.g_sec_history",
+    "comp.sec_history",
+    "comp.sec_id_history",
+    "comp.company",
+    "comp.g_company",
+    "comp.funda",
+    "comp.fundq",
+    "comp.secm",
+    "comp.g_co_hgic",
+    "comp.g_funda",
+    "comp.co_hgic",
+    "comp.g_fundq",
+    "comp.secd",
+    "comp.g_secd",
+)
+
+REUSABLE_CRSP_TABLES: tuple[str, ...] = (
+    "crsp.stksecurityinfohist",
+    "crsp.stkissuerinfohist",
+    "crsp.ccmxpf_lnkhist",
+    "crsp.stkdelists",
+    "crsp.indmthseriesdata_ind",
+    "crsp.indseriesinfohdr_ind",
+    "crsp.msf_v2",
+    "crsp.dsf_v2",
+)
 
 
 def fl_none():
@@ -34,41 +172,74 @@ def bo_false():
 def measure_time(func):
     """
     Description:
-        Decorator to time a function and print start/end timestamps and elapsed minutes:seconds.
+        Decorator recording a function as a monitored pipeline step, falling back to
+        printing timings when no monitor is active.
 
     Steps:
-        1) Record start time and print function name + start.
-        2) Execute the wrapped function and capture result.
-        3) Record end time; compute and print duration.
+        1) Resolve the step name, honouring a caller-supplied ``_step_name``.
+        2) Open a monitor step, or print a single start line when unmonitored.
+        3) Execute the wrapped function, closing the step on success or failure.
         4) Return the original result.
 
     Output:
-        Prints timing info to stdout; returns wrapped function's result.
+        Rows in step_timings.csv when monitored; otherwise one-line timings on
+        stdout. Returns the wrapped function's result unchanged.
+
+    Notes:
+        Pass ``_step_name="label"`` to distinguish repeated calls of the same
+        function -- ``roll_apply_daily`` runs 19 times over different (window,
+        variable) pairs, and three of those share the ``zero_trades`` variable, so
+        the bare function name cannot tell them apart. The kwarg is consumed here
+        and never reaches the wrapped function.
+
+        Output is written as single atomic lines. The rolling-daily fan-out runs
+        these on four worker threads, and the previous multi-line form interleaved
+        into unreadable fragments.
     """
 
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        step_name = kwargs.pop("_step_name", None) or func.__name__
+        monitor = get_active_monitor()
+        step_token = monitor.step_started(step_name) if monitor is not None else None
         start_time = time.time()
-        print(f"Function       : {func.__name__.upper()}", flush=True)
+        if monitor is None:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+            print(f"START {step_name} at {stamp}", flush=True)
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as error:
+            if monitor is not None and step_token is not None:
+                monitor.step_finished(step_token, error)
+            else:
+                elapsed = time.time() - start_time
+                print(
+                    f"FAILED {step_name} after {elapsed:.2f}s "
+                    f"type={type(error).__name__} message={error}",
+                    flush=True,
+                )
+            raise
+        if monitor is not None and step_token is not None:
+            monitor.step_finished(step_token)
+            return result
+        total_seconds = time.time() - start_time
+        minutes, seconds = divmod(total_seconds, 60)
         print(
-            f"Start          : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}",
+            f"END {step_name} in {int(minutes)}m {seconds:.2f}s",
             flush=True,
         )
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        print(
-            f"End            : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}",
-            flush=True,
-        )
-        # Calculate total seconds
-        total_seconds = end_time - start_time
-        # Calculate minutes and seconds
-        minutes = int(total_seconds // 60)
-        seconds = total_seconds % 60
-        print(f"Execution time : {minutes} minutes and {seconds:.2f} seconds", flush=True)
-        print()
         return result
 
     return wrapper
+
+
+def _report_progress(message: str) -> None:
+    """Write progress to the durable run log when a monitored build is active."""
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.note(message)
+    else:
+        print(message, flush=True)
 
 
 @measure_time
@@ -78,7 +249,8 @@ def setup_folder_structure(paths: DataPaths) -> None:
         Create the pipeline's folder structure under the user-specified output directory.
 
     Steps:
-        1) Create directories: raw_tables, raw_data_dfs, characteristics, return_data, accounting_data, other_output, portfolios.
+        1) Create directories: raw_tables, raw_data_dfs, characteristics, return_data,
+           accounting_data, other_output, portfolios, production/{monthly,daily}.
         2) Copy the data README (license and citation info) into the output directory.
 
     Output:
@@ -96,6 +268,9 @@ def setup_folder_structure(paths: DataPaths) -> None:
     (paths.processed_dir / "accounting_data").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "other_output").mkdir(parents=True, exist_ok=True)
     (paths.processed_dir / "portfolios").mkdir(parents=True, exist_ok=True)
+    paths.production_dir.mkdir(parents=True, exist_ok=True)
+    (paths.production_dir / "monthly").mkdir(exist_ok=True)
+    (paths.production_dir / "daily").mkdir(exist_ok=True)
     shutil.copy2(get_data_readme_path(), paths.base_dir / "README.md")
 
 
@@ -117,6 +292,14 @@ def collect_and_write(df, filename, collect_streaming=False):
         Parquet file at `filename`.
     """
     df.collect(streaming=collect_streaming).write_parquet(filename)
+
+
+def _write_sas_csv(df: pl.DataFrame | pl.LazyFrame, path: Path) -> None:
+    """Write a SAS-style CSV with quoted strings and blank nulls."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(df, pl.LazyFrame):
+        df = df.collect(engine="streaming")
+    df.write_csv(path, quote_style="non_numeric", null_value="")
 
 
 def sic_naics_aux(filename):
@@ -200,7 +383,7 @@ def sec_info_aux(filename):
     Output:
         LazyFrame of security status fields.
     """
-    df = pl.scan_parquet(filename).select(["gvkey", "iid", "secstat", "dlrsni"])
+    df = pl.scan_parquet(filename).select(["gvkey", "iid", "secstat", "dlrsni", "dldtei"])
     return df
 
 
@@ -315,10 +498,14 @@ def gen_prihist_files(paths: DataPaths):
         1) Load comp_sec_history and comp_g_sec_history into DuckDB.
         2) Create three tables by item code: PRIHISTROW (global), PRIHISTUSA (NA), PRIHISTCAN (NA).
         3) Keep gvkey, itemvalue→flag, effdate, thrudate.
-        4) Write each to raw_data_dfs as separate Parquet files.
+        4) Combine issue-level EXCHG intervals into __exchg_history; fail the
+           build if no EXCHG interval parses (empty history would silently
+           disable point-in-time exchange resolution).
+        5) Write each to raw_data_dfs as separate Parquet files.
 
     Output:
-        Parquets: __prihistrow.parquet, __prihistusa.parquet, __prihistcan.parquet.
+        Parquets: __prihistrow.parquet, __prihistusa.parquet,
+        __prihistcan.parquet, and __exchg_history.parquet.
     """
     con = ibis.duckdb.connect(threads=os.cpu_count())
     con.create_table(
@@ -364,6 +551,58 @@ def gen_prihist_files(paths: DataPaths):
     con.table("__prihistcan").to_parquet(
         paths.interim_dir / "raw_data_dfs" / "__prihistcan.parquet"
     )
+    con.raw_sql("""
+    CREATE TABLE __exchg_history AS
+    SELECT DISTINCT
+        gvkey,
+        iid,
+        -- DuckDB's varchar->int TRY_CAST also parses decimal-formatted
+        -- codes such as '11.0000' and whitespace-padded values
+        TRY_CAST(itemvalue AS INTEGER) AS historical_exchg,
+        effdate,
+        thrudate
+    FROM (
+        SELECT gvkey, iid, itemvalue, effdate, thrudate
+        FROM comp_sec_history
+        WHERE item = 'EXCHG'
+
+        UNION ALL
+
+        SELECT gvkey, iid, itemvalue, effdate, thrudate
+        FROM comp_g_sec_history
+        WHERE item = 'EXCHG'
+    ) history
+    WHERE TRY_CAST(itemvalue AS INTEGER) IS NOT NULL;
+    """)
+    # An empty exchange history would make _register_historical_exchange_view
+    # silently fall back to current-header EXCHG everywhere, reintroducing the
+    # point-in-time eligibility bug. Fail the build instead.
+    exchg_counts = pl.from_arrow(
+        con.raw_sql("""
+        SELECT
+            (SELECT COUNT(*) FROM __exchg_history) AS resolved,
+            (SELECT COUNT(*)
+             FROM (SELECT item FROM comp_sec_history
+                   UNION ALL
+                   SELECT item FROM comp_g_sec_history) all_items
+             WHERE item = 'EXCHG') AS raw
+        """).arrow()
+    )
+    resolved = int(exchg_counts["resolved"][0])
+    raw = int(exchg_counts["raw"][0])
+    if resolved == 0:
+        detail = (
+            f"none of the {raw} EXCHG itemvalues parsed as an integer exchange code"
+            if raw
+            else "the sec_history sources contain no EXCHG rows"
+        )
+        raise RuntimeError(
+            "__exchg_history is empty; point-in-time exchange resolution would "
+            f"silently fall back to current headers ({detail})"
+        )
+    con.table("__exchg_history").to_parquet(
+        paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet"
+    )
     con.disconnect()
 
 
@@ -402,8 +641,42 @@ def gen_fx1(paths: DataPaths):
     con.disconnect()
 
 
+def _record_ff_snapshot(paths: DataPaths) -> None:
+    """Persist the exact FF/RF input identity used by this pipeline run."""
+    source_path = paths.raw_tables_dir / "ff_factors_monthly.parquet"
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    factors = pl.read_parquet(source_path, columns=["date", "rf"]).sort("date")
+    latest = factors.tail(1)
+    manifest = {
+        "source": "ff.factors_monthly",
+        "sha256": digest.hexdigest(),
+        "bytes": source_path.stat().st_size,
+        "row_count": factors.height,
+        "min_date": str(factors["date"].min()) if factors.height else None,
+        "max_date": str(factors["date"].max()) if factors.height else None,
+        "latest_rf": float(latest["rf"][0])
+        if latest.height and latest["rf"][0] is not None
+        else None,
+    }
+    manifest_path = paths.base_dir / "source_snapshot_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.note(
+            "FF snapshot "
+            f"max_date={manifest['max_date']} latest_rf={manifest['latest_rf']} "
+            f"sha256={manifest['sha256']}"
+        )
+
+
 @measure_time
-def gen_raw_data_dfs(paths: DataPaths):
+def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
     """
     Description:
         Generate a suite of “raw data” helper Parquet files from Compustat/CRSP sources.
@@ -418,6 +691,11 @@ def gen_raw_data_dfs(paths: DataPaths):
         5) Standardize types/columns, sort/deduplicate where needed.
         6) Write all to raw_data_dfs/*.parquet.
 
+    When ``bypass_crsp`` is True, all CRSP-derived helper files (permno0,
+    crsp_*sedelist, crsp_mcti_t30ret, the augmented CRSP monthly file, and the
+    CRSP security files) are skipped, since the dataset is built from Compustat
+    only. See config.BYPASS_CRSP.
+
     Output:
         Multiple helper Parquets under raw_data_dfs/ used in later pipelines.
     """
@@ -426,50 +704,56 @@ def gen_raw_data_dfs(paths: DataPaths):
     collect_and_write(sic_naics_na, paths.interim_dir / "raw_data_dfs" / "sic_naics_na.parquet")
     sic_naics_gl = sic_naics_aux(paths.raw_tables_dir / "comp_g_funda.parquet")
     collect_and_write(sic_naics_gl, paths.interim_dir / "raw_data_dfs" / "sic_naics_gl.parquet")
-    permno0 = (
-        pl.scan_parquet(paths.raw_tables_dir / "crsp_stksecurityinfohist.parquet")
-        .select(
-            [
-                col("permno").cast(pl.Int64),
-                col("permco").cast(pl.Int64),
-                "secinfostartdt",
-                "secinfoenddt",
-                col("siccd").cast(pl.Int64).alias("sic"),
-                col("naics").cast(pl.Int64),
-            ]
+    if not bypass_crsp:
+        permno0 = (
+            pl.scan_parquet(paths.raw_tables_dir / "crsp_stksecurityinfohist.parquet")
+            .select(
+                [
+                    col("permno").cast(pl.Int64),
+                    col("permco").cast(pl.Int64),
+                    "secinfostartdt",
+                    "secinfoenddt",
+                    col("siccd").cast(pl.Int64).alias("sic"),
+                    col("naics").cast(pl.Int64),
+                ]
+            )
+            .unique()
+            .sort(["permno", "secinfostartdt", "secinfoenddt"])
         )
-        .unique()
-        .sort(["permno", "secinfostartdt", "secinfoenddt"])
-    )
-    collect_and_write(permno0, paths.interim_dir / "raw_data_dfs" / "permno0.parquet")
+        collect_and_write(permno0, paths.interim_dir / "raw_data_dfs" / "permno0.parquet")
     comp_hgics_na = comp_hgics_aux(paths.raw_tables_dir / "comp_co_hgic.parquet")
     collect_and_write(comp_hgics_na, paths.interim_dir / "raw_data_dfs" / "comp_hgics_na.parquet")
     comp_hgics_gl = comp_hgics_aux(paths.raw_tables_dir / "comp_g_co_hgic.parquet")
     collect_and_write(comp_hgics_gl, paths.interim_dir / "raw_data_dfs" / "comp_hgics_gl.parquet")
-    crsp_dsedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
-        [
-            "delret",
-            "delactiontype",
-            "delstatustype",
-            "delreasontype",
-            "delpaymenttype",
-            col("permno").cast(pl.Int64),
-            "delistingdt",
-        ]
-    )
-    collect_and_write(crsp_dsedelist, paths.interim_dir / "raw_data_dfs" / "crsp_dsedelist.parquet")
-    crsp_msedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
-        [
-            "delret",
-            "delactiontype",
-            "delstatustype",
-            "delreasontype",
-            "delpaymenttype",
-            col("permno").cast(pl.Int64),
-            "delistingdt",
-        ]
-    )
-    collect_and_write(crsp_msedelist, paths.interim_dir / "raw_data_dfs" / "crsp_msedelist.parquet")
+    if not bypass_crsp:
+        crsp_dsedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
+            [
+                "delret",
+                "delactiontype",
+                "delstatustype",
+                "delreasontype",
+                "delpaymenttype",
+                col("permno").cast(pl.Int64),
+                "delistingdt",
+            ]
+        )
+        collect_and_write(
+            crsp_dsedelist, paths.interim_dir / "raw_data_dfs" / "crsp_dsedelist.parquet"
+        )
+        crsp_msedelist = pl.scan_parquet(paths.raw_tables_dir / "crsp_stkdelists.parquet").select(
+            [
+                "delret",
+                "delactiontype",
+                "delstatustype",
+                "delreasontype",
+                "delpaymenttype",
+                col("permno").cast(pl.Int64),
+                "delistingdt",
+            ]
+        )
+        collect_and_write(
+            crsp_msedelist, paths.interim_dir / "raw_data_dfs" / "crsp_msedelist.parquet"
+        )
     __sec_info = pl.concat(
         [
             sec_info_aux(paths.raw_tables_dir / "comp_security.parquet"),
@@ -477,19 +761,28 @@ def gen_raw_data_dfs(paths: DataPaths):
         ]
     )
     collect_and_write(__sec_info, paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
-    build_mcti(paths)
-    crsp_mcti_t30ret = pl.scan_parquet(
-        paths.interim_dir / "raw_data_dfs" / "crsp_mcti.parquet"
-    ).select(["caldt", "t30ret"])
-    collect_and_write(
-        crsp_mcti_t30ret, paths.interim_dir / "raw_data_dfs" / "crsp_mcti_t30ret.parquet"
-    )
+    if not bypass_crsp:
+        build_mcti(paths)
+        # Float64 for the same reason as rf below: t30ret is divided by the
+        # daily scale and must not inherit a decimal operand's scale.
+        crsp_mcti_t30ret = pl.scan_parquet(
+            paths.interim_dir / "raw_data_dfs" / "crsp_mcti.parquet"
+        ).select([col("caldt"), col("t30ret").cast(pl.Float64)])
+        collect_and_write(
+            crsp_mcti_t30ret, paths.interim_dir / "raw_data_dfs" / "crsp_mcti_t30ret.parquet"
+        )
+    # Cast rf out of the source DECIMAL(7,5). Decimal arithmetic keeps the
+    # operand's scale, so the daily `rf / 21` would round 0.00014761904 to
+    # 0.00015 — a 1.6% overstatement of the daily risk-free rate applied to
+    # every daily excess return, while the monthly path (scale 1, no division)
+    # stayed exact. The two disagreed in the same output.
     ff_factors_monthly = pl.scan_parquet(
         paths.raw_tables_dir / "ff_factors_monthly.parquet"
-    ).select(["date", "rf"])
+    ).select([col("date"), col("rf").cast(pl.Float64)])
     collect_and_write(
         ff_factors_monthly, paths.interim_dir / "raw_data_dfs" / "ff_factors_monthly.parquet"
     )
+    _record_ff_snapshot(paths)
     comp_r_ex_codes = pl.scan_parquet(paths.raw_tables_dir / "comp_r_ex_codes.parquet").select(
         ["exchgdesc", "exchgcd"]
     )
@@ -510,9 +803,14 @@ def gen_raw_data_dfs(paths: DataPaths):
     )
     gen_prihist_files(paths)
     gen_fx1(paths)
-    aug_msf_v2(paths)
-    gen_crsp_sf(paths, "m").to_parquet(paths.interim_dir / "raw_data_dfs" / "__crsp_sf_m.parquet")
-    gen_crsp_sf(paths, "d").to_parquet(paths.interim_dir / "raw_data_dfs" / "__crsp_sf_d.parquet")
+    if not bypass_crsp:
+        aug_msf_v2(paths)
+        gen_crsp_sf(paths, "m").to_parquet(
+            paths.interim_dir / "raw_data_dfs" / "__crsp_sf_m.parquet"
+        )
+        gen_crsp_sf(paths, "d").to_parquet(
+            paths.interim_dir / "raw_data_dfs" / "__crsp_sf_d.parquet"
+        )
 
 
 def gen_crsp_sf(paths: DataPaths, freq):
@@ -553,6 +851,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
         cfacshr_expr = sf.mthcumfacshr
         askhi_expr = sf.mthaskhi
         bidlo_expr = sf.mthbidlo
+        open_expr = None
+        close_expr = None
     else:  # freq == "d", validated above
         date_expr = sf.dlycaldt.cast("date")
         prc_expr = sf.dlyprc
@@ -563,6 +863,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
         cfacshr_expr = sf.dlycumfacshr
         askhi_expr = sf.dlyhigh
         bidlo_expr = sf.dlylow
+        open_expr = sf.dlyopen
+        close_expr = sf.dlyclose
 
     sf_senames_join = sf.join(
         senames,
@@ -606,24 +908,24 @@ def gen_crsp_sf(paths: DataPaths, freq):
         & (issuertype_expr.isin(["ACOR", "CORP"]))
     )
 
-    shrcd_expr = ibis.cases(
-        (is_common_expr, 10),
-        else_=ibis.null(),
-    ).cast("int32")
-
     primaryexch_expr = sf.primaryexch
     conditionaltype_expr = sf.conditionaltype
 
     exch_main_expr = (primaryexch_expr.isin(["A", "N", "Q"]) & (conditionaltype_expr == "RW")).cast(
         "int32"
     )
+    crsp_nyse_expr = ((primaryexch_expr == "N") & (conditionaltype_expr == "RW")).cast("int32")
 
-    exchcd_expr = ibis.cases(
-        ((primaryexch_expr == "N") & (conditionaltype_expr == "RW"), 1),
-        ((primaryexch_expr == "A") & (conditionaltype_expr == "RW"), 2),
-        ((primaryexch_expr == "Q") & (conditionaltype_expr == "RW"), 3),
-        else_=ibis.null(),
-    ).cast("int32")
+    prc_open_mutate = (
+        ibis.cases(((prc_expr > 0) & (open_expr > 0), open_expr), else_=ibis.null())
+        if open_expr is not None
+        else ibis.null()
+    )
+    prc_close_mutate = (
+        ibis.cases(((prc_expr > 0) & (close_expr > 0), close_expr), else_=ibis.null())
+        if close_expr is not None
+        else ibis.null()
+    )
 
     result = full_join.mutate(
         date=date_expr,
@@ -633,14 +935,18 @@ def gen_crsp_sf(paths: DataPaths, freq):
         me=(prc_expr * (sf.shrout / 1000)),
         prc_high=ibis.cases(((prc_expr > 0) & (askhi_expr > 0), askhi_expr), else_=ibis.null()),
         prc_low=ibis.cases(((prc_expr > 0) & (bidlo_expr > 0), bidlo_expr), else_=ibis.null()),
+        prc_open=prc_open_mutate,
+        prc_close=prc_close_mutate,
         iid=ccmxpf_lnkhist.liid,
         ret=ret_expr,
         retx=retx_expr,
         cfacshr=cfacshr_expr,
         vol=vol_expr,
-        exchcd=exchcd_expr,
+        common=is_common_expr.cast("int32"),
+        primaryexch=primaryexch_expr,
+        conditionaltype=conditionaltype_expr,
         exch_main=exch_main_expr,
-        shrcd=shrcd_expr,
+        crsp_nyse=crsp_nyse_expr,
         gvkey=ccmxpf_lnkhist.gvkey,
     ).select(
         [
@@ -649,6 +955,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
             "date",
             "bidask",
             "prc",
+            "prc_open",
+            "prc_close",
             "shrout",
             "ret",
             "retx",
@@ -656,11 +964,13 @@ def gen_crsp_sf(paths: DataPaths, freq):
             "vol",
             "prc_high",
             "prc_low",
-            "exchcd",
+            "common",
+            "primaryexch",
+            "conditionaltype",
+            "crsp_nyse",
             "gvkey",
             "iid",
             "exch_main",
-            "shrcd",
             "me",
             "ticker",
         ]
@@ -668,18 +978,92 @@ def gen_crsp_sf(paths: DataPaths, freq):
     return result
 
 
-def gen_wrds_connection_info(user, password):
-    return (
-        f"host=wrds-pgdata.wharton.upenn.edu "
-        f"port=9737 dbname=wrds "
-        f"user={user} password={password} sslmode=require"
-    )
+def _pg_escape_value(value: str) -> str:
+    """libpq-escape a conninfo value (user or password) for a single-quoted field.
+
+    libpq accepts single-quoted values with backslash-escaped ``\\`` and ``'``,
+    so quoting lets a value hold spaces or special characters without breaking the
+    conninfo. For the password this is also the form that appears in any error text
+    echoing the connection string, so the credential-masking checks reuse it rather
+    than matching the raw password.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _sql_literal(value: str) -> str:
+    """Escape a string for embedding inside a single-quoted DuckDB SQL literal.
+
+    The conninfo is interpolated into ``ATTACH '...'`` / ``postgres_scan('...')``
+    SQL, so any single quote it contains (e.g. around a libpq-quoted password)
+    must be doubled or it terminates the SQL string literal.
+    """
+    return value.replace("'", "''")
+
+
+def gen_wrds_connection_info(user, password: str | None = None) -> str:
+    """Build a libpq conninfo for WRDS.
+
+    When ``password`` is ``None`` the ``password=`` field is omitted, so libpq
+    authenticates from ``$PGPASSFILE`` / ``~/.pgpass`` instead.
+    """
+    parts = [
+        f"host={WRDS_HOST}",
+        f"port={WRDS_PORT}",
+        f"dbname={WRDS_DB}",
+        # Quote the username too: a space or quote in it would otherwise break
+        # libpq's conninfo parsing exactly as an unquoted password would.
+        f"user='{_pg_escape_value(user)}'",
+    ]
+    if password is not None:
+        # Single-quote and escape so a password containing spaces or special
+        # characters can't break the conninfo (or split the value, which would
+        # defeat the password-masking check in _attach_wrds). The conninfo is
+        # itself embedded in a single-quoted SQL literal at each use site, so
+        # callers must additionally pass it through _sql_literal.
+        parts.append(f"password='{_pg_escape_value(password)}'")
+    parts.append("sslmode=require")
+    return " ".join(parts)
+
+
+def _password_forms(password: str) -> tuple[str, str, str]:
+    """The forms the password can take on its way into an error message: raw, the
+    libpq-escaped conninfo form (echoed by a connection IOException), and the
+    SQL-escaped-then-libpq-escaped form (echoed from the raw statement text by a
+    parser error). Ordered most-escaped first so redaction replaces the longest
+    match before its shorter substrings."""
+    escaped = _pg_escape_value(password)
+    return (_sql_literal(escaped), escaped, password)
+
+
+def _password_in_error(text: str, password: str) -> bool:
+    """True if the password appears in ``text`` in any of the forms it can take in
+    an error message (see :func:`_password_forms`)."""
+    return any(form in text for form in _password_forms(password))
+
+
+def _redact_password(text: str, password: str) -> str:
+    """Replace the password with ``***`` in every form it can take in an error
+    message (see :func:`_password_forms`)."""
+    for form in _password_forms(password):
+        text = text.replace(form, "***")
+    return text
+
+
+def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 300_000) -> str:
+    """Add a PostgreSQL startup timeout without exposing or reparsing credentials."""
+    if re.search(r"(^|[?&\s])options=", conninfo):
+        return conninfo
+    option = f"-c%20statement_timeout%3D{timeout_ms}"
+    if "://" in conninfo:
+        separator = "&" if "?" in conninfo else "?"
+        return f"{conninfo}{separator}options={option}"
+    return f"{conninfo} options='-c statement_timeout={timeout_ms}'"
 
 
 def get_columns(conn, conninfo, lib, table):
     cols = conn.execute(f"""
         SELECT *
-        FROM postgres_scan('{conninfo}', '{lib}', '{table}')
+        FROM postgres_scan({_sql_literal(conninfo)}, '{lib}', '{table}')
         LIMIT 0
     """).description
     return [c[0] for c in cols]
@@ -695,6 +1079,18 @@ def get_columns_attached(conn, db_alias, lib, table):
     return [c[0] for c in cols]
 
 
+def _date_where(date_column: str | None, start_date: date | None, end_date: date | None) -> str:
+    """Build an inclusive ``WHERE date_column BETWEEN ...`` clause (empty if no date column)."""
+    if not date_column:
+        return ""
+    conds = []
+    if start_date is not None:
+        conds.append(f"{date_column} >= '{start_date}'")
+    if end_date is not None:
+        conds.append(f"{date_column} <= '{end_date}'")
+    return ("WHERE " + " AND ".join(conds)) if conds else ""
+
+
 def download_wrds_table_attached(
     duckdb_conn,
     db_alias,
@@ -702,15 +1098,20 @@ def download_wrds_table_attached(
     filename,
     date_column: str | None = None,
     end_date: date | None = None,
+    start_date: date | None = None,
+    selected_columns: tuple[str, ...] | None = None,
 ):
-    """Download a WRDS table using an attached persistent connection."""
+    """Download a WRDS table (or an inclusive date-range slice) via an attached connection.
+
+    When ``start_date``/``end_date`` are given (and the table has a ``date_column``), only rows
+    with ``start_date <= date_column <= end_date`` are downloaded. ``start_date`` enables
+    date-range chunking of large tables across parallel workers.
+    """
     lib, table = table_name.split(".")
     cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
-    projection = build_projection(cols)
+    projection = build_projection(cols, selected_columns)
 
-    where_clause = ""
-    if date_column and end_date:
-        where_clause = f"WHERE {date_column} <= '{end_date}'"
+    where_clause = _where_clause(date_column, start_date, end_date)
 
     duckdb_conn.execute(f"""
         COPY (
@@ -722,7 +1123,56 @@ def download_wrds_table_attached(
     """)
 
 
-def build_projection(cols):
+def _date_where_clause(
+    date_column: str | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> str:
+    """Build a WHERE clause filtering ``date_column`` to [start_date, end_date].
+
+    Either bound may be None. Returns an empty string when there is no date
+    column or no bounds to apply.
+    """
+    return _where_clause(date_column, start_date, end_date)
+
+
+def _where_clause(
+    date_column: str | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> str:
+    """Build a WHERE clause from optional date bounds."""
+    if not date_column:
+        conditions = []
+    else:
+        conditions = []
+        if start_date:
+            conditions.append(f"{date_column} >= '{start_date}'")
+        if end_date:
+            conditions.append(f"{date_column} <= '{end_date}'")
+    if not conditions:
+        return ""
+    return "WHERE " + " AND ".join(conditions)
+
+
+def _sql_literal(value: str) -> str:
+    """Quote a value as a single-quoted SQL literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _pg_ident(value: str) -> str:
+    """Quote a PostgreSQL identifier."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def build_projection(cols, selected_columns: tuple[str, ...] | None = None):
+    """Build a DuckDB projection, optionally limited to required columns."""
+    if selected_columns is not None:
+        missing = [column for column in selected_columns if column not in cols]
+        if missing:
+            raise RuntimeError(f"Source table is missing required columns: {', '.join(missing)}")
+        return ", ".join(_pg_ident(column) for column in selected_columns)
+
     casts = []
     if "permno" in cols:
         casts.append("TRY_CAST(permno AS BIGINT) AS permno")
@@ -746,51 +1196,975 @@ def download_wrds_table(
     filename: str,
     date_column: str | None = None,
     end_date: date | None = None,
+    start_date: date | None = None,
+    selected_columns: tuple[str, ...] | None = None,
 ) -> None:
     lib, table = table_name.split(".")
     cols = get_columns(duckdb_conn, conninfo, lib, table)
-    projection = build_projection(cols)
+    projection = build_projection(cols, selected_columns)
 
-    where_clause = ""
-    if date_column and end_date:
-        where_clause = f"WHERE {date_column} <= '{end_date}'"
+    where_clause = _where_clause(date_column, start_date, end_date)
 
     duckdb_conn.execute(f"""
         COPY (
           SELECT {projection}
-          FROM postgres_scan('{conninfo}', '{lib}', '{table}')
+          FROM postgres_scan({_sql_literal(conninfo)}, '{lib}', '{table}')
           {where_clause}
         )
         TO '{filename}' (FORMAT PARQUET);
     """)
 
 
+def load_security_pairs(
+    duckdb_conn: duckdb.DuckDBPyConnection, header_source: Path | str
+) -> list[tuple[str, str]]:
+    """Load the complete distinct security-pair universe from a local header Parquet."""
+    rows = duckdb_conn.execute(f"""
+        SELECT DISTINCT CAST(gvkey AS VARCHAR), CAST(iid AS VARCHAR)
+        FROM read_parquet({_sql_literal(str(header_source))})
+        WHERE gvkey IS NOT NULL AND iid IS NOT NULL
+        ORDER BY 1, 2
+    """).fetchall()
+    return [(str(gvkey).rstrip(), str(iid).rstrip()) for gvkey, iid in rows]
+
+
+@measure_time
+def validate_reusable_raw_data(paths: DataPaths, *, bypass_crsp: bool) -> None:
+    """Reject incomplete raw inputs before a recovery run skips downloading.
+
+    Daily Compustat datasets receive an additional completeness check: their
+    sequential part count must equal the distinct security-pair universe at
+    the downloader's frozen batch size.
+    """
+    required_tables = list(REUSABLE_COMPUSTAT_TABLES)
+    if not bypass_crsp:
+        required_tables.extend(REUSABLE_CRSP_TABLES)
+
+    problems: list[str] = []
+    for table in required_tables:
+        source = paths.raw_table_source(table)
+        if isinstance(source, Path):
+            if not source.is_file() or source.stat().st_size == 0:
+                problems.append(f"missing or empty {source.name}")
+            continue
+
+        parts = sorted(Path(source).parent.glob(Path(source).name))
+        if not parts:
+            problems.append(f"missing parts for {table}")
+        elif any(part.stat().st_size == 0 for part in parts):
+            problems.append(f"empty part for {table}")
+
+    age_anchor = paths.raw_tables_dir / "comp_age_anchor.parquet"
+    if not age_anchor.is_file() or age_anchor.stat().st_size == 0:
+        problems.append(f"missing or empty {age_anchor.name}")
+
+    con = duckdb.connect(":memory:")
+    try:
+        for table, header in DAILY_COMPUSTAT_PAIR_HEADERS.items():
+            header_source = paths.raw_table_source(header)
+            if not isinstance(header_source, Path) or not header_source.is_file():
+                continue
+            pair_count = len(load_security_pairs(con, header_source))
+            expected_count = (pair_count + DAILY_COMPUSTAT_BATCH_SIZE - 1) // (
+                DAILY_COMPUSTAT_BATCH_SIZE
+            )
+            parts_dir = paths.raw_tables_dir / f"{table.replace('.', '_')}_parts"
+            actual_parts = sorted(parts_dir.glob("part-*.parquet"))
+            expected_names = [
+                f"part-{number:06d}.parquet" for number in range(1, expected_count + 1)
+            ]
+            if [part.name for part in actual_parts] != expected_names:
+                problems.append(
+                    f"{table} has {len(actual_parts):,} parts; expected "
+                    f"{expected_count:,} complete sequential parts"
+                )
+    finally:
+        con.close()
+
+    if problems:
+        details = "; ".join(problems)
+        raise RuntimeError("Cannot reuse raw downloads because validation failed: " + details)
+
+
+def _pair_where_clause(
+    pairs: list[tuple[str, str]],
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+) -> str:
+    """Build scalar pair predicates that PostgreSQL can push into raw key indexes."""
+    pair_predicate = " OR ".join(
+        f"(gvkey = {_sql_literal(gvkey)} AND iid = {_sql_literal(iid)})" for gvkey, iid in pairs
+    )
+    conditions = [f"({pair_predicate})"]
+    date_filter = _where_clause(date_column, start_date, end_date)
+    if date_filter:
+        conditions.append(date_filter.removeprefix("WHERE "))
+    return "WHERE " + " AND ".join(conditions)
+
+
+@dataclass(frozen=True)
+class _DailyBatchTask:
+    table_name: str
+    projection: str
+    pairs: tuple[tuple[str, str], ...]
+    date_column: str | None
+    start_date: date | None
+    end_date: date | None
+    batch_number: int
+    total_batches: int
+    part_file: Path
+    manifest_file: Path
+
+
+@dataclass(frozen=True)
+class _DailyBatchResult:
+    task: _DailyBatchTask
+    status: str
+    started_at_utc: str
+    duration_seconds: float
+    worker_id: int | None
+    row_count: int
+    bytes_written: int
+    retries: int
+    timeouts: int
+
+
+class _DailyBatchDownloadError(RuntimeError):
+    """Credential-safe daily batch failure propagated from a worker thread."""
+
+
+def _prepare_batch_directory(filename: str) -> Path:
+    """Create or reopen a resumable Parquet-parts directory."""
+    legacy_file = Path(filename)
+    parts_dir = legacy_file.with_name(f"{legacy_file.stem}_parts")
+    legacy_file.unlink(missing_ok=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for incomplete in parts_dir.glob("incomplete-*.parquet"):
+        incomplete.unlink(missing_ok=True)
+    return parts_dir
+
+
+def _batch_contract(task: _DailyBatchTask) -> dict[str, object]:
+    pairs_payload = json.dumps(task.pairs, separators=(",", ":"), ensure_ascii=True)
+    return {
+        "format_version": 1,
+        "table": task.table_name,
+        "batch_number": task.batch_number,
+        "total_batches": task.total_batches,
+        "pair_count": len(task.pairs),
+        "pairs_sha256": hashlib.sha256(pairs_payload.encode("ascii")).hexdigest(),
+        "projection_sha256": hashlib.sha256(task.projection.encode("utf-8")).hexdigest(),
+        "date_column": task.date_column,
+        "start_date": task.start_date.isoformat() if task.start_date else None,
+        "end_date": task.end_date.isoformat() if task.end_date else None,
+    }
+
+
+def _load_reusable_batch(task: _DailyBatchTask) -> _DailyBatchResult | None:
+    """Return validated atomic-download metadata, or None when it must be rebuilt."""
+    if not task.part_file.is_file() or not task.manifest_file.is_file():
+        return None
+    try:
+        manifest = json.loads(task.manifest_file.read_text(encoding="utf-8"))
+        contract = _batch_contract(task)
+        if any(manifest.get(key) != value for key, value in contract.items()):
+            return None
+        size = task.part_file.stat().st_size
+        if size < 8 or manifest.get("bytes_written") != size:
+            return None
+        with task.part_file.open("rb") as handle:
+            if handle.read(4) != b"PAR1":
+                return None
+            handle.seek(-4, os.SEEK_END)
+            if handle.read(4) != b"PAR1":
+                return None
+        row_count = int(manifest["row_count"])
+        if row_count < 0:
+            return None
+        observed_rows = pl.scan_parquet(task.part_file).select(pl.len()).collect().item()
+        if observed_rows != row_count:
+            return None
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        json.JSONDecodeError,
+        pl.exceptions.PolarsError,
+    ):
+        return None
+    return _DailyBatchResult(
+        task=task,
+        status="reused",
+        started_at_utc=datetime.now(UTC).isoformat(),
+        duration_seconds=0.0,
+        worker_id=None,
+        row_count=row_count,
+        bytes_written=size,
+        retries=0,
+        timeouts=0,
+    )
+
+
+def _write_batch_manifest(task: _DailyBatchTask, result: _DailyBatchResult) -> None:
+    payload = {
+        **_batch_contract(task),
+        "row_count": result.row_count,
+        "bytes_written": result.bytes_written,
+        "retries": result.retries,
+        "timeouts": result.timeouts,
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+    }
+    temporary = task.manifest_file.with_suffix(".manifest.json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, task.manifest_file)
+
+
+def _build_daily_batch_query(task: _DailyBatchTask, relation: str) -> str:
+    return "\nUNION ALL\n".join(
+        f"""SELECT {task.projection}
+          FROM {relation}
+          {_pair_where_clause([pair], task.date_column, task.start_date, task.end_date)}"""
+        for pair in task.pairs
+    )
+
+
+def _parquet_row_count(connection: duckdb.DuckDBPyConnection, path: Path) -> int:
+    result = connection.execute(
+        f"SELECT COUNT(*) FROM read_parquet({_sql_literal(str(path))})"
+    ).fetchone()
+    if result is None:
+        raise RuntimeError(f"Could not read completed Parquet metadata for {path.name}")
+    return int(result[0])
+
+
+def _record_single_table_download(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+    filename: str,
+    *,
+    started_at_utc: str,
+    started_monotonic: float,
+    retries: int = 0,
+    timeouts: int = 0,
+) -> None:
+    """Record one non-batched table after its Parquet file is durable."""
+    path = Path(filename)
+    if not path.is_file():
+        return  # mocked/unit-test download
+    duration = time.monotonic() - started_monotonic
+    bytes_written = path.stat().st_size
+    try:
+        row_count = _parquet_row_count(connection, path)
+    except Exception as error:
+        row_count = 0
+        _report_progress(
+            f"download telemetry row count failed for {table_name} "
+            f"error_type={type(error).__name__}"
+        )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.record_download(
+            event_type="table",
+            table=table_name,
+            status="completed",
+            started_at_utc=started_at_utc,
+            duration_seconds=duration,
+            row_count=row_count,
+            bytes_written=bytes_written,
+            retries=retries,
+            timeouts=timeouts,
+            table_completion_percent=100.0,
+            overall_completion_percent=100.0,
+        )
+    _report_progress(
+        f"completed {table_name} table rows={row_count:,} "
+        f"size_mib={bytes_written / (1024**2):.1f} duration={duration:.1f}s "
+        f"retries={retries} timeouts={timeouts}"
+    )
+
+
+def _record_table_download_failure(
+    table_name: str,
+    *,
+    started_at_utc: str,
+    started_monotonic: float,
+    error: BaseException,
+    retries: int = 0,
+    timeouts: int = 0,
+) -> None:
+    """Record a credential-safe failed table event before propagating it."""
+    monitor = get_active_monitor()
+    if monitor is None:
+        return
+    monitor.record_download(
+        event_type="table",
+        table=table_name,
+        status="failed",
+        started_at_utc=started_at_utc,
+        duration_seconds=time.monotonic() - started_monotonic,
+        retries=retries,
+        timeouts=timeouts,
+        error_type=type(error).__name__,
+    )
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    text = f"{type(error).__name__} {error}".lower()
+    return "timeout" in text or "timed out" in text or "canceling statement" in text
+
+
+def _download_daily_batch_once(
+    connection: duckdb.DuckDBPyConnection,
+    relation: str,
+    task: _DailyBatchTask,
+    worker_id: int,
+    retry_number: int,
+    prior_timeouts: int,
+) -> _DailyBatchResult:
+    started_at = datetime.now(UTC).isoformat()
+    started = time.monotonic()
+    temporary = task.part_file.with_name(
+        f"incomplete-{task.batch_number:06d}-worker-{worker_id}-try-{retry_number}.parquet"
+    )
+    temporary.unlink(missing_ok=True)
+    batch_query = _build_daily_batch_query(task, relation)
+    connection.execute(f"""
+        COPY (
+          {batch_query}
+        )
+        TO {_sql_literal(str(temporary))} (FORMAT PARQUET);
+    """)
+    row_count = _parquet_row_count(connection, temporary)
+    bytes_written = temporary.stat().st_size
+    os.replace(temporary, task.part_file)
+    result = _DailyBatchResult(
+        task=task,
+        status="completed",
+        started_at_utc=started_at,
+        duration_seconds=time.monotonic() - started,
+        worker_id=worker_id,
+        row_count=row_count,
+        bytes_written=bytes_written,
+        retries=retry_number,
+        timeouts=prior_timeouts,
+    )
+    _write_batch_manifest(task, result)
+    return result
+
+
+def _make_daily_batch_tasks(
+    table_name: str,
+    projection: str,
+    pairs: list[tuple[str, str]],
+    filename: str,
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+    batch_size: int,
+) -> list[_DailyBatchTask]:
+    if not pairs:
+        raise RuntimeError(f"No security pairs were found for {table_name}")
+    parts_dir = _prepare_batch_directory(filename)
+    total_batches = (len(pairs) + batch_size - 1) // batch_size
+    tasks: list[_DailyBatchTask] = []
+    for offset in range(0, len(pairs), batch_size):
+        batch_number = offset // batch_size + 1
+        tasks.append(
+            _DailyBatchTask(
+                table_name=table_name,
+                projection=projection,
+                pairs=tuple(pairs[offset : offset + batch_size]),
+                date_column=date_column,
+                start_date=start_date,
+                end_date=end_date,
+                batch_number=batch_number,
+                total_batches=total_batches,
+                part_file=parts_dir / f"part-{batch_number:06d}.parquet",
+                manifest_file=parts_dir / f"part-{batch_number:06d}.manifest.json",
+            )
+        )
+
+    expected = {task.part_file.name for task in tasks} | {task.manifest_file.name for task in tasks}
+    for stale in parts_dir.iterdir():
+        if (
+            stale.is_file()
+            and (stale.name.startswith("part-") or stale.name.startswith("incomplete-"))
+            and stale.name not in expected
+        ):
+            stale.unlink(missing_ok=True)
+    return tasks
+
+
+def _record_download_result(
+    result: _DailyBatchResult,
+    *,
+    monitor,
+    completed_batches: int,
+    table_completed_batches: int,
+    overall_total_batches: int,
+) -> None:
+    task = result.task
+    table_percent = table_completed_batches / task.total_batches * 100
+    overall_percent = completed_batches / overall_total_batches * 100
+    if monitor is not None:
+        monitor.record_download(
+            event_type="batch",
+            table=task.table_name,
+            status=result.status,
+            started_at_utc=result.started_at_utc,
+            duration_seconds=result.duration_seconds,
+            batch_number=task.batch_number,
+            total_batches=task.total_batches,
+            worker_id=result.worker_id,
+            pair_count=len(task.pairs),
+            row_count=result.row_count,
+            bytes_written=result.bytes_written,
+            retries=result.retries,
+            timeouts=result.timeouts,
+            completed_batches=table_completed_batches,
+            table_completion_percent=table_percent,
+            overall_completion_percent=overall_percent,
+        )
+    message = (
+        f"{result.status} {task.table_name} batch {task.batch_number:,}/"
+        f"{task.total_batches:,} worker={result.worker_id or 0} pairs={len(task.pairs):,} "
+        f"rows={result.row_count:,} size_mib={result.bytes_written / (1024**2):.1f} "
+        f"duration={result.duration_seconds:.1f}s retries={result.retries} "
+        f"timeouts={result.timeouts} table_complete={table_percent:.1f}% "
+        f"overall_complete={overall_percent:.1f}%"
+    )
+    if monitor is not None:
+        monitor.note(message)
+    else:
+        print(message, flush=True)
+
+
+def _download_pair_batches(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    relation: str,
+    projection: str,
+    pairs: list[tuple[str, str]],
+    filename: str,
+    date_column: str | None,
+    start_date: date | None,
+    end_date: date | None,
+    batch_size: int,
+    *,
+    table_name: str | None = None,
+) -> None:
+    """Copy one table's pair-filtered batches serially with atomic resume metadata."""
+    resolved_table_name = table_name or ".".join(relation.split(".")[-2:])
+    tasks = _make_daily_batch_tasks(
+        resolved_table_name,
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+    )
+    monitor = get_active_monitor()
+    table_started_at = datetime.now(UTC).isoformat()
+    table_started = time.monotonic()
+    table_results: list[_DailyBatchResult] = []
+    for completed, task in enumerate(tasks, start=1):
+        result = _load_reusable_batch(task)
+        if result is None:
+            result = _download_daily_batch_once(
+                duckdb_conn, relation, task, worker_id=1, retry_number=0, prior_timeouts=0
+            )
+        table_results.append(result)
+        _record_download_result(
+            result,
+            monitor=monitor,
+            completed_batches=completed,
+            table_completed_batches=completed,
+            overall_total_batches=len(tasks),
+        )
+    monitor = get_active_monitor()
+    if monitor is not None:
+        monitor.record_download(
+            event_type="table",
+            table=resolved_table_name,
+            status="completed",
+            started_at_utc=table_started_at,
+            duration_seconds=time.monotonic() - table_started,
+            pair_count=len(pairs),
+            row_count=sum(result.row_count for result in table_results),
+            bytes_written=sum(result.bytes_written for result in table_results),
+            retries=sum(result.retries for result in table_results),
+            timeouts=sum(result.timeouts for result in table_results),
+            completed_batches=len(table_results),
+            table_completion_percent=100.0,
+            overall_completion_percent=100.0,
+        )
+
+
+def download_wrds_daily_table_batched_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    table_name: str,
+    filename: str,
+    pairs: list[tuple[str, str]],
+    selected_columns: tuple[str, ...],
+    date_column: str = "datadate",
+    start_date: date | None = None,
+    end_date: date | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+) -> None:
+    """Download a daily Compustat view in pair-indexed batches via ATTACH."""
+    lib, table = table_name.split(".")
+    cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
+    projection = build_projection(cols, selected_columns)
+    _download_pair_batches(
+        duckdb_conn,
+        f"{db_alias}.{lib}.{table}",
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+        table_name=table_name,
+    )
+
+
+def download_wrds_daily_table_batched(
+    conninfo: str,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    filename: str,
+    pairs: list[tuple[str, str]],
+    selected_columns: tuple[str, ...],
+    date_column: str = "datadate",
+    start_date: date | None = None,
+    end_date: date | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+) -> None:
+    """Download a daily Compustat view in pair-indexed postgres_scan batches."""
+    lib, table = table_name.split(".")
+    cols = get_columns(duckdb_conn, conninfo, lib, table)
+    projection = build_projection(cols, selected_columns)
+    relation = (
+        f"postgres_scan({_sql_literal(conninfo)}, {_sql_literal(lib)}, {_sql_literal(table)})"
+    )
+    _download_pair_batches(
+        duckdb_conn,
+        relation,
+        projection,
+        pairs,
+        filename,
+        date_column,
+        start_date,
+        end_date,
+        batch_size,
+        table_name=table_name,
+    )
+
+
+def _open_daily_worker_connection(
+    conninfo: str, worker_id: int
+) -> tuple[duckdb.DuckDBPyConnection, str]:
+    """Open one isolated DuckDB/PostgreSQL connection for a download worker."""
+    connection = duckdb.connect(":memory:")
+    alias = f"daily_source_w{worker_id}"
+    try:
+        connection.execute("LOAD postgres")
+        connection.execute(f"ATTACH {_sql_literal(conninfo)} AS {alias} (TYPE postgres, READ_ONLY)")
+    except Exception:
+        connection.close()
+        raise
+    return connection, alias
+
+
+def download_wrds_daily_tables_parallel(
+    conninfo: str,
+    planning_connection: duckdb.DuckDBPyConnection,
+    paths: DataPaths,
+    table_names: tuple[str, ...],
+    date_columns: dict[str, str],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+    worker_count: int,
+    planning_db_alias: str | None = None,
+    batch_size: int = DAILY_COMPUSTAT_BATCH_SIZE,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Download SECD/G_SECD through one shared, bounded worker queue.
+
+    Every worker owns one DuckDB connection and one PostgreSQL attachment. Tasks
+    from both daily tables are interleaved, written atomically, and skipped only
+    when their manifest exactly matches the current pair/date/projection contract.
+    Setting ``cancel_event`` makes workers stop pulling batches; completed batches
+    keep their manifests and are reused on the next run.
+    """
+    if not 1 <= worker_count <= MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS:
+        raise ValueError(
+            "daily Compustat download workers must be between 1 and "
+            f"{MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS}"
+        )
+
+    table_tasks: dict[str, list[_DailyBatchTask]] = {}
+    table_pair_counts: dict[str, int] = {}
+    for table_name in table_names:
+        lib, table = table_name.split(".")
+        if planning_db_alias is None:
+            columns = get_columns(planning_connection, conninfo, lib, table)
+        else:
+            columns = get_columns_attached(planning_connection, planning_db_alias, lib, table)
+        selected_columns = LARGE_COMPUSTAT_COLUMNS[table_name]
+        projection = build_projection(columns, selected_columns)
+        header = DAILY_COMPUSTAT_PAIR_HEADERS[table_name]
+        pairs = load_security_pairs(planning_connection, paths.raw_table_source(header))
+        table_pair_counts[table_name] = len(pairs)
+        filename = str(paths.raw_tables_dir / f"{table_name.replace('.', '_')}.parquet")
+        table_tasks[table_name] = _make_daily_batch_tasks(
+            table_name,
+            projection,
+            pairs,
+            filename,
+            date_columns[table_name],
+            start_date,
+            end_date,
+            batch_size,
+        )
+
+    interleaved: list[_DailyBatchTask] = []
+    for group in itertools.zip_longest(*(table_tasks[name] for name in table_names)):
+        interleaved.extend(task for task in group if task is not None)
+
+    monitor = get_active_monitor()
+    total_batches = len(interleaved)
+    completed_batches = 0
+    completed_by_table = dict.fromkeys(table_names, 0)
+    results_by_table: dict[str, list[_DailyBatchResult]] = {name: [] for name in table_names}
+    progress_lock = threading.Lock()
+    pending: queue.Queue[_DailyBatchTask] = queue.Queue()
+    table_started = {name: time.monotonic() for name in table_names}
+    table_started_at = {name: datetime.now(UTC).isoformat() for name in table_names}
+
+    def accept_result(result: _DailyBatchResult) -> None:
+        nonlocal completed_batches
+        with progress_lock:
+            completed_batches += 1
+            completed_by_table[result.task.table_name] += 1
+            results_by_table[result.task.table_name].append(result)
+            _record_download_result(
+                result,
+                monitor=monitor,
+                completed_batches=completed_batches,
+                table_completed_batches=completed_by_table[result.task.table_name],
+                overall_total_batches=total_batches,
+            )
+
+    for task in interleaved:
+        reusable = _load_reusable_batch(task)
+        if reusable is None:
+            pending.put(task)
+        else:
+            accept_result(reusable)
+
+    if pending.empty():
+        if monitor is not None:
+            monitor.note("reused every completed daily Compustat batch")
+    else:
+        errors: queue.Queue[_DailyBatchDownloadError] = queue.Queue()
+        stop_event = cancel_event if cancel_event is not None else threading.Event()
+
+        def worker(worker_id: int) -> None:
+            connection: duckdb.DuckDBPyConnection | None = None
+            alias = ""
+            try:
+                while not stop_event.is_set():
+                    try:
+                        task = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    retry_number = 0
+                    timeouts = 0
+                    while retry_number <= DAILY_COMPUSTAT_BATCH_MAX_RETRIES:
+                        attempt_started_at = datetime.now(UTC).isoformat()
+                        attempt_started = time.monotonic()
+                        try:
+                            if connection is None:
+                                connection, alias = _open_daily_worker_connection(
+                                    conninfo, worker_id
+                                )
+                            relation = f"{alias}.{task.table_name}"
+                            result = _download_daily_batch_once(
+                                connection,
+                                relation,
+                                task,
+                                worker_id,
+                                retry_number,
+                                timeouts,
+                            )
+                        except Exception as error:
+                            timeouts += int(_is_timeout_error(error))
+                            for incomplete in task.part_file.parent.glob(
+                                f"incomplete-{task.batch_number:06d}-worker-{worker_id}-*.parquet"
+                            ):
+                                incomplete.unlink(missing_ok=True)
+                            if connection is not None:
+                                connection.close()
+                                connection = None
+                            if retry_number < DAILY_COMPUSTAT_BATCH_MAX_RETRIES:
+                                retry_number += 1
+                                retry_delay = DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS[
+                                    retry_number - 1
+                                ]
+                                if monitor is not None:
+                                    monitor.note(
+                                        f"retrying {task.table_name} batch "
+                                        f"{task.batch_number:,}/{task.total_batches:,} "
+                                        f"worker={worker_id} retry={retry_number} "
+                                        f"delay_seconds={retry_delay:g} "
+                                        f"timeout={bool(timeouts)} error_type={type(error).__name__}"
+                                    )
+                                if stop_event.wait(retry_delay):
+                                    break
+                                continue
+                            if monitor is not None:
+                                monitor.record_download(
+                                    event_type="batch",
+                                    table=task.table_name,
+                                    status="failed",
+                                    started_at_utc=attempt_started_at,
+                                    duration_seconds=time.monotonic() - attempt_started,
+                                    batch_number=task.batch_number,
+                                    total_batches=task.total_batches,
+                                    worker_id=worker_id,
+                                    pair_count=len(task.pairs),
+                                    retries=retry_number,
+                                    timeouts=timeouts,
+                                    error_type=type(error).__name__,
+                                )
+                            errors.put(
+                                _DailyBatchDownloadError(
+                                    f"daily download failed for {task.table_name} batch "
+                                    f"{task.batch_number}/{task.total_batches} after "
+                                    f"{retry_number} retries; error details were redacted"
+                                )
+                            )
+                            stop_event.set()
+                            break
+                        else:
+                            accept_result(result)
+                            break
+                    pending.task_done()
+            except Exception as error:
+                errors.put(
+                    _DailyBatchDownloadError(
+                        f"daily download worker {worker_id} failed "
+                        f"({type(error).__name__}); error details were redacted"
+                    )
+                )
+                stop_event.set()
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(worker_id,),
+                name=f"jkp-daily-download-{worker_id}",
+            )
+            for worker_id in range(1, worker_count + 1)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if not errors.empty():
+            raise errors.get()
+
+    for table_name in table_names:
+        results = results_by_table[table_name]
+        duration = time.monotonic() - table_started[table_name]
+        row_count = sum(result.row_count for result in results)
+        bytes_written = sum(result.bytes_written for result in results)
+        retries = sum(result.retries for result in results)
+        timeouts = sum(result.timeouts for result in results)
+        if monitor is not None:
+            monitor.record_download(
+                event_type="table",
+                table=table_name,
+                status="completed",
+                started_at_utc=table_started_at[table_name],
+                duration_seconds=duration,
+                pair_count=table_pair_counts[table_name],
+                row_count=row_count,
+                bytes_written=bytes_written,
+                retries=retries,
+                timeouts=timeouts,
+                completed_batches=len(results),
+                table_completion_percent=100.0,
+                overall_completion_percent=100.0,
+            )
+        message = (
+            f"completed {table_name} table pairs={table_pair_counts[table_name]:,} "
+            f"batches={len(results):,} rows={row_count:,} "
+            f"size_gib={bytes_written / (1024**3):.2f} duration={duration:.1f}s "
+            f"retries={retries} timeouts={timeouts}"
+        )
+        if monitor is not None:
+            monitor.note(message)
+        else:
+            print(message, flush=True)
+
+
+def build_compustat_age_anchor_query(raw_schema: str) -> str:
+    """Build the full-history, index-driven Compustat age-anchor query.
+
+    The daily price table is hundreds of millions of rows, so this deliberately
+    starts from the small security header and performs ``ORDER BY datadate
+    LIMIT 1`` probes on each source's natural-key index.  It reproduces the
+    years used by ``firm_age`` without scanning or downloading full history.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_schema):
+        raise ValueError(f"Invalid raw PostgreSQL schema: {raw_schema!r}")
+    schema = _pg_ident(raw_schema)
+
+    def first_date(table: str) -> str:
+        return (
+            f"(SELECT x.datadate FROM {schema}.{_pg_ident(table)} x "
+            "WHERE x.gvkey=s.gvkey AND x.iid=s.iid "
+            "ORDER BY x.datadate LIMIT 1)"
+        )
+
+    global_first = ",\n             ".join(
+        first_date(table) for table in ("sec_dprc", "sec_divid", "sec_dtrt", "sec_split")
+    )
+    national_first = ",\n             ".join(
+        first_date(table) for table in ("sec_mth", "sec_mthprc", "sec_mthtrt")
+    )
+    return f"""
+WITH security_pairs AS MATERIALIZED (
+  SELECT s.gvkey,
+         CASE WHEN s.iid LIKE '%W' THEN
+           LEAST(
+             {global_first}
+           )
+         ELSE
+           LEAST(
+             {national_first}
+           )
+         END AS first_date
+  FROM {schema}.{_pg_ident("security")} s
+  LEFT JOIN {schema}.{_pg_ident("company")} c ON c.gvkey=s.gvkey
+  WHERE s.iid NOT LIKE '%W'
+     OR (s.iid LIKE '%W'
+         AND c.fic IS DISTINCT FROM 'USA'
+         AND c.fic IS DISTINCT FROM 'CAN')
+), ret AS (
+  SELECT gvkey, MIN(first_date)::date AS comp_ret_first
+  FROM security_pairs
+  WHERE first_date IS NOT NULL
+  GROUP BY gvkey
+), acc AS (
+  SELECT gvkey, MIN(datadate)::date AS comp_acc_first
+  FROM {schema}.{_pg_ident("co_adesind")}
+  WHERE popsrc IN ('D', 'I')
+  GROUP BY gvkey
+)
+SELECT COALESCE(ret.gvkey, acc.gvkey)::varchar AS gvkey,
+       ret.comp_ret_first,
+       acc.comp_acc_first
+FROM ret
+FULL JOIN acc USING (gvkey)
+ORDER BY gvkey
+""".strip()
+
+
+def download_postgres_query_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    remote_sql: str,
+    filename: str,
+) -> None:
+    """Execute a PostgreSQL-side query and copy its small result to Parquet."""
+    duckdb_conn.execute(f"""
+        COPY (
+          SELECT *
+          FROM postgres_query({_sql_literal(db_alias)}, {_sql_literal(remote_sql)})
+        )
+        TO {_sql_literal(filename)} (FORMAT PARQUET);
+    """)
+
+
+def download_compustat_age_anchor_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    filename: str,
+    raw_schema: str,
+) -> None:
+    """Download the small full-history company age anchor."""
+    download_postgres_query_attached(
+        duckdb_conn,
+        db_alias,
+        build_compustat_age_anchor_query(raw_schema),
+        filename,
+    )
+
+
+def _raise_redacted_source_error(source_label: str, action: str, exc: Exception) -> None:
+    """Raise a useful source error without echoing a connection string."""
+    raise RuntimeError(
+        f"{source_label} {action} failed ({exc.__class__.__name__}). "
+        "Connection details were redacted; check the source configuration and database logs."
+    ) from None
+
+
 @measure_time
 def download_raw_data_tables(
     paths: DataPaths,
-    username: str,
-    password: str,
+    username: str | None = None,
+    password: str | None = None,
     end_date: date | None = None,
     persistent_connection: bool = False,
+    bypass_crsp: bool = False,
+    start_date: date | None = None,
+    connection_info: str | None = None,
+    source_label: str = "WRDS",
+    raw_schema: str = "comp",
+    daily_download_workers: int = 1,
 ) -> None:
     """
     Description:
-        Bulk-download core WRDS tables to raw_tables and a few curated variants with column subsets.
+        Bulk-download WRDS-shaped source tables to raw_tables.
 
     Steps:
-        1) Connect to WRDS; iterate through a fixed list of library.tables.
+        1) Connect to the selected PostgreSQL source; iterate through a fixed
+           list of library.tables.
         2) For each table: download to raw_tables/lib_table.parquet, applying date filtering
-           when end_date is provided and the table has a known date column.
+           to [start_date, end_date] (either bound optional) when the table has a known
+           date column. SECD/G_SECD are pair-batched into Parquet datasets; the three
+           large Compustat tables transfer only pipeline-consumed columns.
         3) If persistent_connection: ATTACH a single postgres connection and download all tables.
-           Otherwise: use postgres_scan() which creates a new connection per query.
+           Otherwise: use postgres_scan() which creates a new connection per query; with
+           daily_download_workers > 1 the SECD/G_SECD batch queue runs on a background
+           thread concurrently with the remaining tables and the age anchor.
         4) Disconnect.
 
     Args:
-        username: WRDS username
-        password: WRDS password
+        username: WRDS username when ``connection_info`` is not supplied.
+        password: WRDS password when ``connection_info`` is not supplied.
+        connection_info: Optional complete PostgreSQL connection URL/DSN, used
+            for XpressFeed RDS. It is never printed.
+        raw_schema: Schema containing native XpressFeed tables (``public`` on
+            RDS and ``comp`` on WRDS).
         persistent_connection: If True, use a single persistent connection via ATTACH.
             This reduces MFA prompts on systems with NAT IP rotation (e.g., Yale Bouchet).
             If False (default), use postgres_scan() which creates a new connection per query.
+        daily_download_workers: Shared SECD/G_SECD batch workers, 1 to
+            MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS; production CLI runs default to
+            DAILY_DOWNLOAD_WORKERS while direct library calls remain serial.
 
     Output:
         Parquet files under raw_tables/ (Compustat, CRSP, FF, etc.).
@@ -803,6 +2177,7 @@ def download_raw_data_tables(
         "comp.r_ex_codes",
         "comp.g_sec_history",
         "comp.sec_history",
+        "comp.sec_id_history",
         "comp.company",
         "comp.g_company",
         "crsp.stksecurityinfohist",
@@ -824,6 +2199,9 @@ def download_raw_data_tables(
         "comp.g_secd",
     ]
 
+    if bypass_crsp:
+        table_names = [t for t in table_names if not t.startswith("crsp.")]
+
     # Tables with a known date column are filtered to end_date during download.
     # Reference/metadata tables (not listed here) are downloaded in full.
     date_columns: dict[str, str] = {
@@ -838,7 +2216,19 @@ def download_raw_data_tables(
         "comp.g_fundq": "datadate",
     }
 
-    wrds_session_data = gen_wrds_connection_info(username, password)
+    if connection_info is None:
+        if not username or not password:
+            raise ValueError(
+                "WRDS username and password are required when connection_info is absent"
+            )
+        source_connection_info = gen_wrds_connection_info(username, password)
+    else:
+        source_connection_info = connection_info
+    source_connection_info = with_pg_statement_timeout(source_connection_info)
+    if not 1 <= daily_download_workers <= MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS:
+        raise ValueError(
+            f"daily_download_workers must be between 1 and {MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS}"
+        )
     con = duckdb.connect(":memory:")
     con.execute("INSTALL postgres; LOAD postgres;")
 
@@ -848,42 +2238,369 @@ def download_raw_data_tables(
         # in error messages. If the connection fails, suppress the original exception to
         # avoid leaking credentials in logs/tracebacks, and raise a generic error instead.
         try:
-            con.execute(f"ATTACH '{wrds_session_data}' AS wrds (TYPE postgres, READ_ONLY)")
+            con.execute(
+                f"ATTACH {_sql_literal(source_connection_info)} "
+                "AS source_db (TYPE postgres, READ_ONLY)"
+            )
         except Exception as e:
-            if password in str(e):
-                raise RuntimeError(
-                    "Failed to attach persistent WRDS connection. "
-                    "Check credentials and MFA approval."
-                ) from None
-            raise
+            _raise_redacted_source_error(source_label, "connection", e)
+        # The SECD/G_SECD queue needs only the two security header parquets, so it
+        # starts as soon as those exist and drains while the remaining headers and
+        # the age anchor download on the main thread. Without this the phase is
+        # strictly serial and the source database sits at one busy core out of
+        # eight for the ~9 minutes of header downloads, then one again for the
+        # anchor. The same overlap already existed in the postgres_scan branch
+        # below; production runs with --persistent-connection and so never got it.
+        cancel_event = threading.Event()
+        run_context = contextvars.copy_context()  # the monitor ContextVar is not thread-inherited
+        queue_future: Future[None] | None = None
+
+        def run_daily_queue() -> None:
+            # Its own connection and its own ATTACH. `con` stays with the main
+            # thread for the remaining headers, and one DuckDB connection cannot
+            # serve both without serialising them back together.
+            queue_connection = duckdb.connect(":memory:")
+            try:
+                queue_connection.execute("LOAD postgres;")
+                queue_connection.execute(
+                    f"ATTACH {_sql_literal(source_connection_info)} "
+                    "AS source_db (TYPE postgres, READ_ONLY)"
+                )
+                download_wrds_daily_tables_parallel(
+                    source_connection_info,
+                    queue_connection,
+                    paths,
+                    tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
+                    date_columns,
+                    start_date=start_date,
+                    end_date=end_date,
+                    worker_count=daily_download_workers,
+                    planning_db_alias="source_db",
+                    cancel_event=cancel_event,
+                )
+            finally:
+                queue_connection.close()
+
+        # Not a `with` block: the loop below would have to be re-indented, and the
+        # shutdown has to be ordered after cancel_event in the finally anyway.
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jkp-daily-queue")
         try:
             for table in table_names:
-                download_wrds_table_attached(
+                if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
+                    continue
+                filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
+                _report_progress(f"Downloading {source_label} table {table}")
+                selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
+                pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
+                pairs: list[tuple[str, str]] | None = None
+                table_started_at = datetime.now(UTC).isoformat()
+                table_started = time.monotonic()
+                retries = 0
+                timeouts = 0
+                try:
+                    if pair_header is not None:
+                        assert selected_columns is not None
+                        pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
+                        download_wrds_daily_table_batched_attached(
+                            con,
+                            "source_db",
+                            table,
+                            filename,
+                            pairs,
+                            selected_columns,
+                            date_column=date_columns[table],
+                            end_date=end_date,
+                            start_date=start_date,
+                        )
+                    else:
+                        download_wrds_table_attached(
+                            con,
+                            "source_db",
+                            table,
+                            filename,
+                            date_column=date_columns.get(table),
+                            end_date=end_date,
+                            start_date=start_date,
+                            selected_columns=selected_columns,
+                        )
+                except Exception as e:
+                    if e.__class__.__name__ != "OutOfMemoryException":
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=e,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(e)),
+                        )
+                        _raise_redacted_source_error(source_label, f"download of {table}", e)
+                    retries = 1
+                    timeouts += int(_is_timeout_error(e))
+                    Path(filename).unlink(missing_ok=True)
+                    _report_progress(
+                        f"Attached {source_label} download ran out of memory on {table}; "
+                        "retrying with postgres_scan."
+                    )
+                    try:
+                        if pair_header is not None:
+                            assert selected_columns is not None
+                            if pairs is None:
+                                pairs = load_security_pairs(
+                                    con, paths.raw_table_source(pair_header)
+                                )
+                            download_wrds_daily_table_batched(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                pairs,
+                                selected_columns,
+                                date_column=date_columns[table],
+                                end_date=end_date,
+                                start_date=start_date,
+                            )
+                        else:
+                            download_wrds_table(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                date_column=date_columns.get(table),
+                                end_date=end_date,
+                                start_date=start_date,
+                                selected_columns=selected_columns,
+                            )
+                    except Exception as retry_error:
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=retry_error,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(retry_error)),
+                        )
+                        _raise_redacted_source_error(
+                            source_label, f"fallback download of {table}", retry_error
+                        )
+                if pair_header is None:
+                    _record_single_table_download(
+                        con,
+                        table,
+                        filename,
+                        started_at_utc=table_started_at,
+                        started_monotonic=table_started,
+                        retries=retries,
+                        timeouts=timeouts,
+                    )
+                # comp.security is the later of the two pair headers in table_names,
+                # so the queue's planner inputs are now on disk.
+                if daily_download_workers > 1 and table == "comp.security":
+                    _report_progress(
+                        f"Downloading {source_label} daily Compustat tables with "
+                        f"{daily_download_workers} shared workers"
+                    )
+                    queue_future = pool.submit(run_context.run, run_daily_queue)
+            _report_progress(f"Downloading {source_label} full-history age anchor")
+            anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
+            anchor_started_at = datetime.now(UTC).isoformat()
+            anchor_started = time.monotonic()
+            try:
+                download_compustat_age_anchor_attached(
                     con,
-                    "wrds",
-                    table,
-                    str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet")),
-                    date_column=date_columns.get(table),
-                    end_date=end_date,
+                    "source_db",
+                    anchor_filename,
+                    raw_schema,
                 )
-        finally:
-            con.execute("DETACH wrds")
-    else:
-        # Use postgres_scan() which creates a new connection per query (default)
-        for table in table_names:
-            download_wrds_table(
-                wrds_session_data,
+            except Exception as e:
+                _record_table_download_failure(
+                    "comp.age_anchor",
+                    started_at_utc=anchor_started_at,
+                    started_monotonic=anchor_started,
+                    error=e,
+                    timeouts=int(_is_timeout_error(e)),
+                )
+                _raise_redacted_source_error(source_label, "age-anchor download", e)
+            _record_single_table_download(
                 con,
-                table,
-                str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet")),
-                date_column=date_columns.get(table),
-                end_date=end_date,
+                "comp.age_anchor",
+                anchor_filename,
+                started_at_utc=anchor_started_at,
+                started_monotonic=anchor_started,
             )
+            if queue_future is not None:
+                try:
+                    queue_future.result()
+                except _DailyBatchDownloadError:
+                    raise
+                except Exception as error:
+                    _raise_redacted_source_error(source_label, "parallel daily download", error)
+        finally:
+            # Cancel before shutdown: shutdown(wait=True) would otherwise block for
+            # the rest of the queue after the main thread has already failed.
+            if queue_future is not None and not queue_future.done():
+                cancel_event.set()
+            pool.shutdown(wait=True)
+            con.execute("DETACH source_db")
+    else:
+        # Use postgres_scan() which creates a new connection per query (default).
+        # With workers > 1 the SECD/G_SECD batch queue needs only the two security
+        # header parquets, so it starts on a background thread as soon as those
+        # exist and drains while the remaining tables (and the age anchor) download
+        # here on the main thread.
+        cancel_event = threading.Event()
+        run_context = contextvars.copy_context()  # the monitor ContextVar is not thread-inherited
+        queue_future: Future[None] | None = None
+
+        def run_daily_queue() -> None:
+            planning_connection = duckdb.connect(":memory:")
+            try:
+                planning_connection.execute("LOAD postgres;")
+                download_wrds_daily_tables_parallel(
+                    source_connection_info,
+                    planning_connection,
+                    paths,
+                    tuple(DAILY_COMPUSTAT_PAIR_HEADERS),
+                    date_columns,
+                    start_date=start_date,
+                    end_date=end_date,
+                    worker_count=daily_download_workers,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                planning_connection.close()
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jkp-daily-queue") as pool:
+            try:
+                for table in table_names:
+                    if daily_download_workers > 1 and table in DAILY_COMPUSTAT_PAIR_HEADERS:
+                        continue
+                    _report_progress(f"Downloading {source_label} table {table}")
+                    filename = str(paths.raw_tables_dir / (table.replace(".", "_") + ".parquet"))
+                    selected_columns = LARGE_COMPUSTAT_COLUMNS.get(table)
+                    pair_header = DAILY_COMPUSTAT_PAIR_HEADERS.get(table)
+                    table_started_at = datetime.now(UTC).isoformat()
+                    table_started = time.monotonic()
+                    retries = 0
+                    timeouts = 0
+                    try:
+                        if pair_header is not None:
+                            assert selected_columns is not None
+                            pairs = load_security_pairs(con, paths.raw_table_source(pair_header))
+                            download_wrds_daily_table_batched(
+                                source_connection_info,
+                                con,
+                                table,
+                                filename,
+                                pairs,
+                                selected_columns,
+                                date_column=date_columns[table],
+                                end_date=end_date,
+                                start_date=start_date,
+                            )
+                        else:
+                            for attempt in (0, 1):
+                                try:
+                                    download_wrds_table(
+                                        source_connection_info,
+                                        con,
+                                        table,
+                                        filename,
+                                        date_column=date_columns.get(table),
+                                        end_date=end_date,
+                                        start_date=start_date,
+                                        selected_columns=selected_columns,
+                                    )
+                                    break
+                                except Exception as e:
+                                    if attempt or not _is_timeout_error(e):
+                                        raise
+                                    retries = 1
+                                    timeouts = 1
+                                    Path(filename).unlink(missing_ok=True)
+                                    _report_progress(
+                                        f"{source_label} download of {table} timed "
+                                        "out; retrying once."
+                                    )
+                    except Exception as e:
+                        _record_table_download_failure(
+                            table,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            error=e,
+                            retries=retries,
+                            timeouts=timeouts + int(_is_timeout_error(e)),
+                        )
+                        _raise_redacted_source_error(source_label, f"download of {table}", e)
+                    if pair_header is None:
+                        _record_single_table_download(
+                            con,
+                            table,
+                            filename,
+                            started_at_utc=table_started_at,
+                            started_monotonic=table_started,
+                            retries=retries,
+                            timeouts=timeouts,
+                        )
+                    # comp.security is the later of the two pair headers in
+                    # table_names, so the queue's planner inputs are now on disk.
+                    if daily_download_workers > 1 and table == "comp.security":
+                        _report_progress(
+                            f"Downloading {source_label} daily Compustat tables with "
+                            f"{daily_download_workers} shared workers"
+                        )
+                        queue_future = pool.submit(run_context.run, run_daily_queue)
+
+                _report_progress(f"Downloading {source_label} full-history age anchor")
+                anchor_alias = "age_anchor_source"
+                anchor_filename = str(paths.raw_tables_dir / "comp_age_anchor.parquet")
+                anchor_started_at = datetime.now(UTC).isoformat()
+                anchor_started = time.monotonic()
+                try:
+                    con.execute(
+                        f"ATTACH {_sql_literal(source_connection_info)} AS {anchor_alias} "
+                        "(TYPE postgres, READ_ONLY)"
+                    )
+                    download_compustat_age_anchor_attached(
+                        con,
+                        anchor_alias,
+                        anchor_filename,
+                        raw_schema,
+                    )
+                except Exception as e:
+                    _record_table_download_failure(
+                        "comp.age_anchor",
+                        started_at_utc=anchor_started_at,
+                        started_monotonic=anchor_started,
+                        error=e,
+                        timeouts=int(_is_timeout_error(e)),
+                    )
+                    _raise_redacted_source_error(source_label, "age-anchor download", e)
+                finally:
+                    with contextlib.suppress(Exception):
+                        con.execute(f"DETACH {anchor_alias}")
+                _record_single_table_download(
+                    con,
+                    "comp.age_anchor",
+                    anchor_filename,
+                    started_at_utc=anchor_started_at,
+                    started_monotonic=anchor_started,
+                )
+
+                if queue_future is not None:
+                    try:
+                        queue_future.result()
+                    except _DailyBatchDownloadError:
+                        raise
+                    except Exception as error:
+                        _raise_redacted_source_error(source_label, "parallel daily download", error)
+            except BaseException:
+                # Stop the queue so the executor's join does not outlive the error.
+                cancel_event.set()
+                raise
 
     con.close()
 
 
-@measure_time
 def aug_msf_v2(paths: DataPaths):
     """
     Description:
@@ -945,7 +2662,6 @@ def aug_msf_v2(paths: DataPaths):
     msf_aug.to_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
 
 
-@measure_time
 def build_mcti(paths: DataPaths):
     """
     Description:
@@ -977,7 +2693,11 @@ def build_mcti(paths: DataPaths):
 
 
 @measure_time
-def prepare_comp_sf(paths: DataPaths, freq):
+def prepare_comp_sf(
+    paths: DataPaths,
+    freq,
+    bypass_crsp: bool = False,
+):
     """
     Description:
         Prepare Compustat security-file derivatives (Comp DSF/SSF equivalents) for daily/monthly runs.
@@ -985,6 +2705,9 @@ def prepare_comp_sf(paths: DataPaths, freq):
     Steps:
         1) Ensure firm-shares table is populated (populate_own), then create Comp DSF (gen_comp_dsf).
         2) Run process_comp_sf1 for requested frequency: 'd', 'm', or 'both'.
+
+    When ``bypass_crsp`` is True, excess returns use the FF risk-free rate (with a
+    last-month fallback) instead of the CRSP 30y T-bill. See config.BYPASS_CRSP.
 
     Output:
         Intermediate Comp security files written by downstream helpers (no direct return).
@@ -998,10 +2721,10 @@ def prepare_comp_sf(paths: DataPaths, freq):
     )
     gen_comp_dsf(paths)
     if freq == "both":
-        process_comp_sf1(paths, "d")
-        process_comp_sf1(paths, "m")
+        process_comp_sf1(paths, "d", bypass_crsp=bypass_crsp)
+        process_comp_sf1(paths, "m", bypass_crsp=bypass_crsp)
     else:
-        process_comp_sf1(paths, freq)
+        process_comp_sf1(paths, freq, bypass_crsp=bypass_crsp)
 
 
 def populate_own(paths: DataPaths, inset_path, idvar, datevar, datename):
@@ -1082,24 +2805,24 @@ def compustat_fx(paths: DataPaths):
     return __fx1.collect()
 
 
-def adj_trd_vol_NASDAQ(datevar, col_to_adjust, exchg_var, exchg_val):
+def adj_trd_vol_NASDAQ(datevar, col_to_adjust, is_nasdaq_expr):
     """
     Description:
         Apply historic NASDAQ trade-volume adjustments (pre-decimalization reporting) to a volume column.
 
     Steps:
-        1) Build date cutoffs: <2001-02-01, ≤2001-12-31, <2003-12-31.
-        2) If exchg_var == exchg_val (NASDAQ) and within windows, scale col_to_adjust by
+        1) Build date cutoffs: <2001-02-01, ≤2001-12-31, ≤2003-12-31.
+        2) If is_nasdaq_expr is true and within windows, scale col_to_adjust by
         1/2, 1/1.8, or 1/1.6 respectively; otherwise keep original.
         3) Return the adjusted expression aliased as the original column name.
 
     Output:
         Polars expression that yields adjusted trade volume for NASDAQ histories.
     """
-    c1 = col(exchg_var) == exchg_val
+    c1 = is_nasdaq_expr
     c2 = col(datevar) < pl.datetime(2001, 2, 1)
     c3 = col(datevar) <= pl.datetime(2001, 12, 31)
-    c4 = col(datevar) < pl.datetime(2003, 12, 31)
+    c4 = col(datevar) <= pl.datetime(2003, 12, 31)
     adj_trd_vol = (
         pl.when(c1 & c2)
         .then(col(col_to_adjust) / 2)
@@ -1112,6 +2835,64 @@ def adj_trd_vol_NASDAQ(datevar, col_to_adjust, exchg_var, exchg_val):
     return adj_trd_vol
 
 
+def _register_historical_exchange_view(
+    con,
+    *,
+    view_name: str,
+    source_path: Path | str,
+    history_path: Path | str,
+) -> None:
+    """Register a pricing view with EXCHG resolved as of each observation date.
+
+    Compustat's security pricing headers can expose the latest exchange on old
+    observations.  ``sec_history`` is the point-in-time source of truth used by
+    the original SAS code.  An ASOF join is both interval-correct and efficient
+    for the very large daily Parquets.
+    """
+
+    def sql_path(value: Path | str) -> str:
+        return str(value).replace("\\", "/").replace("'", "''")
+
+    current_view = f"{view_name}_current"
+    history_view = f"{view_name}_exchange_history"
+    if not Path(history_path).is_file():
+        con.raw_sql(f"""
+        CREATE VIEW {current_view} AS
+            SELECT * FROM read_parquet('{sql_path(source_path)}');
+        CREATE VIEW {view_name} AS SELECT * FROM {current_view};
+        """)
+        return
+    con.raw_sql(f"""
+    CREATE VIEW {current_view} AS
+        SELECT * FROM read_parquet('{sql_path(source_path)}');
+    CREATE VIEW {history_view} AS
+        SELECT gvkey, iid, historical_exchg, effdate, thrudate
+        FROM read_parquet('{sql_path(history_path)}')
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY gvkey, iid, effdate
+            ORDER BY thrudate DESC NULLS FIRST, historical_exchg
+        ) = 1;
+    CREATE VIEW {view_name} AS
+        SELECT
+            s.* EXCLUDE (exchg),
+            CAST(
+                COALESCE(
+                    CASE
+                        WHEN h.effdate IS NOT NULL
+                         AND (h.thrudate IS NULL OR s.datadate <= h.thrudate)
+                        THEN h.historical_exchg
+                    END,
+                    s.exchg
+                ) AS INTEGER
+            ) AS exchg
+        FROM {current_view} AS s
+        ASOF LEFT JOIN {history_view} AS h
+            ON s.gvkey = h.gvkey
+           AND s.iid = h.iid
+           AND s.datadate >= h.effdate;
+    """)
+
+
 def gen_comp_dsf(paths: DataPaths):
     """
     Description:
@@ -1119,32 +2900,58 @@ def gen_comp_dsf(paths: DataPaths):
         prices/returns/volumes/dividends; store as __comp_dsf.parquet.
 
     Steps:
-        1) Materialize daily FX to fx_data.parquet; register SECD, G_SECD, firm-shares, and FX in DuckDB.
-        2) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
+        1) Materialize daily FX to fx_data.parquet.
+        2) Register SECD, G_SECD, firm-shares, and FX in DuckDB.
+        3) Create __comp_dsf_global from G_SECD: local prices, highs/lows (if prcstd≠5),
         shares traded, shares outstanding, local return index (ri_local), dividend currencies.
-        3) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
-        4) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
-        5) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
-        6) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
+        A missing total-return factor trfd is replaced with 1 (production SAS coalesce).
+        4) Create __comp_dsf_na from SECD with same fields; infer cshoc from firm-shares when missing.
+        5) Adjust NASDAQ (exchg=14) cshtrd by historical factors (2001 windows).
+        6) FULL OUTER JOIN NA and Global records; LEFT JOIN daily FX for trading and dividend currencies.
+        7) Compute USD variables: prc, prc_high, prc_low, market cap (me), USD turnover (dolvol),
         USD return index (ri), dividends (split into total/cash/special); derive month-end eom.
-        7) Drop intermediates and write __comp_dsf.parquet.
+        8) Drop intermediates and write __comp_dsf.parquet.
 
     Output:
         Parquet: __comp_dsf.parquet (daily Compustat security observations in USD).
     """
     (paths.interim_dir / "aux_comp_dsf.ddb").unlink(missing_ok=True)
+
+    # Prepare FX data
+    compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
+
+    g_secd_path = paths.raw_table_source("comp.g_secd")
+    secd_path = paths.raw_table_source("comp.secd")
+
+    # Original SQL processing
+    # Views, not tables: the whole merge/FX/USD pipeline streams in a single
+    # pass at the final COPY instead of materializing five intermediate
+    # tables to the .ddb file. The NASDAQ cshtrd UPDATE is folded into the
+    # __comp_dsf_na view as an equivalent CASE expression.
     con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_dsf.ddb"), threads=os.cpu_count())
 
-    compustat_fx(paths).write_parquet(paths.interim_dir / "fx_data.parquet")
-    con.create_table("comp_g_secd", con.read_parquet(paths.raw_tables_dir / "comp_g_secd.parquet"))
-    con.create_table(
-        "__firm_shares2", con.read_parquet(paths.interim_dir / "__firm_shares2.parquet")
+    history_path = paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet"
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_g_secd",
+        source_path=g_secd_path,
+        history_path=history_path,
     )
-    con.create_table("comp_secd", con.read_parquet(paths.raw_tables_dir / "comp_secd.parquet"))
-    con.create_table("fx", con.read_parquet(paths.interim_dir / "fx_data.parquet"))
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_secd",
+        source_path=secd_path,
+        history_path=history_path,
+    )
+
+    con.raw_sql(f"""
+    CREATE VIEW __firm_shares2 AS
+        SELECT * FROM read_parquet('{(paths.interim_dir / "__firm_shares2.parquet").as_posix()}');
+    CREATE VIEW fx AS SELECT * FROM read_parquet('{(paths.interim_dir / "fx_data.parquet").as_posix()}');
+    """)
 
     con.raw_sql("""
-    CREATE TABLE __comp_dsf_global AS
+    CREATE VIEW __comp_dsf_global AS
     SELECT
         gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prccd / qunit AS prc_local, ajexdi, cshoc / 1e6 AS cshoc,
         CASE
@@ -1155,11 +2962,17 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN prcstd != 5 THEN prcld / qunit
             ELSE NULL
         END AS prc_low_lcl,
-        cshtrd, (prccd / qunit) / ajexdi * trfd AS ri_local,
+        CASE
+            WHEN prcod IS NOT NULL AND prcod > 0 THEN prcod / qunit
+            ELSE NULL
+        END AS prc_open_lcl,
+        -- production SAS (Lior 15.12.2022): coalesce(trfd, 1) — a missing
+        -- total-return factor never nulls the return index
+        cshtrd, (prccd / qunit) / ajexdi * COALESCE(trfd, 1) AS ri_local,
         curcddv, div, divd, divsp
     FROM comp_g_secd;
 
-    CREATE TABLE __comp_dsf_na AS
+    CREATE VIEW __comp_dsf_na AS
     SELECT
         a.gvkey, a.iid, a.datadate, a.tpci, a.exchg, a.prcstd, a.curcdd, a.prccd AS prc_local, a.ajexdi,
         CASE
@@ -1170,29 +2983,31 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN a.prcstd != 5 THEN a.prcld
             ELSE NULL
         END AS prc_low_lcl,
-        a.cshtrd, COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
-        (a.prccd / a.ajexdi * a.trfd) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
+        CASE
+            WHEN a.prcod IS NOT NULL AND a.prcod > 0 THEN a.prcod
+            ELSE NULL
+        END AS prc_open_lcl,
+        -- cast back to the column type: the original UPDATE assigned the
+        -- divided value in place, implicitly rounding to DECIMAL(28,8)
+        CAST(CASE
+            WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrd / 2
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrd / 1.8
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrd / 1.6
+            ELSE a.cshtrd
+        END AS DECIMAL(28, 8)) AS cshtrd,
+        COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
+        (a.prccd / a.ajexdi * COALESCE(a.trfd, 1)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
     LEFT JOIN __firm_shares2 AS b
     ON a.gvkey = b.gvkey AND a.datadate = b.ddate;
 
-    UPDATE __comp_dsf_na
-    SET cshtrd =
-        CASE
-            WHEN datadate <  DATE '2001-02-01' THEN cshtrd / 2
-            WHEN datadate <= DATE '2001-12-31' THEN cshtrd / 1.8
-            WHEN datadate <  DATE '2003-12-31' THEN cshtrd / 1.6
-            ELSE cshtrd
-        END
-    WHERE exchg = 14;
-
-    CREATE TABLE __comp_dsf1 AS
+    CREATE VIEW __comp_dsf1 AS
     SELECT *
     FROM __comp_dsf_na
     FULL OUTER JOIN __comp_dsf_global
-    USING (gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prc_local, ajexdi, prc_high_lcl, prc_low_lcl, cshtrd, cshoc, ri_local, curcddv, div, divd, divsp);
+    USING (gvkey, iid, datadate, tpci, exchg, prcstd, curcdd, prc_local, ajexdi, prc_high_lcl, prc_low_lcl, prc_open_lcl, cshtrd, cshoc, ri_local, curcddv, div, divd, divsp);
 
-    CREATE TABLE __comp_dsf2 AS
+    CREATE VIEW __comp_dsf2 AS
     SELECT a.*, b.fx AS fx, c.fx AS fx_div
     FROM __comp_dsf1 AS a
     LEFT JOIN fx AS b
@@ -1200,12 +3015,13 @@ def gen_comp_dsf(paths: DataPaths):
     LEFT JOIN fx AS c
         ON a.curcddv = c.curcdd AND a.datadate = c.datadate;
 
-    CREATE TABLE __comp_dsf3 AS
+    CREATE VIEW __comp_dsf3 AS
     SELECT
-        *,
+        * EXCLUDE (div, divd, divsp, fx_div, curcddv, prc_high_lcl, prc_low_lcl),
         prc_local    * fx AS prc,
         prc_high_lcl * fx AS prc_high,
         prc_low_lcl  * fx AS prc_low,
+        prc_open_lcl * fx AS prc_open,
         (prc_local   * fx) * cshoc AS me,
         cshtrd       * (prc_local * fx) AS dolvol,
         ri_local     * fx AS ri,
@@ -1217,10 +3033,11 @@ def gen_comp_dsf(paths: DataPaths):
     FROM __comp_dsf2;
 
     """)
-    t = con.table("__comp_dsf3").drop(
-        ["div", "divd", "divsp", "fx_div", "curcddv", "prc_high_lcl", "prc_low_lcl"]
-    )
-    t.to_parquet(paths.interim_dir / "__comp_dsf.parquet")
+
+    con.raw_sql(f"""
+    COPY (SELECT * FROM __comp_dsf3)
+    TO '{(paths.interim_dir / "__comp_dsf.parquet").as_posix()}' (FORMAT PARQUET);
+    """)
     con.disconnect()
 
 
@@ -1310,7 +3127,8 @@ def gen_secm_data(paths: DataPaths):
         2) In CTE:
         - Map SECM fields to local price/hi/low/ajex, compute cshoc fallback from firm-shares,
             adjust NASDAQ cshtrm by historical factors.
-        - Join FX for trading and dividend currencies; compute ri_local.
+        - Join FX for trading and dividend currencies; compute ri_local with the
+            production coalesce(trfm, 1).
         3) Project to final fields: USD prc, prc_high/low, ME, dolvol, RI, total dividends (cash/special null),
         prcstd=10, source=0, and eom=last_day(datadate).
         4) Write to secm_data.parquet.
@@ -1324,10 +3142,11 @@ def gen_secm_data(paths: DataPaths):
     compustat_fx(paths).rename({"datadate": "date"}).write_parquet(
         paths.interim_dir / "fx_data.parquet"
     )
-    con.create_table(
-        "comp_secm",
-        con.read_parquet(paths.raw_tables_dir / "comp_secm.parquet"),
-        overwrite=True,
+    _register_historical_exchange_view(
+        con,
+        view_name="comp_secm",
+        source_path=paths.raw_tables_dir / "comp_secm.parquet",
+        history_path=paths.interim_dir / "raw_data_dfs" / "__exchg_history.parquet",
     )
     con.create_table(
         "__firm_shares2",
@@ -1352,12 +3171,13 @@ def gen_secm_data(paths: DataPaths):
             CASE
             WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrm/2
             WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrm/1.8
-            WHEN a.exchg = 14 AND a.datadate <  DATE '2003-12-31' THEN a.cshtrm/1.6
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrm/1.6
             ELSE a.cshtrm
             END AS cshtrm,
             CASE WHEN a.curcdm    = 'USD' THEN 1 ELSE c.fx END AS fx,
             CASE WHEN a.curcddvm  = 'USD' THEN 1 ELSE d.fx END AS fx_div,
-            a.prccm / a.ajexm * a.trfm AS ri_local
+            -- production SAS (Lior 21.12.2022): coalesce(trfm, 1), matching daily
+            a.prccm / a.ajexm * coalesce(a.trfm, 1) AS ri_local
         FROM comp_secm AS a
         LEFT JOIN __firm_shares2 AS b
             ON a.gvkey    = b.gvkey  AND a.datadate = b.ddate
@@ -1380,7 +3200,8 @@ def gen_secm_data(paths: DataPaths):
         dvpsxm         * fx_div            AS div_tot,
         NULL::DOUBLE                       AS div_cash,
         NULL::DOUBLE                       AS div_spc
-        FROM base;
+        FROM base
+        WHERE prc_local IS NOT NULL AND curcdd IS NOT NULL;
     """)
     con.table("__comp_secm2").to_parquet(paths.interim_dir / "secm_data.parquet")
 
@@ -1528,12 +3349,19 @@ def comp_exchanges(paths: DataPaths):
         WHERE excntry IS NOT NULL AND exchg IS NOT NULL
         GROUP BY exchg
         """
+    # US exchange codes 15, 16, 17, 18, 21 are in `special_exchanges` (normally
+    # excluded), but they are legitimate US exchanges, so for excntry == 'USA'
+    # they are treated as a main exchange. Mirrors the SAS manual change
+    # (project_macros.sas, 30-12-2025).
+    us_override_exchanges = [15, 16, 17, 18, 21]
     exch_exp = (
-        pl.when(
-            (col("excntry") != "multi national") & (col("exchg").is_in(special_exchanges).not_())
-        )
+        pl.when(col("excntry") == "multi national")
+        .then(pl.lit(0))
+        .when((col("excntry") == "USA") & col("exchg").is_in(us_override_exchanges))
         .then(pl.lit(1))
-        .otherwise(pl.lit(0))
+        .when(col("exchg").is_in(special_exchanges))
+        .then(pl.lit(0))
+        .otherwise(pl.lit(1))
         .alias("exch_main")
     )
     comp_r_ex_codes = pl.read_parquet(
@@ -1690,7 +3518,8 @@ def gen_returns_df(paths: DataPaths, freq):
            {gvkey,iid,datadate} keeping highest prcstd (best data quality); sort.
         3) Compute ret and ret_local as pct_change of ri and ri_local over (gvkey,iid).
         4) If iid unchanged but currency changed, set ret_local = ret (reset local base).
-        5) Null-out ±∞/NaN returns; select core columns and collect.
+        5) Null-out ±∞/NaN returns (undefined pct_change, e.g. from a zero prior price);
+           select core columns.
 
     Output:
         Polars DataFrame with {gvkey,iid,datadate,ret,ret_local,ret_lag_dif}.
@@ -1730,6 +3559,10 @@ def gen_returns_df(paths: DataPaths, freq):
             .otherwise(col("ret_local"))
         )
         .with_columns(
+            # Null only ±inf/NaN (an undefined pct_change, e.g. from a zero prior
+            # price). No magnitude filter: the production SAS never screens raw
+            # ret/ret_local — extreme returns are handled downstream by the
+            # winsorized ret_exc_wins column and the return-cutoff clipping.
             ret_local=pl.when(col("ret_local").is_infinite() | col("ret_local").is_nan())
             .then(None)
             .otherwise(col("ret_local")),
@@ -1749,13 +3582,26 @@ def gen_delist_df(paths: DataPaths, __returns):
 
     Steps:
         1) From __returns, keep final nonzero/non-null ret_local per (gvkey,iid).
-        2) Join __sec_info to get secstat/dlrsni; keep inactive (secstat='I').
+        2) Join __sec_info to get secstat/dlrsni/dldtei; keep inactive securities
+           whose vendor inactivation date falls within the downloaded panel.
         3) Map delisting code {02,03} → dlret = -0.30 else 0.0; rename columns.
 
     Output:
         DataFrame {gvkey,iid,date_delist,dlret} for use in delisting adjustments.
+
+    Note:
+        `dldtei` is compared against the end of the whole panel, not against the
+        security's own last observation. Compustat sets the inactivation date
+        *after* the final observation in 99.3% of delistings (732 of 737 sampled
+        on WRDS, median 2 days in North America and 5 days globally), so a
+        per-security comparison never fires: it suppressed both the truncation and
+        the -0.30 delisting return for nearly every delisting. The panel-wide test
+        still blocks the case it was written for — a security that goes inactive
+        after the downloaded window, which must not have its final weeks truncated
+        or a delisting return applied early.
     """
     __sec_info = pl.scan_parquet(paths.interim_dir / "raw_data_dfs" / "__sec_info.parquet")
+    panel_end = __returns["datadate"].max()
     __delist = (
         __returns.lazy()
         .filter((col("ret_local").is_not_null()) & (col("ret_local") != 0.0))
@@ -1764,7 +3610,10 @@ def gen_delist_df(paths: DataPaths, __returns):
         .unique(["gvkey", "iid"], keep="last")
         .join(__sec_info, how="left", on=["gvkey", "iid"])
         .rename({"datadate": "date_delist"})
-        .filter(col("secstat") == "I")
+        .filter(
+            (col("secstat") == "I")
+            & (col("dldtei").is_null() | (col("dldtei") <= pl.lit(panel_end)))
+        )
         .with_columns(
             dlret=pl.when(col("dlrsni").is_in(["02", "03"]))
             .then(pl.lit(-0.3))
@@ -1808,7 +3657,9 @@ def gen_temporary_sf(paths: DataPaths, freq, __returns, __delist):
     return temp_sf
 
 
-def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
+def add_rf_and_exchange_data_to_temporary_sf(
+    paths: DataPaths, freq, temp_sf, bypass_crsp: bool = False
+):
     """
     Description:
         Append T-bill / RF and exchange metadata to the temp security file; compute excess returns.
@@ -1818,11 +3669,41 @@ def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
         2) Compute ret_exc = ret − (t30ret or rf)/scale, with scale=1 (m) or 21 (d).
         3) Cast exchg to int64 and join exchange-country mapping.
 
+    When ``bypass_crsp`` is True the CRSP 30y T-bill (t30ret) is unavailable, so
+    excess returns use the FF risk-free rate with a last-available-month fallback
+    for recent dates not yet published by FF:
+    ``ret_exc = ret − coalesce(rf, last_rf)/scale``. This mirrors the SAS
+    ``bypass_crsp`` path (``coalesce(c.rf, &lffm.)``). See config.BYPASS_CRSP.
+
     Output:
         Polars LazyFrame temp_sf with ret_exc and exchange info attached.
     """
-    crsp_mcti, ff_factors_monthly, __exchanges = load_rf_and_exchange_data(paths)
     scale = 1 if (freq == "m") else 21
+
+    if bypass_crsp:
+        ff_factors_monthly = add_MMYY_column_drop_original(
+            pl.scan_parquet(paths.interim_dir / "raw_data_dfs" / "ff_factors_monthly.parquet"),
+            "date",
+        ).collect()
+        # Last available FF risk-free rate (highest month index), used as a
+        # fallback for recent dates FF has not yet published.
+        last_rf = (
+            ff_factors_monthly.sort("merge_aux").select(pl.col("rf").last()).item()
+            if ff_factors_monthly.height > 0
+            else None
+        )
+        __exchanges = comp_exchanges(paths)
+        temp_sf = (
+            temp_sf.with_columns(merge_aux=gen_MMYY_column("datadate"))
+            .join(ff_factors_monthly, how="left", on="merge_aux")
+            .with_columns(ret_exc=col("ret") - pl.coalesce(["rf", pl.lit(last_rf)]) / scale)
+            .drop(["merge_aux", "rf"])
+            .with_columns(col("exchg").cast(pl.Int64))
+            .join(__exchanges, how="left", on=["exchg"])
+        )
+        return temp_sf
+
+    crsp_mcti, ff_factors_monthly, __exchanges = load_rf_and_exchange_data(paths)
     temp_sf = (
         temp_sf.with_columns(merge_aux=gen_MMYY_column("datadate"))
         .join(crsp_mcti, how="left", on="merge_aux")
@@ -1835,20 +3716,37 @@ def add_rf_and_exchange_data_to_temporary_sf(paths: DataPaths, freq, temp_sf):
     return temp_sf
 
 
-def process_comp_sf1(paths: DataPaths, freq):
+def process_comp_sf1(paths: DataPaths, freq, bypass_crsp: bool = False):
     """
     Description:
         Full pipeline to build Compustat monthly or daily security files with returns,
-        excess returns, exchange flags, and primary_sec indicator.
+        excess returns, exchange flags, and primary_sec indicator.  For daily
+        frequency, also computes the Lou, Polk, and Skouras (2019) overnight /
+        intraday decomposition in both USD and local currency:
+
+            ret_intraday       = prc / prc_open - 1
+            ret_overnight      = (1 + ret) / (1 + ret_intraday) - 1
+            ret_intraday_local = ret_intraday   # FX cancels in open/close ratio
+            ret_overnight_local = (1 + ret_local) / (1 + ret_intraday_local) - 1
+
+        so that (1 + ret_intraday)(1 + ret_overnight) = (1 + ret) and
+        (1 + ret_intraday_local)(1 + ret_overnight_local) = (1 + ret_local).
 
     Steps:
         1) If monthly, run gen_comp_msf() to ensure comp_msf/parquets exist.
         2) Compute __returns → gen_delist_df → gen_temporary_sf.
         3) Add RF/exchange metadata; write __comp_sf2.parquet.
-        4) Call add_primary_sec(...) to add primary_sec and write final comp_{freq}sf.parquet.
+        4) For daily, compute LPS (2019) overnight/intraday return decomposition
+           (USD and local) when prc_open is available.
+        5) Call add_primary_sec(...) to add primary_sec and write final comp_{freq}sf.parquet.
+
+    When ``bypass_crsp`` is True, excess returns use the FF risk-free rate (with a
+    last-month fallback) instead of the CRSP 30y T-bill. See config.BYPASS_CRSP.
 
     Output:
-        comp_msf.parquet or comp_dsf.parquet with enriched fields (ret_exc, primary_sec, etc.).
+        comp_msf.parquet or comp_dsf.parquet with enriched fields (ret_exc,
+        primary_sec, and for daily: ret_intraday, ret_overnight,
+        ret_intraday_local, ret_overnight_local).
     """
     # Eager mode is faster here
     if freq == "m":
@@ -1856,7 +3754,32 @@ def process_comp_sf1(paths: DataPaths, freq):
     __returns = gen_returns_df(paths, freq)
     __delist = gen_delist_df(paths, __returns)
     __comp_sf2 = gen_temporary_sf(paths, freq, __returns, __delist)
-    __comp_sf2 = add_rf_and_exchange_data_to_temporary_sf(paths, freq, __comp_sf2)
+    __comp_sf2 = add_rf_and_exchange_data_to_temporary_sf(
+        paths, freq, __comp_sf2, bypass_crsp=bypass_crsp
+    )
+
+    if freq == "d" and "prc_open" in __comp_sf2.columns:
+        __comp_sf2 = (
+            __comp_sf2.with_columns(
+                ret_intraday=pl.when((col("prc_open") > 0) & (col("prc") > 0))
+                .then(col("prc") / col("prc_open") - 1)
+                .otherwise(fl_none()),
+            )
+            .with_columns(
+                ret_overnight=pl.when(col("ret_intraday").is_not_null() & col("ret").is_not_null())
+                .then((1 + col("ret")) / (1 + col("ret_intraday")) - 1)
+                .otherwise(fl_none()),
+                ret_intraday_local=col("ret_intraday"),
+            )
+            .with_columns(
+                ret_overnight_local=pl.when(
+                    col("ret_intraday_local").is_not_null() & col("ret_local").is_not_null()
+                )
+                .then((1 + col("ret_local")) / (1 + col("ret_intraday_local")) - 1)
+                .otherwise(fl_none()),
+            )
+        )
+
     __comp_sf2.write_parquet(paths.interim_dir / "__comp_sf2.parquet")
     del __comp_sf2
     add_primary_sec(
@@ -1907,7 +3830,18 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         Clean and finalize the CRSP security-file panel (monthly or daily) produced by gen_crsp_sf.
         This step adds trading-volume diagnostics, dividend totals, delisting-return adjustments,
         excess returns (over T-bill / RF), and company-level market equity, using the CIZ delist
-        fields (DelReasonType/DelActionType/DelPaymentType/DelStatusType).
+        fields (DelReasonType/DelActionType/DelPaymentType/DelStatusType).  For daily frequency,
+        also computes the Lou, Polk, and Skouras (2019) overnight / intraday decomposition in both
+        USD and local currency.  The intraday leg uses prc_close (dlyclose, the actual closing
+        trade) rather than prc (dlyprc, which may be a bid–ask midpoint):
+
+            ret_intraday       = prc_close / prc_open - 1
+            ret_overnight      = (1 + ret) / (1 + ret_intraday) - 1
+            ret_intraday_local = ret_intraday   # FX cancels; for CRSP, ret_local == ret
+            ret_overnight_local = (1 + ret) / (1 + ret_intraday_local) - 1
+
+        so that (1 + ret_intraday)(1 + ret_overnight) = (1 + ret).  For CRSP (USD),
+        ret_overnight_local equals ret_overnight because ret_local equals ret.
 
     Steps:
         1) Read raw_data_dfs/__crsp_sf_{freq}.parquet; cast key numeric columns; apply NASDAQ volume adjustment.
@@ -1915,11 +3849,13 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         3) Join CRSP delists (crsp_{freq}sedelist); impute missing delret = −0.30 for “bad delist” buckets defined by CIZ codes;
            set ret=0 when ret is missing but delret exists; compound ret with delret.
         4) Join risk-free proxies (CRSP T-bill and FF RF) and compute excess return ret_exc; compute company ME by summing ME across permnos within permco-date.
-        5) If monthly, rescale vol and dolvol for unit alignment.
-        6) Drop helper columns, deduplicate by (permno, date), sort, and write crsp_{freq}sf.parquet.
+        5) If daily, compute LPS (2019) overnight/intraday returns (USD and local).
+        6) If monthly, rescale vol and dolvol for unit alignment.
+        7) Drop helper columns, deduplicate by (permno, date), sort, and write crsp_{freq}sf.parquet.
 
     Output:
-        Writes crsp_msf.parquet (freq="m") or crsp_dsf.parquet (freq="d") with cleaned returns and ret_exc.
+        Writes crsp_msf.parquet (freq="m") or crsp_dsf.parquet (freq="d") with cleaned returns,
+        ret_exc, and for daily: ret_intraday, ret_overnight, ret_intraday_local, ret_overnight_local.
     """
     assert freq in ("m", "d")
 
@@ -1930,11 +3866,26 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         .with_columns(
             [
                 col(var).cast(pl.Float64)
-                for var in ["prc", "cfacshr", "ret", "retx", "prc_high", "prc_low"]
+                for var in [
+                    "prc",
+                    "cfacshr",
+                    "ret",
+                    "retx",
+                    "prc_high",
+                    "prc_low",
+                    "prc_open",
+                    "prc_close",
+                ]
             ]
             + [col("vol").cast(pl.Int64)]
         )
-        .with_columns(adj_trd_vol_NASDAQ("date", "vol", "exchcd", 3))
+        .with_columns(
+            adj_trd_vol_NASDAQ(
+                "date",
+                "vol",
+                (pl.col("primaryexch") == "Q") & (pl.col("conditionaltype") == "RW"),
+            )
+        )
         .sort(["permno", "date"])
         .with_columns(
             dolvol=col("prc").abs() * col("vol"),
@@ -2034,6 +3985,31 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         .with_columns(ret_exc=ret_exc_exp, me_company=me_company_exp)
     )
 
+    # LPS (2019) overnight/intraday return decomposition (daily only).
+    # prc_close is the actual closing trade price (dlyclose), distinct from
+    # prc (dlyprc) which may be a bid-ask midpoint.
+    if freq == "d":
+        __crsp_sf = (
+            __crsp_sf.with_columns(
+                ret_intraday=pl.when((col("prc_close") > 0) & (col("prc_open") > 0))
+                .then(col("prc_close") / col("prc_open") - 1)
+                .otherwise(fl_none()),
+            )
+            .with_columns(
+                ret_overnight=pl.when(col("ret_intraday").is_not_null() & col("ret").is_not_null())
+                .then((1 + col("ret")) / (1 + col("ret_intraday")) - 1)
+                .otherwise(fl_none()),
+                ret_intraday_local=col("ret_intraday"),
+            )
+            .with_columns(
+                ret_overnight_local=pl.when(
+                    col("ret_intraday_local").is_not_null() & col("ret").is_not_null()
+                )
+                .then((1 + col("ret")) / (1 + col("ret_intraday_local")) - 1)
+                .otherwise(fl_none()),
+            )
+        )
+
     if freq == "m":
         __crsp_sf = __crsp_sf.with_columns(
             [(col(var) * 100).alias(var) for var in ["vol", "dolvol"]]
@@ -2061,7 +4037,7 @@ def prepare_crsp_sf(paths: DataPaths, freq):
 
 
 @measure_time
-def combine_crsp_comp_sf(paths: DataPaths) -> None:
+def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
     """
     Description:
         Create unified monthly and daily security datasets by combining CRSP and Compustat,
@@ -2071,10 +4047,18 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
         1) Connect to DuckDB (persistent file for out-of-core processing).
         2) Create monthly world table: normalize CRSP/Comp → UNION ALL → LEAD(ret_exc).
         3) Derive obs_main: prefer CRSP when multiple observations per (gvkey, iid, eom).
-        4) Write __msf_world.parquet with deterministic dedup (primary_sec preferred
+        4) In CRSP-bypass mode, recompute me_company for USA main-exchange rows as the
+           (gvkey, date) sum over all USA main-exchange listings, pre-dedup (production
+           SAS update); every other row keeps its incoming me_company.
+        5) Write __msf_world.parquet with deterministic dedup (primary_sec preferred
            on tie via ROW_NUMBER).
-        5) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
-        6) Clean up DuckDB file.
+        6) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
+        7) Clean up DuckDB file.
+
+    When ``bypass_crsp`` is True, the CRSP normalization CTEs and the UNION ALL are
+    dropped so the world files are built from Compustat only (every row has
+    source_crsp=0); the CRSP monthly/daily parquet inputs are not read. This
+    mirrors the SAS ``bypass_crsp`` path. See config.BYPASS_CRSP.
 
     Note on the dedup tie-break (ORDER BY source_crsp DESC, primary_sec DESC):
         CRSP rows use raw permno as id (5-digit ints), while Compustat rows construct
@@ -2103,20 +4087,24 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
     comp_dsf_path = (paths.interim_dir / "comp_dsf.parquet").as_posix()
     msf_world_out = (paths.interim_dir / "__msf_world.parquet").as_posix()
     world_dsf_out = (paths.interim_dir / "world_dsf.parquet").as_posix()
-    try:
-        # Monthly: normalize CRSP/Comp, UNION ALL, compute ret_exc_lead1m
-        con.execute(f"""
-            CREATE TABLE sf_world_m AS
-            WITH crsp_msf_norm AS (
+
+    # In CRSP-bypass mode the CRSP normalization CTEs are omitted and the world
+    # files are sourced from the Compustat CTE only (no UNION ALL). The CRSP
+    # parquet inputs are never read. See config.BYPASS_CRSP.
+    crsp_msf_norm_cte = (
+        ""
+        if bypass_crsp
+        else f"""crsp_msf_norm AS (
                 SELECT
                     permno AS id, permno, permco, gvkey, iid,
                     'USA' AS excntry,
                     exch_main::INT AS exch_main,
-                    CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
+                    common::INT AS common,
                     1 AS primary_sec,
                     bidask::INT AS bidask,
-                    shrcd::DOUBLE AS crsp_shrcd,
-                    exchcd::DOUBLE AS crsp_exchcd,
+                    primaryexch,
+                    conditionaltype,
+                    crsp_nyse::INT AS crsp_nyse,
                     NULL::VARCHAR AS comp_tpci,
                     NULL::BIGINT AS comp_exchg,
                     'USD' AS curcd,
@@ -2139,7 +4127,58 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                     1 AS source_crsp
                 FROM read_parquet('{crsp_msf_path}')
             ),
-            comp_msf_norm AS (
+            """
+    )
+    monthly_union = (
+        "SELECT * FROM comp_msf_norm"
+        if bypass_crsp
+        else """SELECT * FROM crsp_msf_norm
+                UNION ALL
+                SELECT * FROM comp_msf_norm"""
+    )
+    crsp_dsf_norm_cte = (
+        ""
+        if bypass_crsp
+        else f"""crsp_dsf_norm AS (
+                    SELECT
+                        permno AS id,
+                        'USA' AS excntry,
+                        exch_main::INT AS exch_main,
+                        common::INT AS common,
+                        1 AS primary_sec,
+                        bidask::INT AS bidask,
+                        'USD' AS curcd,
+                        1.0 AS fx,
+                        date,
+                        last_day(date) AS eom,
+                        cfacshr AS adjfct,
+                        shrout AS shares,
+                        me, dolvol,
+                        vol AS tvol,
+                        prc, prc_high, prc_low,
+                        NULL::DOUBLE AS prc_open_lcl,
+                        ret AS ret_local,
+                        ret, ret_exc,
+                        ret_intraday, ret_overnight,
+                        ret_intraday_local, ret_overnight_local,
+                        1::BIGINT AS ret_lag_dif,
+                        1 AS source_crsp
+                    FROM read_parquet('{crsp_dsf_path}')
+                ),
+                """
+    )
+    daily_union = (
+        "SELECT * FROM comp_dsf_norm"
+        if bypass_crsp
+        else """SELECT * FROM crsp_dsf_norm
+                    UNION ALL
+                    SELECT * FROM comp_dsf_norm"""
+    )
+    try:
+        # Monthly: normalize CRSP/Comp, UNION ALL, compute ret_exc_lead1m
+        con.execute(f"""
+            CREATE TABLE sf_world_m AS
+            WITH {crsp_msf_norm_cte}comp_msf_norm AS (
                 SELECT
                     CAST(
                         CASE
@@ -2155,8 +4194,9 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                     CASE WHEN tpci = '0' THEN 1 ELSE 0 END AS common,
                     primary_sec::INT AS primary_sec,
                     CASE WHEN prcstd = 4 THEN 1 ELSE 0 END AS bidask,
-                    NULL::DOUBLE AS crsp_shrcd,
-                    NULL::DOUBLE AS crsp_exchcd,
+                    NULL::VARCHAR AS primaryexch,
+                    NULL::VARCHAR AS conditionaltype,
+                    0 AS crsp_nyse,
                     tpci AS comp_tpci,
                     exchg::BIGINT AS comp_exchg,
                     curcdd AS curcd,
@@ -2180,11 +4220,14 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                     WHEN LEAD(ret_lag_dif, 1) OVER (PARTITION BY id ORDER BY eom) != 1
                     THEN NULL
                     ELSE LEAD(ret_exc, 1) OVER (PARTITION BY id ORDER BY eom)
-                END AS ret_exc_lead1m
+                END AS ret_exc_lead1m,
+                CASE
+                    WHEN LEAD(ret_lag_dif, 1) OVER (PARTITION BY id ORDER BY eom) != 1
+                    THEN NULL
+                    ELSE LEAD(ret_local, 1) OVER (PARTITION BY id ORDER BY eom)
+                END AS ret_local_lead1m
             FROM (
-                SELECT * FROM crsp_msf_norm
-                UNION ALL
-                SELECT * FROM comp_msf_norm
+                {monthly_union}
             ) unioned
         """)
 
@@ -2209,21 +4252,39 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
             GROUP BY id, eom
         """)
 
+        # In CRSP-bypass mode the production SAS recomputes me_company for USA
+        # main-exchange rows as the (gvkey, date) sum over all USA main-exchange
+        # listings — share classes and preferred issues alike, with no
+        # tpci/common filter — computed on the pre-dedup panel; every other row
+        # keeps its issue me. With CRSP present the original SAS has no such
+        # update: CRSP rows carry the permco aggregate, Compustat rows keep me.
+        me_company_expr = (
+            "CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
+            "THEN COALESCE(SUM(CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
+            "THEN a.me END) OVER (PARTITION BY a.gvkey, a.date), a.me) "
+            "ELSE a.me_company END"
+            if bypass_crsp
+            else "a.me_company"
+        )
+
         # Write monthly output with deterministic dedup (prefer CRSP)
         con.execute(f"""
             COPY (
                 SELECT
                     id, permno, permco, gvkey, iid, excntry, exch_main, common,
-                    primary_sec, bidask, crsp_shrcd, crsp_exchcd, comp_tpci, comp_exchg,
-                    curcd, fx, date, eom, adjfct, shares, me, me_company, prc, prc_local,
+                    primary_sec, bidask, primaryexch, conditionaltype, crsp_nyse, comp_tpci, comp_exchg,
+                    curcd, fx, date, eom, adjfct, shares, me,
+                    _me_company AS me_company, prc, prc_local,
                     prc_high, prc_low, dolvol, tvol, ret, ret_local, ret_exc, ret_lag_dif,
-                    div_tot, div_cash, div_spc, source_crsp, ret_exc_lead1m, obs_main
+                    div_tot, div_cash, div_spc, source_crsp, ret_exc_lead1m,
+                    ret_local_lead1m, obs_main
                 FROM (
                     -- source_crsp DESC is a no-op today (CRSP/Comp ids don't collide);
                     -- primary_sec DESC is the real tie-break: when Compustat rows
                     -- disagree on primary_sec for the same (id, eom), prefer the
                     -- primary one. See combine_crsp_comp_sf docstring for details.
                     SELECT a.*, b.obs_main,
+                        {me_company_expr} AS _me_company,
                         ROW_NUMBER() OVER (
                             PARTITION BY a.id, a.eom
                             ORDER BY a.source_crsp DESC, a.primary_sec DESC
@@ -2242,30 +4303,7 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
         # Daily: normalize CRSP/Comp, UNION ALL, join obs_main, dedup, write
         con.execute(f"""
             COPY (
-                WITH crsp_dsf_norm AS (
-                    SELECT
-                        permno AS id,
-                        'USA' AS excntry,
-                        exch_main::INT AS exch_main,
-                        CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
-                        1 AS primary_sec,
-                        bidask::INT AS bidask,
-                        'USD' AS curcd,
-                        1.0 AS fx,
-                        date,
-                        last_day(date) AS eom,
-                        cfacshr AS adjfct,
-                        shrout AS shares,
-                        me, dolvol,
-                        vol AS tvol,
-                        prc, prc_high, prc_low,
-                        ret AS ret_local,
-                        ret, ret_exc,
-                        1::BIGINT AS ret_lag_dif,
-                        1 AS source_crsp
-                    FROM read_parquet('{crsp_dsf_path}')
-                ),
-                comp_dsf_norm AS (
+                WITH {crsp_dsf_norm_cte}comp_dsf_norm AS (
                     SELECT
                         CAST(
                             CASE
@@ -2287,16 +4325,16 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                         cshoc AS shares,
                         me, dolvol,
                         cshtrd AS tvol,
-                        prc, prc_high, prc_low,
+                        prc, prc_high, prc_low, prc_open_lcl,
                         ret_local, ret, ret_exc,
+                        ret_intraday, ret_overnight,
+                        ret_intraday_local, ret_overnight_local,
                         ret_lag_dif::BIGINT AS ret_lag_dif,
                         0 AS source_crsp
                     FROM read_parquet('{comp_dsf_path}')
                 ),
                 sf_world_d AS (
-                    SELECT * FROM crsp_dsf_norm
-                    UNION ALL
-                    SELECT * FROM comp_dsf_norm
+                    {daily_union}
                 ),
                 ranked AS (
                     -- See dedup tie-break note in monthly block above.
@@ -2311,7 +4349,9 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
                 SELECT
                     id, excntry, exch_main, common, primary_sec, bidask, curcd, fx,
                     date, eom, adjfct, shares, me, dolvol, tvol, prc, prc_high, prc_low,
-                    ret_local, ret, ret_exc, ret_lag_dif, source_crsp, obs_main
+                    prc_open_lcl, ret_local, ret, ret_exc, ret_intraday, ret_overnight,
+                    ret_intraday_local, ret_overnight_local,
+                    ret_lag_dif, source_crsp, obs_main
                 FROM ranked
                 WHERE _rn = 1
                 ORDER BY id, date
@@ -2320,6 +4360,70 @@ def combine_crsp_comp_sf(paths: DataPaths) -> None:
     finally:
         con.close()
         (paths.interim_dir / "aux_combine_sf.ddb").unlink(missing_ok=True)
+
+
+@measure_time
+def compound_overnight_intraday(paths: DataPaths) -> None:
+    """
+    Description:
+        Compound daily overnight/intraday returns (USD and local) to monthly
+        and join onto world_msf.  This implements the monthly aggregation of
+        the LPS (2019) decomposition: ret_X_m = prod(1 + ret_X_d) - 1 for
+        X in {intraday, overnight, intraday_local, overnight_local}.  Also
+        computes one-month-ahead leads (_lead1m) mirroring the ret_exc_lead1m
+        logic.
+
+    Steps:
+        1) Read world_dsf.parquet with ret_intraday, ret_overnight,
+           ret_intraday_local, and ret_overnight_local.
+        2) For each (id, eom) group, compound daily returns to monthly.
+        3) Left-join onto world_msf (__msf_world.parquet).
+        4) Compute lead columns gated by ret_lag_dif == 1.
+        5) Overwrite __msf_world.parquet.
+
+    Output:
+        Overwrites __msf_world.parquet with ret_intraday, ret_overnight,
+        ret_intraday_local, ret_overnight_local, and their _lead1m variants.
+    """
+    msf_path = paths.interim_dir / "__msf_world.parquet"
+
+    oi_cols = [
+        "ret_intraday",
+        "ret_overnight",
+        "ret_intraday_local",
+        "ret_overnight_local",
+    ]
+
+    monthly_oi = (
+        pl.scan_parquet(paths.interim_dir / "world_dsf.parquet")
+        .select(["id", "eom"] + oi_cols)
+        .group_by(["id", "eom"])
+        .agg(
+            [
+                pl.when(col(c).is_null().any())
+                .then(fl_none())
+                .otherwise((col(c) + 1).product() - 1)
+                .alias(c)
+                for c in oi_cols
+            ]
+        )
+    )
+
+    msf = (
+        pl.scan_parquet(msf_path)
+        .join(monthly_oi, on=["id", "eom"], how="left")
+        .sort(["id", "eom"])
+        .with_columns(
+            [
+                pl.when(col("ret_lag_dif").shift(-1).over("id") == 1)
+                .then(col(c).shift(-1).over("id"))
+                .otherwise(fl_none())
+                .alias(f"{c}_lead1m")
+                for c in oi_cols
+            ]
+        )
+    )
+    msf.collect().write_parquet(msf_path)
 
 
 @measure_time
@@ -2350,7 +4454,7 @@ def crsp_industry(paths: DataPaths):
     permno0.collect().write_parquet(paths.interim_dir / "crsp_ind.parquet")
 
 
-def comp_hgics(paths: DataPaths, lib):
+def comp_hgics(paths: DataPaths, lib, end_date: date = END_DATE):
     """
     Description:
         Expand Compustat GICS history (national/global) to a daily panel with forward-filled
@@ -2358,7 +4462,8 @@ def comp_hgics(paths: DataPaths, lib):
 
     Steps:
         1) Load raw file (national/global); replace null gics with -999 sentinel.
-        2) Compute row counts and terminal rows; set open-ended indthru to (max(indfrom) or END_DATE).
+        2) Compute row counts and terminal rows; set open-ended indthru to
+           (max(indfrom) or the runtime end date).
         3) Create date ranges [indfrom, indthru]; explode; unique per (gvkey,date).
         4) Write to na_hgics.parquet or g_hgics.parquet.
 
@@ -2377,15 +4482,26 @@ def comp_hgics(paths: DataPaths, lib):
         },
     }
     data = pl.read_parquet(file_paths["raw data"][lib])  # .sort(['gvkey', 'indfrom'])
+    if data.is_empty():
+        pl.DataFrame(schema={"gvkey": pl.String, "date": pl.Date, "gics": pl.Int64}).write_parquet(
+            file_paths["output"][lib]
+        )
+        return
+
     data = data.with_columns(
         gics=pl.when(col("gics").is_null()).then(-999).otherwise(col("gics")),
+    ).sort(["gvkey", "indfrom"])
+    data = data.with_columns(
         n=pl.len().over("gvkey"),
         n_aux=pl.cum_count("gvkey").over("gvkey"),
     )
+    # max() is None when every indfrom is null; fall back to end_date so the
+    # comparison cannot raise on a degenerate input.
+    max_indfrom = data[["indfrom"]].max()[0, 0]
     indthru_date = (
-        pl.lit(data[["indfrom"]].max()[0, 0])
-        if data[["indfrom"]].max()[0, 0] > END_DATE
-        else pl.lit(END_DATE)
+        pl.lit(max_indfrom)
+        if max_indfrom is not None and max_indfrom > end_date
+        else pl.lit(end_date)
     )
     c1 = col("n") == col("n_aux")
     c2 = col("indthru").is_null()
@@ -2399,7 +4515,7 @@ def comp_hgics(paths: DataPaths, lib):
     data.write_parquet(file_paths["output"][lib])
 
 
-def hgics_join(paths: DataPaths):
+def hgics_join(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Merge national and global GICS daily panels, preferring local (national) where available.
@@ -2412,8 +4528,8 @@ def hgics_join(paths: DataPaths):
     Output:
         Parquet comp_hgics.parquet with consolidated GICS per (gvkey,date).
     """
-    comp_hgics(paths, "global")
-    comp_hgics(paths, "national")
+    comp_hgics(paths, "global", end_date=end_date)
+    comp_hgics(paths, "national", end_date=end_date)
     global_data = pl.scan_parquet(paths.interim_dir / "g_hgics.parquet")
     local_data = pl.scan_parquet(paths.interim_dir / "na_hgics.parquet")
     gjoin = local_data.join(global_data, on=["gvkey", "date"], how="full", coalesce=True)
@@ -2422,7 +4538,7 @@ def hgics_join(paths: DataPaths):
         .unique(["gvkey", "date"])
         .sort(["gvkey", "date"])
     )
-    gjoin.collect().write_parquet(paths.interim_dir / "comp_hgics.parquet")
+    gjoin.sink_parquet(paths.interim_dir / "comp_hgics.parquet")
 
 
 def comp_sic_naics(paths: DataPaths):
@@ -2526,86 +4642,62 @@ def comp_sic_naics(paths: DataPaths):
         .unique(["gvkey", "date"])
         .sort(["gvkey", "date"])
     )
-    comp.collect().write_parquet(paths.interim_dir / "comp_other.parquet")
+    comp.sink_parquet(paths.interim_dir / "comp_other.parquet")
     con.disconnect()
 
 
 @measure_time
-def comp_industry(paths: DataPaths):
+def comp_industry(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
-        Merge daily GICS and SIC/NAICS into a single daily Compustat industry file,
-        filling gaps day-by-day to ensure continuity.
+        Merge daily GICS and SIC/NAICS into a single daily Compustat industry file with a
+        continuous daily date axis; days between observations carry null industry codes.
 
     Steps:
-        1) Run comp_sic_naics() and hgics_join(); load into DuckDB.
+        1) Run comp_sic_naics() and hgics_join(); scan both panels lazily.
         2) Full-outer-join on (gvkey,date); compute aux_date = next date − 1 day to detect gaps.
-        3) Build gap ranges via generate_series and fill from gap_dates; union with continuous rows.
-        4) Select distinct first by (gvkey,date); write comp_ind.parquet.
+        3) Emit interior gap days [date+1, aux_date] with null codes (only the gap-start day
+           carries values, matching the historical SQL gap-fill behaviour).
+        4) Concatenate joined rows with gap rows; sort; sink comp_ind.parquet.
 
     Output:
         Parquet comp_ind.parquet with {gvkey,date,gics,sic,naics} daily.
     """
     comp_sic_naics(paths)
-    hgics_join(paths)
-    (paths.interim_dir / "aux_comp_ind.ddb").unlink(missing_ok=True)
-    con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_ind.ddb"), threads=os.cpu_count())
-    con.create_table("comp_other", con.read_parquet(paths.interim_dir / "comp_other.parquet"))
-    con.create_table("comp_gics", con.read_parquet(paths.interim_dir / "comp_hgics.parquet"))
-    con.raw_sql("""
-                DROP TABLE IF EXISTS join_table;
-                CREATE TABLE join_table AS
-                SELECT          *,
-                                COALESCE( LEAD(date) OVER (PARTITION BY gvkey ORDER BY date) - INTERVAL '1 day', date )::DATE AS aux_date
-                FROM            comp_gics
-                FULL OUTER JOIN comp_other
-                USING           (gvkey, date);
-
-                DROP TABLE IF EXISTS gap_dates;
-                CREATE TABLE gap_dates AS
-                SELECT *
-                FROM join_table
-                WHERE date <> aux_date;
-
-                DROP TABLE IF EXISTS gaps;
-                CREATE TABLE gaps AS
-                WITH full_span AS (
-                SELECT
-                    j.gvkey, gs.gap_date::DATE AS date,
-                    FROM gap_dates as j
-                    CROSS JOIN LATERAL
-                    generate_series(j.date, j.aux_date, INTERVAL '1 day') AS gs(gap_date)
-                    ORDER BY gvkey, date
-                )
-                SELECT
-                fs.gvkey, fs.date, gd.gics, gd.sic, gd.naics
-                FROM full_span fs
-                LEFT JOIN gap_dates gd
-                ON gd.gvkey = fs.gvkey
-                AND gd.date  = fs.date
-                ORDER BY fs.gvkey, fs.date;
-
-                DROP TABLE IF EXISTS continuous;
-                CREATE TABLE continuous AS
-                SELECT *
-                FROM join_table
-                WHERE date = aux_date;
-
-                DROP TABLE IF EXISTS merged_data;
-                CREATE TABLE merged_data AS
-                SELECT gvkey, date, gics, sic, naics FROM continuous
-                UNION
-                SELECT gvkey, date, gics, sic, naics FROM gaps;
-
-                DROP TABLE IF EXISTS comp_industry;
-                CREATE TABLE comp_industry AS
-                SELECT DISTINCT ON (gvkey, date)
-                    *
-                FROM merged_data
-                ORDER BY (gvkey, date);
-    """)
-    con.table("comp_industry").to_parquet(paths.interim_dir / "comp_ind.parquet")
-    con.disconnect()
+    hgics_join(paths, end_date=end_date)
+    comp_gics = pl.scan_parquet(paths.interim_dir / "comp_hgics.parquet")
+    comp_other = pl.scan_parquet(paths.interim_dir / "comp_other.parquet")
+    joined = (
+        comp_gics.join(comp_other, on=["gvkey", "date"], how="full", coalesce=True)
+        # Null dates (from GICS records with null indfrom) were silently dropped by the
+        # historical SQL: both `WHERE date <> aux_date` and `WHERE date = aux_date`
+        # evaluate to NULL for them, excluding the rows from every output branch.
+        .filter(pl.col("date").is_not_null())
+        .sort(["gvkey", "date"])
+        .with_columns(
+            aux_date=pl.coalesce(
+                pl.col("date").shift(-1).over("gvkey") - pl.duration(days=1),
+                pl.col("date"),
+            )
+        )
+    )
+    schema = joined.collect_schema()
+    # Interior days of each gap get null industry codes: the historical SQL left-joined
+    # gap_dates on the exact date, so only the gap-start day (already present in the
+    # joined panel) carried values.
+    gap_rows = (
+        joined.filter(pl.col("date") != pl.col("aux_date"))
+        .select(
+            "gvkey",
+            pl.date_ranges(pl.col("date") + pl.duration(days=1), "aux_date").alias("date"),
+            *[pl.lit(None, dtype=schema[c]).alias(c) for c in ["gics", "sic", "naics"]],
+        )
+        .explode("date")
+    )
+    out = pl.concat([joined.select(["gvkey", "date", "gics", "sic", "naics"]), gap_rows]).sort(
+        ["gvkey", "date"]
+    )
+    out.sink_parquet(paths.interim_dir / "comp_ind.parquet")
 
 
 def _parse_siccodes_file(filename: str, label: str) -> pl.DataFrame:
@@ -2677,7 +4769,7 @@ def ff_ind_class(paths: DataPaths, data_path: str) -> None:
 
 
 @measure_time
-def nyse_size_cutoffs(paths: DataPaths, data_path):
+def nyse_size_cutoffs(paths: DataPaths, data_path, bypass_crsp: bool = False):
     """
     Description:
         Compute NYSE market equity cutoffs (1%,20%,50%,80%) by month.
@@ -2688,10 +4780,16 @@ def nyse_size_cutoffs(paths: DataPaths, data_path):
         3) Apply QUANTILE_DISC for cutoffs.
         4) Collect and save.
 
+    NYSE membership is identified via the CRSP exchange code (``crsp_exchcd = 1``).
+    When ``bypass_crsp`` is True there is no CRSP data, so NYSE is identified via
+    the Compustat exchange code (``comp_exchg = 11``), mirroring the SAS bypass
+    path. See config.BYPASS_CRSP.
+
     Output:
         'nyse_cutoffs.parquet' with [eom, n, nyse_p1, nyse_p20, nyse_p50, nyse_p80].
     """
-    nyse_sf = pl.scan_parquet(data_path).sql("""
+    nyse_filter = "comp_exchg = 11" if bypass_crsp else "crsp_nyse = 1"
+    nyse_sf = pl.scan_parquet(data_path).sql(f"""
             SELECT
                 eom,
                 COUNT(*)                    AS n,
@@ -2700,7 +4798,7 @@ def nyse_size_cutoffs(paths: DataPaths, data_path):
                 QUANTILE_DISC(me, 0.50)     AS nyse_p50,
                 QUANTILE_DISC(me, 0.80)     AS nyse_p80
             FROM self
-            WHERE  crsp_exchcd = 1
+            WHERE  {nyse_filter}
                 AND obs_main   = 1
                 AND exch_main  = 1
                 AND primary_sec= 1
@@ -2891,7 +4989,13 @@ def add_ret_exc_wins(
         )
         .drop(drop_cols)
     )
-    result.collect(streaming=(freq == "d")).write_parquet(data_path)
+    tmp_path = data_path.with_name(f"{data_path.stem}_ret_exc_wins.parquet")
+    tmp_path.unlink(missing_ok=True)
+    output = result.collect(streaming=(freq == "d"))
+    del result, data, cutoffs
+    output.write_parquet(tmp_path)
+    del output
+    os.replace(tmp_path, data_path)
 
 
 def load_mkt_returns_params(freq):
@@ -3238,17 +5342,35 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     c1 = (col("indfmt").is_in(["INDL", "FS"])) if mode == 1 else (col("indfmt") == "INDL")
     datafmt_val = "HIST_STD" if mode == 1 else "STD"
     popsrc_val = "I" if mode == 1 else "D"
+    accounting_start = pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
+    raw = pl.scan_parquet(filename)
+    schema_names = set(raw.collect_schema().names())
+    publication_fields = [
+        name for name in ("pdate", "fdate", "pdateq", "fdateq", "rdq") if name in schema_names
+    ]
+    # Earliest marker, not latest: `pdate`/`rdq` record when preliminary results
+    # were released and `fdate` when the final filing landed, typically weeks
+    # later. Taking the maximum would withhold a statement that was already
+    # public — Driven Brands FY2025 was released 2026-05-19 but finalized
+    # 2026-06-03, which pushed it out of the May panel that the production SAS
+    # (a plain four-month lag) includes. Minimum keeps the guard doing only its
+    # intended job: blocking rows whose data did not exist yet, such as Akanda
+    # FY2025, which has no `pdate` at all and a `fdate` of 2026-07-01.
+    availability_date = (
+        pl.min_horizontal([col(name).cast(pl.Date) for name in publication_fields])
+        if publication_fields
+        else pl.lit(None, dtype=pl.Date)
+    )
     df = (
-        pl.scan_parquet(filename)
-        .with_row_index("n")
+        raw.with_row_index("n")
         .filter(
             c1
             & (col("datafmt") == datafmt_val)
             & (col("popsrc") == popsrc_val)
             & (col("consol") == "C")
-            & (col("datadate") >= start_date)
+            & (col("datadate") >= accounting_start)
         )
-        .with_columns(source=pl.lit(source_str))
+        .with_columns(source=pl.lit(source_str), availability_date=availability_date)
     )
     return df
 
@@ -3274,6 +5396,72 @@ def apply_indfmt_filter(df):
         .drop(["indfmt", "count_indfmt"])
     )
     return df
+
+
+# Identity/bookkeeping columns; everything else on an accounting frame is a
+# reported value and counts toward how complete a candidate row is.
+_ACCOUNTING_META_COLUMNS = frozenset(
+    {
+        "gvkey",
+        "datadate",
+        "availability_date",
+        "n",
+        "indfmt",
+        "fyr",
+        "fyearq",
+        "fqtr",
+        "curcd",
+        "curcdq",
+        "source",
+    }
+)
+
+
+def resolve_dual_package_rows(df, key_cols):
+    """
+    Description:
+        Pick one row per key when a company files in both the Global and NA
+        Compustat packages, preferring whichever row carries more data.
+
+    Steps:
+        1) Count populated (non-null) reported values on each candidate row.
+        2) Keep only rows tied for the highest count within the key.
+        3) Break any remaining tie toward the Global row.
+
+    Rationale:
+        The SAS leaves this undefined: `set __gfunda __funda` concatenates both
+        rows and the survivor is decided by a later `proc sort nodupkey` with no
+        ORDER BY and no stable-sort guarantee (accounting_chars.sas:413-423 and
+        the sort inside %add_helper_vars). Preferring Global unconditionally --
+        the previous behaviour here -- is deterministic but systematically picks
+        the weaker row: banks file the sparse `FS` format globally while their NA
+        `INDL` filing carries capex and working capital, and a dual filer whose
+        Global row has not caught up yet is a near-empty stub. Choosing on
+        completeness keeps this deterministic while retaining the data, and the
+        Global tie-break preserves the old outcome whenever both rows are equally
+        populated.
+
+        Whole rows are compared rather than coalescing field by field, so a
+        record always reflects a single filing instead of a balance sheet
+        assembled from two.
+
+    Output:
+        LazyFrame with one row per key.
+    """
+    value_cols = [
+        name for name in df.collect_schema().names() if name not in _ACCOUNTING_META_COLUMNS
+    ]
+    populated = (
+        pl.sum_horizontal([col(name).is_not_null().cast(pl.Int32) for name in value_cols])
+        if value_cols
+        else pl.lit(0, dtype=pl.Int32)
+    )
+    return (
+        df.with_columns(_populated=populated)
+        .filter(col("_populated") == col("_populated").max().over(key_cols))
+        .filter((pl.len().over(key_cols) == 1) | (col("source") == "GLOBAL"))
+        .drop("_populated")
+    )
 
 
 def add_fx_and_convert_vars(df, fx_df, vars, freq):
@@ -3482,7 +5670,16 @@ def standardized_accounting_data(
                 ni=(col("ib") + pl.coalesce("xi", 0) + pl.coalesce("do", 0)).cast(pl.Float64)
             )
             .select(
-                ["gvkey", "datadate", "n", "indfmt", "curcd", "source", "ni"]
+                [
+                    "gvkey",
+                    "datadate",
+                    "availability_date",
+                    "n",
+                    "indfmt",
+                    "curcd",
+                    "source",
+                    "ni",
+                ]
                 + [fl_none().alias(i) for i in ["gp", "pstkrv", "pstkl", "itcb", "xad", "txbcof"]]
                 + query_vars
             )
@@ -3517,6 +5714,7 @@ def standardized_accounting_data(
                 [
                     "gvkey",
                     "datadate",
+                    "availability_date",
                     "n",
                     "indfmt",
                     "fyr",
@@ -3553,7 +5751,7 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_funda.parquet", start_date, "NA", 2
         )
         __funda = funda.select(
-            ["gvkey", "datadate", "n", "curcd", "source"]
+            ["gvkey", "datadate", "availability_date", "n", "curcd", "source"]
             + [fl_none().alias(i) for i in ["wcapt", "ltdch", "purtshr"]]
             + query_vars
         )
@@ -3572,7 +5770,17 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_fundq.parquet", start_date, "NA", 2
         )
         __fundq = fundq.select(
-            ["gvkey", "datadate", "n", "fyr", "fyearq", "fqtr", "curcdq", "source"]
+            [
+                "gvkey",
+                "datadate",
+                "availability_date",
+                "n",
+                "fyr",
+                "fyearq",
+                "fqtr",
+                "curcdq",
+                "source",
+            ]
             + [
                 fl_none().alias(i)
                 for i in ["dvtq", "gpq", "dvty", "gpy", "ltdchy", "purtshry", "wcapty"]
@@ -3580,16 +5788,11 @@ def standardized_accounting_data(
             + query_vars
         )
     if coverage == "world":
-        __wfunda = pl.concat([__gfunda, __funda], how="diagonal_relaxed").filter(
-            (pl.len().over(["gvkey", "datadate"]) == 1)
-            | ((pl.len().over(["gvkey", "datadate"]) == 2) & (col("source") == "GLOBAL"))
+        __wfunda = pl.concat([__gfunda, __funda], how="diagonal_relaxed").pipe(
+            resolve_dual_package_rows, key_cols=["gvkey", "datadate"]
         )
-        __wfundq = pl.concat([__gfundq, __fundq], how="diagonal_relaxed").filter(
-            (pl.len().over(["gvkey", "fyr", "fyearq", "fqtr"]) == 1)
-            | (
-                (pl.len().over(["gvkey", "fyr", "fyearq", "fqtr"]) == 2)
-                & (col("source") == "GLOBAL")
-            )
+        __wfundq = pl.concat([__gfundq, __fundq], how="diagonal_relaxed").pipe(
+            resolve_dual_package_rows, key_cols=["gvkey", "fyr", "fyearq", "fqtr"]
         )
     else:
         pass
@@ -4605,7 +6808,7 @@ def ohlson_o(df, name="o_score"):
     Steps:
         1) Build features: lev=debt/at_x, roe=nix_x/at_x, cacl=cl_x/ca_x, lat=log(at_x),
         wc=(ca_x−cl_x)/at_x, ffo=(pi_x+dp)/lt, neg_eq=1[lt>at_x], neg_earn=1[both nix_x<0], nich=(Δnix)/( |nix|+|nix₋₁| ).
-        2) Apply linear index: −1.32 −0.407*lat +6.03*lev +1.43*wc +0.076*cacl −1.72*neg_eq −2.37*roe −1.83*ffo +0.285*neg_earn −0.52*nich.
+        2) Apply linear index: −1.32 −0.407*lat +6.03*lev −1.43*wc +0.076*cacl −1.72*neg_eq −2.37*roe −1.83*ffo +0.285*neg_earn −0.52*nich.
 
     Output:
         DataFrame with '{name}' continuous score.
@@ -4644,6 +6847,9 @@ def ohlson_o(df, name="o_score"):
                 -1.32
                 - 0.407 * col("__o_lat")
                 + 6.03 * col("__o_lev")
+                # Ohlson (1980) and the upstream SAS since 2025-03-05
+                # (ReplicationCrisis@b0b01d5a): more working capital lowers the
+                # distress score. The +1.43 the pre-2025 SAS carried was a bug.
                 - 1.43 * col("__o_wc")
                 + 0.076 * col("__o_cacl")
                 - 1.72 * col("__o_neg_eq")
@@ -5570,6 +7776,18 @@ def add_profit_scaled_by_lagged_vars(df):
     return df
 
 
+def accounting_public_start(lag_to_pub: int) -> pl.Expr:
+    """Earliest month-end when an accounting observation may enter the panel."""
+    lagged_start = col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end()
+    reported_start = col("availability_date").dt.month_end()
+    return (
+        pl.when(reported_start.is_not_null() & (reported_start > lagged_start))
+        .then(reported_start)
+        .otherwise(lagged_start)
+        .alias("start_date")
+    )
+
+
 def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_pub, max_lag):
     """
     Description:
@@ -5578,7 +7796,10 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
     Steps:
         1) Run persistence job over input parquet (N=5 yrs, min=5) → 'ni_ar_res.parquet'.
         2) Join on (gvkey,curcd,datadate); keep rows with data_available=1.
-        3) Set start_date = datadate + lag_to_pub months; end_date = min(next_start−1mo, datadate+max_lag).
+        3) Set start_date to the later of the normal publication lag and the
+           actual pdate/fdate/rdq month; end_date = min(earliest start among all
+           later records −1mo, datadate+max_lag). Records fully superseded by a
+           fresher, earlier-available report (end < start) are dropped.
         4) Expand monthly between start/end to 'public_date'.
 
     Output:
@@ -5590,9 +7811,17 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
         df.join(earnings_pers, on=["gvkey", "curcd", "datadate"], how="left")
         .filter(col("data_available") == 1)
         .sort(["gvkey", "datadate"])
-        .with_columns(start_date=col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end())
+        .with_columns(accounting_public_start(lag_to_pub))
         .sort(["gvkey", "datadate"])
-        .with_columns(next_start_date=col("start_date").shift(-1).over(["gvkey"]))
+        # Availability-based starts are not monotone in datadate: a fiscal period
+        # can be published after a later period's report. A record is therefore
+        # superseded by the earliest start among ALL later records, not just the
+        # next row's, or a stale record would cover months where fresher data was
+        # already public (the SAS original used shift(-1), which is safe only for
+        # its plain datadate+lag starts).
+        .with_columns(
+            next_start_date=col("start_date").cum_min(reverse=True).shift(-1).over("gvkey")
+        )
         .with_columns(
             end_date=pl.min_horizontal(
                 (col("next_start_date").dt.offset_by("-1mo").dt.month_end()),
@@ -5600,6 +7829,7 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
             )
         )
         .drop("next_start_date")
+        .filter(col("end_date") >= col("start_date"))
     )
     return expand(
         data=df,
@@ -6026,8 +8256,13 @@ def combine_ann_qtr_chars(paths: DataPaths, ann_df_path, qtr_df_path, char_vars,
 
     Steps:
         1) Load annual and quarterly files into DuckDB with row numbers.
-        2) Left-join on (gvkey, public_date); for each char_var choose quarterly value if present and more recent (datadate_qitem > datadate).
-        3) Drop redundant join and dated columns; dedupe on (gvkey, public_date).
+        2) Outer-join on (gvkey, public_date), since each panel is expanded to its own
+           coverage window and a security-month can be covered by only one of the two
+           (e.g. a slow-filing annual report leaves a gap that a timelier quarterly
+           filing does not); coalesce the join keys and source from whichever side matched.
+        3) For each char_var choose the quarterly value if the annual one is missing or
+           the quarterly one is present and more recent (datadate_qitem > datadate).
+        4) Drop redundant join and dated columns; dedupe on (gvkey, public_date).
 
     Output:
         Writes 'acc_chars_world.parquet' merged panel.
@@ -6048,7 +8283,14 @@ def combine_ann_qtr_chars(paths: DataPaths, ann_df_path, qtr_df_path, char_vars,
     )
     ann = con.table("ann")
     qtr = con.table("qtr")
-    combined = ann.left_join(qtr, [ann.gvkey == qtr.gvkey, ann.public_date == qtr.public_date])
+    combined = ann.join(
+        qtr, [ann.gvkey == qtr.gvkey, ann.public_date == qtr.public_date], how="outer"
+    )
+    combined = combined.mutate(
+        gvkey=combined.gvkey.coalesce(combined.gvkey_right),
+        public_date=combined.public_date.coalesce(combined.public_date_right),
+        source=combined.source.coalesce(combined.source_qitem),
+    )
     drop_columns = [
         "datadate",
         f"datadate{q_suffix}",
@@ -6334,74 +8576,60 @@ def market_chars_monthly(paths: DataPaths, data_path, market_ret_path, local_cur
 
 
 @measure_time
-def firm_age(paths: DataPaths, data_path):
+def firm_age(paths: DataPaths, data_path, bypass_crsp: bool = False):
     """
     Description:
-        Compute firm age in months using earliest of CRSP, Compustat accounting, or Compustat returns dates.
+        Compute firm age in months using the full-history Compustat age anchor,
+        optional CRSP history, and the first row in the working stock panel.
 
     Steps:
-        1) Load identifiers/dates from inputs; get earliest dates per gvkey/permco.
-        2) Join earliest sources to each (id, eom); also get first observed eom per id.
-        3) Age = months between eom and min(first_obs, first_alt). Write result.
+        1) Load the compact, unfiltered Compustat age anchor produced during download.
+        2) When CRSP is enabled, get its earliest date per permco; bypass mode
+           never reads a CRSP file.
+        3) Join earliest sources to each (id, eom); also get first observed eom per id.
+        4) Age = months between eom and min(first_obs, first_alt). Write result.
 
     Output:
         'firm_age.parquet' with [id, eom, age].
     """
     con = ibis.duckdb.connect(threads=os.cpu_count())
     data = con.read_parquet(data_path).select(["gvkey", "permco", "id", "eom"])
-    comp_secm = con.read_parquet(paths.raw_tables_dir / "comp_secm.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_gsecm = (
-        con.read_parquet(paths.raw_tables_dir / "comp_g_secd.parquet")
-        .filter(_.monthend == 1)
-        .select(["gvkey", "datadate"])
-    )
-    comp_ret_age = (
-        comp_secm.union(comp_gsecm)
-        .group_by("gvkey")
-        .agg(comp_ret_first=_.datadate.min())
-        .mutate(
-            comp_ret_first=(
-                (_.comp_ret_first - ibis.interval(years=1)).year().cast("string") + "-12-31"
-            ).cast("date")
-        )
-    )
-    comp_funda = con.read_parquet(paths.raw_tables_dir / "comp_funda.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_gfunda = con.read_parquet(paths.raw_tables_dir / "comp_g_funda.parquet").select(
-        ["gvkey", "datadate"]
-    )
-    comp_acc_age = (
-        comp_funda.union(comp_gfunda)
-        .group_by("gvkey")
-        .agg(comp_acc_first=_.datadate.min())
-        .mutate(
-            comp_acc_first=(
-                (_.comp_acc_first - ibis.interval(years=1)).year().cast("string") + "-12-31"
-            ).cast("date")
-        )
-    )
-    crsp_age = (
-        con.read_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
-        .group_by("permco")
-        .agg(crsp_first=_.mthcaldt.min())
-    )
     con.create_table("data", data.to_polars())
-    con.create_table("comp_ret_age", comp_ret_age.to_polars())
-    con.create_table("comp_acc_age", comp_acc_age.to_polars())
-    con.create_table("crsp_age", crsp_age.to_polars())
+    con.create_table(
+        "comp_age_anchor",
+        con.read_parquet(paths.raw_tables_dir / "comp_age_anchor.parquet"),
+    )
+    if bypass_crsp:
+        con.raw_sql("""
+            CREATE TABLE crsp_age (
+                permco BIGINT,
+                crsp_first DATE
+            );
+        """)
+    else:
+        crsp_age = (
+            con.read_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
+            .group_by("permco")
+            .agg(crsp_first=_.mthcaldt.min())
+        )
+        con.create_table("crsp_age", crsp_age.to_polars())
     sql_query = """
                     CREATE TABLE age1 AS
                     SELECT
                         a.id,
                         a.eom,
-                        LEAST(b.crsp_first, c.comp_acc_first, d.comp_ret_first) AS first_obs
+                        LEAST(
+                            b.crsp_first,
+                            CASE WHEN c.comp_acc_first IS NULL THEN NULL ELSE
+                              MAKE_DATE(YEAR(c.comp_acc_first) - 1, 12, 31)
+                            END,
+                            CASE WHEN c.comp_ret_first IS NULL THEN NULL ELSE
+                              MAKE_DATE(YEAR(c.comp_ret_first) - 1, 12, 31)
+                            END
+                        ) AS first_obs
                     FROM data AS a
                     LEFT JOIN crsp_age AS b ON a.permco = b.permco
-                    LEFT JOIN comp_acc_age AS c ON a.gvkey = c.gvkey
-                    LEFT JOIN comp_ret_age AS d ON a.gvkey = d.gvkey;
+                    LEFT JOIN comp_age_anchor AS c ON a.gvkey = c.gvkey;
 
                     CREATE TABLE age2 AS
                     SELECT  *, MIN(eom) OVER (PARTITION BY id) AS first_alt
@@ -6442,6 +8670,24 @@ def char_pf_rets():
     return [lms, smb]
 
 
+def _ensure_ff_portfolio_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Add empty FF size-by-characteristic buckets omitted by an eager pivot."""
+    required = (
+        "small_low",
+        "small_mid",
+        "small_high",
+        "big_low",
+        "big_mid",
+        "big_high",
+    )
+    missing = [
+        pl.lit(None, dtype=pl.Float64).alias(column)
+        for column in required
+        if column not in df.columns
+    ]
+    return df.with_columns(missing) if missing else df
+
+
 def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
     """
     Description:
@@ -6460,10 +8706,7 @@ def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
     # print(f"Executing sort_ff_style for {char}", flush=True)
     c1 = (
         ((col("size_grp_l").is_in(["small", "large", "mega"])) & (col("excntry_l") != "USA"))
-        | (
-            ((col("crsp_exchcd_l") == 1) | (col("comp_exchg_l") == 11))
-            & (col("excntry_l") == "USA")
-        )
+        | (((col("crsp_nyse_l") == 1) | (col("comp_exchg_l") == 11)) & (col("excntry_l") == "USA"))
     ) & col(f"{char}_l").is_not_null()
     char_pf_exp = (
         pl.when(col(f"{char}_l") >= col("bp_p70"))
@@ -6513,6 +8756,7 @@ def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
         )
         .collect()
         .pivot(values="ret_exc", index=["excntry", date_col], on="combined_pf")
+        .pipe(_ensure_ff_portfolio_columns)
         .select(["excntry", date_col, *char_pf_rets()])
         .sort(["excntry", date_col])
     )
@@ -6552,7 +8796,7 @@ def ap_factors(
     sf_cond = (col("ret_lag_dif") == 1) if freq == "m" else (col("ret_lag_dif") <= 5)
     lag_vars = [
         "comp_exchg",
-        "crsp_exchcd",
+        "crsp_nyse",
         "exch_main",
         "obs_main",
         "common",
@@ -6736,14 +8980,16 @@ def prep_data_factor_regs(
 
 
 @measure_time
-def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min):
+def market_beta(
+    paths: DataPaths, output_path, data_path, fcts_path, __n, __min, end_date: date = END_DATE
+):
     """
     Description:
         Estimate rolling CAPM betas and idiosyncratic vol for each stock.
 
     Steps:
         1) Prep data via prep_data_factor_regs; load '__msf2' lazily.
-        2) Generate rolling-window mappings; run process_map_chunks(..., 'capm') per mapping.
+        2) Generate staggered window specs; run process_window(..., 'capm') per window.
         3) Map back to ids/dates; select beta_{__n}m and ivol_capm_{__n}m; sort.
 
     Output:
@@ -6751,9 +8997,8 @@ def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min)
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n)
     df = pl.concat(
-        [process_map_chunks(base_data, mapping, "capm", __n, __min) for mapping in aux_maps]
+        [process_window(base_data, w, "capm", __n, __min) for w in gen_aux_windows(__n)]
     ).collect()
     ids = con.table("__msf2").select(["id", "id_int"]).distinct().to_polars()
     dates = (
@@ -6782,13 +9027,23 @@ def market_beta(paths: DataPaths, output_path, data_path, fcts_path, __n, __min)
 
 
 @measure_time
-def residual_momentum(paths: DataPaths, output_path, data_path, fcts_path, __n, __min, incl, skip):
+def residual_momentum(
+    paths: DataPaths,
+    output_path,
+    data_path,
+    fcts_path,
+    __n,
+    __min,
+    incl,
+    skip,
+    end_date: date = END_DATE,
+):
     """
     Description:
         Compute residual momentum from FF3 regressions with rolling windows and skip/inclusion rules.
 
     Steps:
-        1) Prep '__msf2'; build window mappings; run process_map_chunks(..., 'res_mom', __n, __min, incl, skip).
+        1) Prep '__msf2'; build window specs; run process_window(..., 'res_mom', __n, __min, incl, skip).
         2) Join back ids/dates and keep resff3_{incl}_{skip}; sort.
 
     Output:
@@ -6799,11 +9054,10 @@ def residual_momentum(paths: DataPaths, output_path, data_path, fcts_path, __n, 
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n)
     df = pl.concat(
         [
-            process_map_chunks(base_data, mapping, "res_mom", __n, __min, incl, skip)
-            for mapping in aux_maps
+            process_window(base_data, w, "res_mom", __n, __min, incl, skip)
+            for w in gen_aux_windows(__n)
         ]
     ).collect()
     ids = con.table("__msf2").select(["id", "id_int"]).distinct().to_polars()
@@ -6825,6 +9079,21 @@ def residual_momentum(paths: DataPaths, output_path, data_path, fcts_path, __n, 
     con.disconnect()
 
 
+def zero_obs_gate_ok() -> pl.Expr:
+    """
+    Description:
+        Source-conditional quality screen for months with many zero local-return days.
+
+    Steps:
+        1) CRSP-sourced rows (source_crsp == 1) always pass.
+        2) Compustat rows pass only when zero_obs < 10.
+
+    Output:
+        Boolean Polars expression usable in .filter().
+    """
+    return (pl.col("source_crsp") == 1) | (pl.col("zero_obs") < 10)
+
+
 @measure_time
 def prepare_daily(paths: DataPaths, data_path, fcts_path):
     """
@@ -6835,8 +9104,9 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
         1) Join daily stock data with daily factors; filter rows with mktrf.
         2) Create zero_obs flags per (id,eom); cap returns to lag ≤14 days; compute prc_adj.
         3) Write dsf1.parquet and id_int_key.parquet.
-        4) Build market lead/lag series per day and write mkt_lead_lag.parquet.
-        5) Build 3-day rolling sums for stock and market excess returns; filter to non-null sums and zero_obs<10; write corr_data.parquet.
+        4) Build market lead/lag series per day (dropping null mktrf) and write mkt_lead_lag.parquet.
+        5) Build 3-day rolling sums for stock and market excess returns; filter to non-null
+           sums and zero_obs_gate_ok(); write corr_data.parquet.
 
     Output:
         Parquets: dsf1.parquet, id_int_key.parquet, mkt_lead_lag.parquet, corr_data.parquet.
@@ -6848,6 +9118,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
             [
                 "excntry",
                 "id",
+                "source_crsp",
                 "date",
                 "eom",
                 "prc",
@@ -6889,6 +9160,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
 
     mkt_lead_lag = (
         fcts.select(["excntry", "date", "mktrf", col("date").dt.month_end().alias("eom")])
+        .filter(col("mktrf").is_not_null())
         .sort(["excntry", "date"])
         .with_columns(
             mktrf_ld1=col("mktrf").shift(-1).over(["excntry", "eom"]),
@@ -6901,7 +9173,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
 
     corr_data = (
         pl.scan_parquet(paths.interim_dir / "dsf1.parquet")
-        .select(["ret_exc", "id_int", "date", "mktrf", "eom", "zero_obs"])
+        .select(["ret_exc", "id_int", "date", "mktrf", "eom", "zero_obs", "source_crsp"])
         .sort(["id_int", "date"])
         .with_columns(
             ret_exc_3l=(col("ret_exc") + col("ret_exc").shift(1) + col("ret_exc").shift(2)).over(
@@ -6912,9 +9184,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
             ),
         )
         .filter(
-            col("ret_exc_3l").is_not_null()
-            & col("mkt_exc_3l").is_not_null()
-            & (col("zero_obs") < 10)
+            col("ret_exc_3l").is_not_null() & col("mkt_exc_3l").is_not_null() & zero_obs_gate_ok()
         )
         .select(["id_int", "eom", "ret_exc_3l", "mkt_exc_3l"])
         .select(pl.all().shrink_dtype())
@@ -7648,6 +9918,7 @@ def finish_daily_chars(paths: DataPaths, output_path):
         2) Outer join on (id, eom).
         3) Add betabab (beta * rvol / mktvol) and rmax5_rvol ratio.
         4) Drop helper columns.
+        5) Convert every non-finite floating-point result to null.
 
     Output:
         '{output_path}' parquet with final daily characteristics.
@@ -7661,6 +9932,17 @@ def finish_daily_chars(paths: DataPaths, output_path):
         betabab_1260d=col("corr_1260d") * col("rvol_252d") / col("__mktvol_252d"),
         rmax5_rvol_21d=col("rmax5_21d") / col("rvol_252d"),
     ).drop("__mktvol_252d")
+    daily_schema = daily_chars.collect_schema()
+    float_cols = [name for name, dtype in daily_schema.items() if dtype.is_float()]
+    daily_chars = daily_chars.with_columns(
+        [
+            pl.when(col(name).is_finite())
+            .then(col(name))
+            .otherwise(pl.lit(None, dtype=daily_schema[name]))
+            .alias(name)
+            for name in float_cols
+        ]
+    )
     daily_chars.collect().write_parquet(output_path)
 
 
@@ -7670,16 +9952,16 @@ def z_ranks(data, var, __min, sort):
         ["excntry", "eom"]
     )
     z_df = (
-        data.filter(col(var).is_not_nan())
+        data.filter(col(var).is_finite())
         .filter(pl.count(var).over(["excntry", "eom"]) >= __min)
         .with_columns(
             rank=col(var).rank(method="average", descending=order).over(["excntry", "eom"])
         )
         .select(["excntry", "id", "eom", exp_z_var.alias(f"z_{var}")])
         .with_columns(
-            pl.when(col(f"z_{var}").is_nan())
-            .then(fl_none())
-            .otherwise(col(f"z_{var}"))
+            pl.when(col(f"z_{var}").is_finite())
+            .then(col(f"z_{var}"))
+            .otherwise(fl_none())
             .alias(f"z_{var}")
         )
         .filter(col(f"z_{var}").is_not_null())
@@ -7770,12 +10052,13 @@ def quality_minus_junk(paths: DataPaths, data_path, min_stks):
         & (col("me").is_not_null())
     )
     # NOTE: input must be unique on (excntry, eom, id) — guaranteed upstream by
-    # construction of world_data_-1. Duplicate keys would fan out multiplicatively
-    # across the 16+3 full joins below and panic at the Polars frame-length limit.
+    # construction of world_data_-1. Duplicate keys would still make each rank
+    # attachment ambiguous even though the joins below deliberately preserve the
+    # filtered QMJ base universe with left joins.
     qmj = pl.scan_parquet(data_path).filter(c1).select(cols).sort(["excntry", "eom"]).collect()
     for var_z, dir in zip(z_vars, direction, strict=True):
         __z = z_ranks(qmj, var_z, min_stks, dir)
-        qmj = qmj.join(__z, how="full", coalesce=True, on=["excntry", "eom", "id"])
+        qmj = qmj.join(__z, how="left", on=["excntry", "eom", "id"])
 
     qmj = qmj.with_columns(
         __prof=pl.mean_horizontal(
@@ -7795,9 +10078,9 @@ def quality_minus_junk(paths: DataPaths, data_path, min_stks):
     }
     qmj = (
         qmj.select(["excntry", "id", "eom"])
-        .join(ranks["prof"], how="full", coalesce=True, on=["excntry", "id", "eom"])
-        .join(ranks["growth"], how="full", coalesce=True, on=["excntry", "id", "eom"])
-        .join(ranks["safety"], how="full", coalesce=True, on=["excntry", "id", "eom"])
+        .join(ranks["prof"], how="left", on=["excntry", "id", "eom"])
+        .join(ranks["growth"], how="left", on=["excntry", "id", "eom"])
+        .join(ranks["safety"], how="left", on=["excntry", "id", "eom"])
         .with_columns(__qmj=(col("qmj_prof") + col("qmj_growth") + col("qmj_safety")) / 3)
     )
     __qmj = z_ranks(qmj, "__qmj", min_stks, "ascending").rename({"z___qmj": "qmj"})
@@ -7925,12 +10208,15 @@ def save_main_data(paths: DataPaths) -> None:
 def save_output_files(paths: DataPaths):
     """
     Description:
-        Copy main market returns and cutoff files to Output folder.
+        Copy main market returns and cutoff files to Python output folders and
+        emit SAS-compatible CSV copies.
 
     Steps:
         1) Copy parquet outputs from interim/ to other_output/.
         2) Includes market returns (monthly/daily) and cutoff files.
-        3) Interim files are preserved for downstream steps.
+        3) Write the five CSV files exported by the modified SAS main.sas to
+           processed/production/.
+        4) Interim files are preserved for downstream steps.
 
     Output:
         Files copied into 'other_output/' directory.
@@ -7946,6 +10232,18 @@ def save_output_files(paths: DataPaths):
         "ap_factors_daily.parquet",
     ):
         shutil.copy2(paths.interim_dir / name, other_output / name)
+
+    for name in (
+        "market_returns_daily",
+        "market_returns",
+        "nyse_cutoffs",
+        "return_cutoffs",
+        "return_cutoffs_daily",
+    ):
+        _write_sas_csv(
+            pl.scan_parquet(paths.interim_dir / f"{name}.parquet"),
+            paths.production_dir / f"{name}.csv",
+        )
 
 
 @measure_time
@@ -7964,7 +10262,21 @@ def save_daily_ret(paths: DataPaths):
     """
     data = (
         pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
-        .select(["excntry", "id", "date", "me", "ret", "ret_exc", "ret_exc_wins"])
+        .select(
+            [
+                "excntry",
+                "id",
+                "date",
+                "me",
+                "ret",
+                "ret_exc",
+                "ret_exc_wins",
+                "ret_intraday",
+                "ret_overnight",
+                "ret_intraday_local",
+                "ret_overnight_local",
+            ]
+        )
         .with_columns(
             excntry=pl.when(col("excntry").is_null())
             .then(pl.lit("null_country"))
@@ -8056,29 +10368,39 @@ def save_monthly_ret(paths: DataPaths):
         Save monthly returns for world securities.
 
     Steps:
-        1) Load world_msf_output.parquet and select relevant columns.
+        1) Load world_msf.parquet and select the SAS monthly-return columns.
         2) Shrink dtypes and collect results.
-        3) Write to return_data/world_ret_monthly.parquet.
+        3) Write to return_data/world_ret_monthly.parquet and
+           production/world_ret_monthly.csv.
 
     Output:
         Parquet file with monthly returns by country/security.
+
+    Note:
+        Reads the UNFILTERED world_msf, not world_msf_output. The production SAS
+        (save_monthly_ret_csv) exports scratch.world_msf with no screen, so the
+        file includes non-common securities (ETFs, funds, preferred, warrants),
+        secondary listings, and non-main-exchange observations — roughly half
+        the rows. The main filters exist in this file only as flag inputs
+        further upstream; applying them here dropped ~53k rows per month
+        relative to the SAS output.
     """
-    data = pl.scan_parquet(paths.interim_dir / "world_msf_output.parquet").select(
-        ["excntry", "id", "source_crsp", "eom", "me", "ret_exc", "ret", "ret_local", "ret_exc_wins"]
+    data = pl.scan_parquet(paths.interim_dir / "world_msf.parquet").select(
+        ["excntry", "id", "source_crsp", "eom", "ret_exc", "ret", "ret_local"]
     )
-    data.select(pl.all().shrink_dtype()).collect().write_parquet(
-        paths.processed_dir / "return_data" / "world_ret_monthly.parquet"
-    )
+    monthly = data.select(pl.all().shrink_dtype()).collect()
+    monthly.write_parquet(paths.processed_dir / "return_data" / "world_ret_monthly.parquet")
+    _write_sas_csv(monthly, paths.production_dir / "world_ret_monthly.csv")
 
 
 @measure_time
-def merge_roll_apply_daily_results(paths: DataPaths):
+def merge_roll_apply_daily_results(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Merge rolling regression daily results into one dataset.
 
     Steps:
-        1) Build date index from earliest to END_DATE month.
+        1) Build date index from earliest to the runtime end-date month.
         2) Load id_int mapping and all '__roll*' parquet files (sorted for
            deterministic join order).
         3) Outer join them on (id_int, aux_date).
@@ -8088,16 +10410,10 @@ def merge_roll_apply_daily_results(paths: DataPaths):
     Output:
         'roll_apply_daily.parquet' with merged roll regression results.
     """
-    date_idx = END_DATE.month + END_DATE.year * 12
-    df_dates = pl.DataFrame(
-        {
-            "aux_date": [i + 1 for i in range(23112, date_idx + 1)],
-            "eom": [f"{i // 12}-{i % 12 + 1}-1" for i in range(23112, date_idx + 1)],
-        }
-    )
-    df_dates = df_dates.with_columns(
-        col("eom").str.strptime(pl.Date, "%Y-%m-%d").dt.month_end().alias("eom"),
+    date_idx = end_date.month + end_date.year * 12
+    df_dates = pl.DataFrame({"aux_date": range(23113, date_idx + 2)}).with_columns(
         col("aux_date").cast(pl.Int64),
+        eom=pl.date((col("aux_date") - 1) // 12, (col("aux_date") - 1) % 12 + 1, 1).dt.month_end(),
     )
     df_id = pl.scan_parquet(paths.interim_dir / "id_int_key.parquet")
     file_paths = sorted(
@@ -8177,7 +10493,7 @@ def merge_qmj_to_world_data(paths: DataPaths):
 
 
 @measure_time
-def merge_industry_to_world_msf(paths: DataPaths):
+def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
     """
     Description:
         Merge industry codes into world MSF dataset.
@@ -8188,125 +10504,88 @@ def merge_industry_to_world_msf(paths: DataPaths):
         3) Coalesce SIC/NAICS from both sources.
         4) Drop redundant columns.
 
+    When ``bypass_crsp`` is True there is no CRSP industry file, so SIC/NAICS come
+    from Compustat only (no crsp_ind join), mirroring the SAS bypass path
+    (``coalesce(b.sic, .)``). See config.BYPASS_CRSP.
+
     Output:
         '__msf_world2.parquet' with industry codes appended.
     """
     __msf_world = pl.scan_parquet(paths.interim_dir / "__msf_world.parquet")
     comp_ind = pl.scan_parquet(paths.interim_dir / "comp_ind.parquet")
-    crsp_ind = pl.scan_parquet(paths.interim_dir / "crsp_ind.parquet").rename(
-        {"sic": "sic_crsp", "naics": "naics_crsp"}
+    __msf_world = __msf_world.join(
+        comp_ind, how="left", left_on=["gvkey", "eom"], right_on=["gvkey", "date"]
     )
-    __msf_world = (
-        __msf_world.join(comp_ind, how="left", left_on=["gvkey", "eom"], right_on=["gvkey", "date"])
-        .join(
-            crsp_ind,
-            how="left",
-            left_on=["permco", "permno", "eom"],
-            right_on=["permco", "permno", "date"],
+    if not bypass_crsp:
+        crsp_ind = pl.scan_parquet(paths.interim_dir / "crsp_ind.parquet").rename(
+            {"sic": "sic_crsp", "naics": "naics_crsp"}
         )
-        .with_columns(
-            sic=pl.coalesce(["sic", "sic_crsp"]),
-            naics=pl.coalesce(["naics", "naics_crsp"]),
+        __msf_world = (
+            __msf_world.join(
+                crsp_ind,
+                how="left",
+                left_on=["permco", "permno", "eom"],
+                right_on=["permco", "permno", "date"],
+            )
+            .with_columns(
+                sic=pl.coalesce(["sic", "sic_crsp"]),
+                naics=pl.coalesce(["naics", "naics_crsp"]),
+            )
+            .drop(["sic_crsp", "naics_crsp"])
         )
-        .drop(["sic_crsp", "naics_crsp"])
-    )
     __msf_world.collect().write_parquet(paths.interim_dir / "__msf_world2.parquet")
 
 
 @measure_time
-def roll_apply_daily(paths: DataPaths, stats, sfx, __min):
+def roll_apply_daily(paths: DataPaths, stats, sfx, __min, end_date: date = END_DATE):
     """
     Description:
         Run rolling daily-stat calculations over grouped date windows and save results.
 
     Steps:
-        1) Generate date-group mappings from sfx (e.g., _21d → k=1, _252d → k=12).
+        1) Generate staggered window specs from sfx (e.g., _21d → k=1, _252d → k=12).
         2) Prepare base daily data per stat.
-        3) Apply process_map_chunks for each mapping and concat results.
+        3) Apply process_window for each window spec and concat results.
         4) Write to '__roll{sfx}_{stats}.parquet'.
 
     Output:
-        Parquet with per-(id_int, group_number) rolling metrics for `stats`.
+        Parquet with per-(id_int, aux_date) rolling metrics for `stats`.
     """
-    print(f"Processing {stats} - {sfx.replace('_', '')} - {__min}", flush=True)
-    aux_maps = gen_aux_maps(sfx)
+    _report_progress(f"Processing {stats} - {sfx.replace('_', '')} - {__min}")
     base_data = prepare_base_data(paths, stat=stats)
     results = pl.concat(
-        [process_map_chunks(base_data, mapping, stats, sfx, __min) for mapping in aux_maps]
+        [process_window(base_data, w, stats, sfx, __min) for w in gen_aux_windows(sfx)]
     )
     results.collect(engine="streaming").write_parquet(
         paths.interim_dir / f"__roll{sfx}_{stats}.parquet"
     )
 
 
-def gen_consecutive_lists(input_list, k):
+def gen_aux_windows(sfx: str | int) -> list[tuple[int, int, int]]:
     """
     Description:
-        Split a list into consecutive, non-overlapping sublists of length k.
+        Build k staggered window specs from suffix window length.
 
     Steps:
-        1) Slice input_list in steps of k.
-        2) Keep only full-length chunks.
+        1) Map suffix to k: {'_21d':1,'_126d':6,'_252d':12,'_1260d':60} or int(sfx).
+        2) For each offset in [0..k-1], compute the window start month and the
+           end of the last full k-month window that fits before the END_DATE
+           month index. Within an offset, month m belongs to
+           group_number = (m - start) // k, and the group's window ends at
+           start + (group_number + 1) * k - 1.
 
     Output:
-        List of k-length sublists.
+        List of k tuples (start, k, last_end), one per offset.
     """
-    return [
-        input_list[i : i + k]
-        for i in range(0, len(input_list), k)
-        if len(input_list[i : i + k]) == k
-    ]
-
-
-def build_groups(input_list, k):
-    """
-    Description:
-        Build k staggered groupings (offset windows) over a list.
-
-    Steps:
-        1) For each offset in [0..k-1], take consecutive k-sublists from input_list[offset:].
-        2) Aggregate into a list of group lists.
-
-    Output:
-        List of k lists, each containing k-length sublists.
-    """
-    return [gen_consecutive_lists(input_list[offset:], k) for offset in range(k)]
-
-
-def group_mapping_dfs(input_list, k):
-    """
-    Description:
-        Create mapping DataFrames linking aux_date to group_number, and group_number to new (max) aux_date.
-
-    Steps:
-        1) Build groups via build_groups(input_list, k).
-        2) For each group, create a DataFrame with aux_date arrays and group_number.
-        3) Return:
-        - group_map: exploded (aux_date, group_number)
-        - date_map : (group_number, aux_date=max group date)
-
-    Output:
-        List of dicts: {'group_map': LazyFrame, 'date_map': LazyFrame}.
-    """
-    groups = build_groups(input_list, k)
-    dfs = [
-        pl.DataFrame({"aux_date": group}).with_columns(
-            group_number=pl.cum_count("aux_date"), new_date=col("aux_date").list.max()
-        )
-        for group in groups
-    ]
-    return [
-        {
-            "group_map": df.explode("aux_date")
-            .select([col("aux_date").cast(pl.Int32), "group_number"])
-            .lazy(),
-            "date_map": df.select(["group_number", col("new_date").alias("aux_date")])
-            .unique()
-            .sort(["group_number"])
-            .lazy(),
-        }
-        for df in dfs
-    ]
+    parameter_mapping = {"_21d": 1, "_126d": 6, "_252d": 12, "_1260d": 60}
+    k = parameter_mapping[sfx] if sfx in parameter_mapping else int(sfx)
+    date_aux = END_DATE.month + END_DATE.year * 12
+    windows = []
+    for offset in range(k):
+        start = 23113 - k + offset
+        n_groups = (date_aux - start + 1) // k
+        windows.append((start, k, start + n_groups * k - 1))
+    return windows
 
 
 def base_data_filter_exp(stat):
@@ -8316,22 +10595,20 @@ def base_data_filter_exp(stat):
 
     Steps:
         1) Choose required non-null columns by stat.
-        2) For return-based stats, also require zero_obs < 10.
+        2) For return-based stats, require non-null ret_exc and zero_obs_gate_ok().
 
     Output:
         Polars expression usable in .filter().
     """
-    if stat == "zero_trades":
+    if stat in ("zero_trades", "turnover"):
         return col("tvol").is_not_null()
     elif stat == "dolvol":
         return col("dolvol_d").is_not_null()
-    elif stat == "turnover":
-        return col("tvol").is_not_null()
     elif stat == "mktcorr":
         # corr_data.parquet pre-filtered upstream in prepare_daily.
         return pl.lit(True)
     else:
-        return (col("ret_exc").is_not_null()) & (col("zero_obs") < 10)
+        return col("ret_exc").is_not_null() & zero_obs_gate_ok()
 
 
 def prepare_base_data(paths: DataPaths, stat):
@@ -8381,7 +10658,7 @@ def apply_group_filter(df, stat, min_obs):
     Output:
         Filtered LazyFrame for subsequent aggregation/regression.
     """
-    if stat == "turnover" or stat == "mktcorr":
+    if stat in ("turnover", "mktcorr"):
         pass
     elif stat == "dimsonbeta":
         df = df.with_columns(
@@ -8394,31 +10671,31 @@ def apply_group_filter(df, stat, min_obs):
             & (col("mktrf_ld1").is_not_null())
         )
     else:
-        if stat == "zero_trades":
-            filter_var = "tvol"
-        elif stat == "dolvol":
-            filter_var = "dolvol_d"
-        else:
-            filter_var = "ret_exc"
+        filter_var = {"zero_trades": "tvol", "dolvol": "dolvol_d"}.get(stat, "ret_exc")
         df = df.with_columns(n=pl.count(filter_var).over(["id_int", "group_number"])).filter(
             col("n") >= min_obs
         )
     return df
 
 
-def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=None):
+def process_window(
+    base_data, window: tuple[int, int, int], stats, sfx, __min, incl=None, skip=None
+):
     """
     Description:
-        Execute a rolling computation for a mapping: join groups, filter, compute stat, remap to end date.
+        Execute a rolling computation for one staggered window offset:
+        assign groups arithmetically, filter, compute stat, stamp end date.
 
     Steps:
-        1) Join base_data with mapping['group_map'] on aux_date.
+        1) Filter base_data to [start, last_end] and assign
+           group_number = (aux_date - start) // k.
         2) Apply apply_group_filter(stat, __min).
         3) Run the appropriate function from `funcs` dict (res_mom with incl/skip).
-        4) Join mapping['date_map'] to replace group_number by new aux_date.
+        4) Replace group_number by the window end month:
+           aux_date = start + (group_number + 1) * k - 1.
 
     Output:
-        LazyFrame of per-(id_int, group_number) results with remapped aux_date.
+        LazyFrame of per-(id_int, aux_date) results.
     """
     funcs = {
         "rvol": rvol,
@@ -8441,8 +10718,11 @@ def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=No
         "res_mom": res_mom,
     }
 
-    df = base_data.join(mapping["group_map"], how="inner", on="aux_date").pipe(
-        apply_group_filter, stat=stats, min_obs=__min
+    start, k, last_end = window
+    df = (
+        base_data.filter(pl.col("aux_date").is_between(start, last_end))
+        .with_columns(group_number=(pl.col("aux_date") - start) // k)
+        .pipe(apply_group_filter, stat=stats, min_obs=__min)
     )
 
     if stats == "res_mom":
@@ -8450,9 +10730,9 @@ def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=No
     else:
         df = df.pipe(funcs[stats], sfx=sfx, __min=__min)
 
-    df = df.join(mapping["date_map"], how="left", on="group_number").drop("group_number")
-
-    return df
+    return df.with_columns(
+        aux_date=(start + (pl.col("group_number") + 1) * k - 1).cast(pl.Int64)
+    ).drop("group_number")
 
 
 def res_mom(df, sfx, __min, incl, skip):
@@ -8475,7 +10755,12 @@ def res_mom(df, sfx, __min, incl, skip):
         .over(["id_int", "group_number"])
     )
     df = (
-        df.filter(col("hml").is_not_null() & col("smb_ff").is_not_null())
+        # Fix within-group row order before the OLS: base_data comes from a
+        # multithreaded DuckDB scan whose row order is nondeterministic, and the
+        # least-squares solve is float-order-sensitive, so an unsorted input
+        # yields byte-different residuals across runs.
+        df.sort(["id_int", "group_number", "aux_date"])
+        .filter(col("hml").is_not_null() & col("smb_ff").is_not_null())
         .with_columns(
             res=res_exp.alias("res"),
             max_date_gn=pl.max("aux_date").over("group_number"),
@@ -8492,30 +10777,6 @@ def res_mom(df, sfx, __min, incl, skip):
     return df
 
 
-def gen_aux_maps(sfx):
-    """
-    Description:
-        Build date-group maps from suffix window length.
-
-    Steps:
-        1) Map suffix to k: {'_21d':1,'_126d':6,'_252d':12,'_1260d':60} or int(sfx).
-        2) Build aux_date range from start index to END_DATE month index.
-        3) Create grouped mappings via group_mapping_dfs(date_idx, k).
-
-    Output:
-        List of {'group_map','date_map'} mappings.
-    """
-    parameter_mapping = {"_21d": 1, "_126d": 6, "_252d": 12, "_1260d": 60}
-    date_aux = END_DATE.month + END_DATE.year * 12
-    if sfx in parameter_mapping:
-        date_idx = list(range(23113 - parameter_mapping[sfx], date_aux + 1))
-        aux_maps = group_mapping_dfs(date_idx, parameter_mapping[sfx])
-    else:
-        date_idx = list(range(23113 - int(sfx), date_aux + 1))
-        aux_maps = group_mapping_dfs(date_idx, int(sfx))
-    return aux_maps
-
-
 def rvol(df, sfx, __min):
     """
     Description:
@@ -8529,7 +10790,10 @@ def rvol(df, sfx, __min):
         LazyFrame with f'rvol{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("ret_exc").cast(pl.Float64).std().alias(f"rvol{sfx}")
+        pl.when(col("ret_exc").min() < col("ret_exc").max())
+        .then(col("ret_exc").cast(pl.Float64).std())
+        .otherwise(fl_none())
+        .alias(f"rvol{sfx}")
     )
     return df
 
@@ -8548,8 +10812,14 @@ def rmax(df, sfx, __min):
     """
     df = df.group_by(["id_int", "group_number"]).agg(
         [
-            col("ret").top_k(5).mean().alias(f"rmax5{sfx}"),
-            col("ret").max().alias(f"rmax1{sfx}"),
+            pl.when(col("ret").min() < col("ret").max())
+            .then(col("ret").top_k(5).mean())
+            .otherwise(fl_none())
+            .alias(f"rmax5{sfx}"),
+            pl.when(col("ret").min() < col("ret").max())
+            .then(col("ret").max())
+            .otherwise(fl_none())
+            .alias(f"rmax1{sfx}"),
         ]
     )
     return df
@@ -8568,7 +10838,10 @@ def skew(df, sfx, __min):
         LazyFrame with f'rskew{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("ret_exc").skew(bias=False).alias(f"rskew{sfx}")
+        pl.when(col("ret_exc").min() < col("ret_exc").max())
+        .then(col("ret_exc").skew(bias=False))
+        .otherwise(fl_none())
+        .alias(f"rskew{sfx}")
     )
     return df
 
@@ -8595,9 +10868,10 @@ def prc_to_high(df, sfx, __min):
         df.group_by(["id_int", "group_number"])
         .agg(
             [
-                (col("prc_adj").sort_by("date").last() / col("prc_adj").max()).alias(
-                    f"prc_highprc{sfx}"
-                ),
+                pl.when(col("prc_adj").min() < col("prc_adj").max())
+                .then(col("prc_adj").sort_by("date").last() / col("prc_adj").max())
+                .otherwise(fl_none())
+                .alias(f"prc_highprc{sfx}"),
                 pl.count("prc_adj").alias("n"),
             ]
         )
@@ -8619,13 +10893,24 @@ def capm(df, sfx, __min):
     Output:
         LazyFrame with f'beta{sfx}' and f'ivol_capm{sfx}'.
     """
-    df = df.group_by(["id_int", "group_number"]).agg(
-        [
-            (pl.cov("ret_exc", "mktrf") / pl.var("mktrf")).alias(f"beta{sfx}"),
-            (col("ret_exc") - col("mktrf") * (pl.cov("ret_exc", "mktrf") / pl.var("mktrf")))
-            .std()
-            .alias(f"ivol_capm{sfx}"),
-        ]
+    # Fix within-group row order before the reductions: base_data comes from a
+    # multithreaded DuckDB scan whose row order is nondeterministic, and cov/var/
+    # std are float-order-sensitive, so an unsorted input yields byte-different
+    # betas across runs.
+    beta_exp = pl.cov("ret_exc", "mktrf") / pl.var("mktrf")
+    residual_exp = col("ret_exc") - col("mktrf") * beta_exp
+    df = (
+        df.sort(["id_int", "group_number", "aux_date"])
+        .group_by(["id_int", "group_number"])
+        .agg(
+            [
+                beta_exp.alias(f"beta{sfx}"),
+                pl.when(col("ret_exc").min() < col("ret_exc").max())
+                .then(residual_exp.std())
+                .otherwise(fl_none())
+                .alias(f"ivol_capm{sfx}"),
+            ]
+        )
     )
     return df
 
@@ -8648,7 +10933,10 @@ def ami(df, sfx, __min):
         df.group_by(["id_int", "group_number"])
         .agg(
             [
-                (col("ret").abs() / aux_1 * 1e6).mean().alias(f"ami{sfx}"),
+                pl.when((col("ret").min() < col("ret").max()) & (~(col("dolvol_d") == 0).any()))
+                .then((col("ret").abs() / aux_1 * 1e6).mean())
+                .otherwise(fl_none())
+                .alias(f"ami{sfx}"),
                 pl.count("dolvol_d").alias("n"),
             ]
         )
@@ -8698,7 +10986,10 @@ def mktrf_vol(df, sfx, __min):
         LazyFrame with f'__mktvol{sfx}'.
     """
     df = df.group_by(["id_int", "group_number"]).agg(
-        col("mktrf").cast(pl.Float64).std().alias(f"__mktvol{sfx}")
+        pl.when(col("mktrf").min() < col("mktrf").max())
+        .then(col("mktrf").cast(pl.Float64).std())
+        .otherwise(fl_none())
+        .alias(f"__mktvol{sfx}")
     )
     return df
 
@@ -8725,9 +11016,18 @@ def capm_ext(df, sfx, __min):
     df = df.group_by(["id_int", "group_number"]).agg(
         [
             beta_col.cast(pl.Float64).alias(f"beta{sfx}"),
-            residual_col.std().alias(f"ivol_capm{sfx}"),
-            residual_col.skew(bias=False).alias(f"iskew_capm{sfx}"),
-            (exp_coskew1 / exp_coskew2).alias(f"coskew{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(residual_col.std())
+            .otherwise(fl_none())
+            .alias(f"ivol_capm{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(residual_col.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_capm{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(exp_coskew1 / exp_coskew2)
+            .otherwise(fl_none())
+            .alias(f"coskew{sfx}"),
         ]
     )
     return df
@@ -8752,8 +11052,14 @@ def ff3(df, sfx, __min):
         df.filter(col("smb_ff").is_not_null() & col("hml").is_not_null())
         .group_by(["id_int", "group_number"])
         .agg(
-            res_exp.std(ddof=3).alias(f"ivol_ff3{sfx}"),
-            res_exp.skew(bias=False).alias(f"iskew_ff3{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.std(ddof=3))
+            .otherwise(fl_none())
+            .alias(f"ivol_ff3{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_ff3{sfx}"),
         )
     )
     return df
@@ -8780,8 +11086,14 @@ def hxz4(df, sfx, __min):
         )
         .group_by(["id_int", "group_number"])
         .agg(
-            res_exp.std(ddof=4).alias(f"ivol_hxz4{sfx}"),
-            res_exp.skew(bias=False).alias(f"iskew_hxz4{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.std(ddof=4))
+            .otherwise(fl_none())
+            .alias(f"ivol_hxz4{sfx}"),
+            pl.when(col("ret_exc").min() < col("ret_exc").max())
+            .then(res_exp.skew(bias=False))
+            .otherwise(fl_none())
+            .alias(f"iskew_hxz4{sfx}"),
         )
     )
     return df
@@ -8845,7 +11157,7 @@ def dolvol(df, sfx, __min):
     df = df.group_by(["id_int", "group_number"]).agg(
         [
             col("dolvol_d").mean().alias(f"dolvol{sfx}"),
-            pl.when(col("dolvol_d").mean() != 0)
+            pl.when((col("dolvol_d").mean() != 0) & (col("dolvol_d").min() < col("dolvol_d").max()))
             .then(col("dolvol_d").std() / col("dolvol_d").mean())
             .otherwise(fl_none())
             .alias(f"dolvol_var{sfx}"),
@@ -8873,16 +11185,18 @@ def turnover(df, sfx, __min):
         .agg(
             turnover_d.mean().alias(f"turnover{sfx}"),
             turnover_d.std().alias("turnover_std"),
+            turnover_d.min().alias("turnover_min"),
+            turnover_d.max().alias("turnover_max"),
             pl.len().alias("n"),
         )
         .with_columns(
-            pl.when(col(f"turnover{sfx}") != 0)
+            pl.when((col(f"turnover{sfx}") != 0) & (col("turnover_min") < col("turnover_max")))
             .then(col("turnover_std") / col(f"turnover{sfx}"))
             .otherwise(fl_none())
             .alias(f"turnover_var{sfx}"),
         )
         .filter(col("n") >= __min)
-        .drop(["turnover_std", "n"])
+        .drop(["turnover_std", "turnover_min", "turnover_max", "n"])
     )
     return df
 
@@ -8899,14 +11213,18 @@ def mktcorr(df, sfx, __min):
     Output:
         LazyFrame with f'corr{sfx}'.
     """
+    name = f"corr{sfx}"
     return (
         df.group_by(["id_int", "group_number"])
         .agg(
             pl.len().alias("n"),
-            pl.corr("ret_exc_3l", "mkt_exc_3l").alias(f"corr{sfx}"),
+            pl.corr("ret_exc_3l", "mkt_exc_3l").alias(name),
         )
         .filter(col("n") >= __min)
         .drop("n")
+        .with_columns(
+            pl.when(col(name).is_finite()).then(col(name)).otherwise(fl_none()).alias(name)
+        )
     )
 
 
@@ -8935,7 +11253,7 @@ def dimsonbeta(
             )
         )
         .select("id_int", "group_number", beta_expr.alias(name))
-        .filter(pl.col(name).is_not_null() & pl.col(name).is_not_nan())
+        .filter(pl.col(name).is_not_null() & pl.col(name).is_finite())
     )
 
 
@@ -9165,6 +11483,7 @@ def portfolios(
     ind_pf=True,  # Should industry portfolio returns be estimated
     ret_cutoffs=None,  # Data frame for monthly winsorization. Neccesary when wins_ret=T
     ret_cutoffs_daily=None,  # Data frame for daily winsorization. Neccesary when wins_ret=T and daily_pf=T
+    daily_ret_col: str = "ret_exc",  # Daily return column to aggregate into portfolios
 ):
     if source is None:
         source = ["CRSP", "COMPUSTAT"]
@@ -9178,7 +11497,7 @@ def portfolios(
             "eom",
             "source_crsp",
             "comp_exchg",
-            "crsp_exchcd",
+            "crsp_nyse",
             "size_grp",
             "ret_exc",
             "ret_exc_lead1m",
@@ -9194,13 +11513,20 @@ def portfolios(
     # polars push predicate/null filters into the parquet reader (skipping row
     # groups on real production files) and fuse the ~15 intermediate steps into
     # one pass instead of allocating ~15 intermediate DataFrames.
-    cast_exclude = {"id", "eom", "source_crsp", "size_grp", "excntry"}
+    cast_exclude = {
+        "id",
+        "eom",
+        "source_crsp",
+        "size_grp",
+        "excntry",
+        "crsp_nyse",
+    }
     cast_cols = [c for c in columns if c not in cast_exclude]
 
     if bps == "nyse":
         bp_stock_expr = (
-            ((pl.col("crsp_exchcd") == 1) & pl.col("comp_exchg").is_null())
-            | ((pl.col("comp_exchg") == 11) & pl.col("crsp_exchcd").is_null())
+            ((pl.col("crsp_nyse") == 1) & pl.col("comp_exchg").is_null())
+            | ((pl.col("comp_exchg") == 11) & (pl.col("crsp_nyse") != 1))
         ).alias("bp_stock")
     else:  # "non_mc"
         bp_stock_expr = pl.col("size_grp").is_in(["mega", "large", "small"]).alias("bp_stock")
@@ -9234,7 +11560,7 @@ def portfolios(
     if daily_pf:
         daily_lazy = (
             pl.scan_parquet(daily_file_path)
-            .select(["id", "date", "ret_exc"])
+            .select(["id", "date", pl.col(daily_ret_col).alias("ret_exc")])
             .with_columns((pl.col("date").dt.month_start().dt.offset_by("-1d")).alias("eom_lag1"))
             .with_columns(pl.col("ret_exc").cast(pl.Float64))
         )
@@ -9262,8 +11588,9 @@ def portfolios(
             .drop(["source_crsp", "p001", "p999"])
         )
 
-        # Daily winsorization
-        if daily_pf:
+        # Daily winsorization (only for standard ret_exc; O/I component
+        # returns are not excess returns and use different distributions).
+        if daily_pf and daily_ret_col == "ret_exc":
             daily_lazy = (
                 daily_lazy.with_columns(pl.col("date").dt.month_end().alias("eom"))
                 .join(

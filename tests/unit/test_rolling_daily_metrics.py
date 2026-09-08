@@ -26,6 +26,7 @@ from jkp.data.aux_functions import (
     dolvol,
     downbeta,
     ff3,
+    finish_daily_chars,
     hxz4,
     mktcorr,
     mktrf_vol,
@@ -36,6 +37,113 @@ from jkp.data.aux_functions import (
     turnover,
     zero_trades,
 )
+
+
+class TestDegenerateRollingWindows:
+    """Flat or non-finite windows must not become extreme ranked signals."""
+
+    def test_flat_return_extremes_are_null(self):
+        df = pl.DataFrame({"id_int": [1] * 5, "group_number": [10] * 5, "ret": [0.0] * 5})
+        result = rmax(df, "_21d", __min=5)
+        assert result["rmax5_21d"][0] is None
+        assert result["rmax1_21d"][0] is None
+
+    def test_flat_nonzero_price_to_high_is_null(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 3,
+                "group_number": [10] * 3,
+                "date": [date(2024, 1, d) for d in (1, 2, 3)],
+                "prc_adj": [12.0] * 3,
+            }
+        )
+        result = prc_to_high(df, "_21d", __min=3)
+        assert result["prc_highprc_21d"][0] is None
+
+    def test_flat_stock_return_nulls_idiosyncratic_moments(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 5,
+                "group_number": [10] * 5,
+                # capm() sorts on aux_date before its order-sensitive reductions
+                "aux_date": [1, 2, 3, 4, 5],
+                "ret_exc": [0.0] * 5,
+                "mktrf": [-0.02, -0.01, 0.0, 0.01, 0.02],
+            }
+        )
+        capm_result = capm(df, "_21d", __min=5)
+        ext_result = capm_ext(df, "_21d", __min=5)
+        assert capm_result["ivol_capm_21d"][0] is None
+        assert ext_result["ivol_capm_21d"][0] is None
+        assert ext_result["iskew_capm_21d"][0] is None
+        assert ext_result["coskew_21d"][0] is None
+
+    def test_flat_stock_return_nulls_multifactor_residual_moments(self):
+        n = 8
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * n,
+                "group_number": [10] * n,
+                "ret_exc": [0.0] * n,
+                "mktrf": [-0.04, -0.03, -0.02, -0.01, 0.01, 0.02, 0.03, 0.04],
+                "smb_ff": [0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.04, -0.04],
+                "hml": [-0.02, 0.01, 0.03, -0.04, 0.04, -0.03, -0.01, 0.02],
+                "smb_hxz": [0.03, -0.01, -0.04, 0.02, -0.02, 0.04, 0.01, -0.03],
+                "roe": [-0.01, 0.04, -0.02, 0.03, -0.04, 0.02, -0.03, 0.01],
+                "inv": [0.04, -0.03, 0.01, -0.02, 0.03, -0.01, 0.02, -0.04],
+            }
+        )
+        ff3_result = ff3(df, "_21d", __min=n)
+        hxz_result = hxz4(df, "_21d", __min=n)
+        assert ff3_result["ivol_ff3_21d"][0] is None
+        assert ff3_result["iskew_ff3_21d"][0] is None
+        assert hxz_result["ivol_hxz4_21d"][0] is None
+        assert hxz_result["iskew_hxz4_21d"][0] is None
+
+    def test_flat_dollar_volume_keeps_level_but_nulls_variability(self):
+        df = pl.DataFrame({"id_int": [1] * 3, "group_number": [10] * 3, "dolvol_d": [100.0] * 3})
+        result = dolvol(df, "_126d", __min=3)
+        assert result["dolvol_126d"][0] == 100.0
+        assert result["dolvol_var_126d"][0] is None
+
+    def test_flat_turnover_keeps_level_but_nulls_variability(self):
+        df = pl.DataFrame(
+            {
+                "id_int": [1] * 3,
+                "group_number": [10] * 3,
+                "tvol": [10.0] * 3,
+                "shares": [1.0] * 3,
+            }
+        )
+        result = turnover(df, "_126d", __min=3)
+        assert result["turnover_126d"][0] == pytest.approx(10.0 / 1e6)
+        assert result["turnover_var_126d"][0] is None
+
+    def test_finish_daily_chars_scrubs_nan_and_infinity(self, test_paths):
+        eom = date(2024, 1, 31)
+        pl.DataFrame({"id": [1], "eom": [eom], "bidaskhl_21d": [float("inf")]}).write_parquet(
+            test_paths.interim_dir / "corwin_schultz.parquet"
+        )
+        pl.DataFrame(
+            {
+                "id": [1],
+                "eom": [eom],
+                "corr_1260d": [float("nan")],
+                "rvol_252d": [0.0],
+                "__mktvol_252d": [0.0],
+                "rmax5_21d": [0.0],
+            }
+        ).write_parquet(test_paths.interim_dir / "roll_apply_daily.parquet")
+        output = test_paths.interim_dir / "daily_chars.parquet"
+
+        finish_daily_chars(test_paths, output)
+
+        result = pl.read_parquet(output)
+        assert result["bidaskhl_21d"][0] is None
+        assert result["corr_1260d"][0] is None
+        assert result["betabab_1260d"][0] is None
+        assert result["rmax5_rvol_21d"][0] is None
+
 
 GOLDEN_DIR = Path(__file__).parent.parent / "golden" / "fixtures"
 
@@ -88,11 +196,12 @@ class TestRvol:
         # Polars std() is sample std (ddof=1), so:
         # (1,10): std([1,2,3]) = 1.0
         # (1,20): std([2,4,4]) = sqrt(4/3)
-        # (2,10): std([3,3,3]) = 0.0
+        # (2,10): constant window is economically undefined -> null
         # (2,20): std([-1,0,1]) = 1.0
+        assert result["rvol_21d"][2] is None
         np.testing.assert_allclose(
-            result["rvol_21d"].to_list(),
-            [1.0, np.sqrt(4.0 / 3.0), 0.0, 1.0],
+            [result["rvol_21d"][0], result["rvol_21d"][1], result["rvol_21d"][3]],
+            [1.0, np.sqrt(4.0 / 3.0), 1.0],
             **tolerance.STANDARD,
             err_msg=f"Unexpected rvol values: {result['rvol_21d'].to_list()}",
         )
@@ -439,6 +548,7 @@ class TestCapm:
                 "group_number": [10, 10, 10, 10],
                 "mktrf": [1.0, 2.0, 3.0, 4.0],
                 "ret_exc": [2.0, 4.0, 6.0, 8.0],
+                "aux_date": [date(2020, 1, d) for d in (1, 2, 3, 4)],
             }
         )
 
@@ -465,6 +575,7 @@ class TestCapm:
                 "group_number": [10, 10, 10, 10],
                 "mktrf": [2.0, 2.0, 2.0, 2.0],
                 "ret_exc": [1.0, 2.0, 3.0, 4.0],
+                "aux_date": [date(2020, 1, d) for d in (1, 2, 3, 4)],
             }
         )
         result = capm(df, "_21d", __min=15)
@@ -479,6 +590,7 @@ class TestCapm:
                 "group_number": [10, 10, 10, 10, 20, 20, 20, 20],
                 "mktrf": [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
                 "ret_exc": [2.0, 4.0, 6.0, 8.0, 1.0, 2.0, 3.0, 5.0],
+                "aux_date": [date(2020, 1, d) for d in (1, 2, 3, 4, 1, 2, 3, 4)],
             }
         )
         low_min = capm(df, "_21d", __min=1).sort(["id_int", "group_number"])
@@ -492,6 +604,7 @@ class TestCapm:
                 "group_number": pl.Int64,
                 "mktrf": pl.Float64,
                 "ret_exc": pl.Float64,
+                "aux_date": pl.Date,
             }
         )
         result = capm(df, "_21d", __min=15)
@@ -501,8 +614,8 @@ class TestCapm:
 class TestAmi:
     """Tests for ami() Amihud illiquidity helper."""
 
-    def test_ami_zero_dollar_volume_ignored_and_min_filter_applied(self, tolerance):
-        """dolvol_d == 0 should become null in ratio; groups keep only if n >= __min."""
+    def test_ami_zero_dollar_volume_nulls_window_and_min_filter_applied(self):
+        """A zero-volume day makes the window's Amihud estimate unreliable."""
         df = pl.DataFrame(
             {
                 "id_int": [1, 1, 1, 2, 2],
@@ -515,16 +628,11 @@ class TestAmi:
         result = ami(df, "_21d", __min=3).sort(["id_int", "group_number"])
 
         # group (1,10):
-        # abs(ret)/dolvol*1e6 -> [100, null, 25] -> mean = 62.5
-        # n = count(dolvol_d) = 3, passes
+        # A zero dolvol day invalidates the whole group's estimate.
+        # n = count(dolvol_d) = 3, so the group itself still passes.
         # group (2,20): n=2, filtered out
         assert len(result) == 1, f"Expected 1 group after min filter, got {len(result)}"
-        np.testing.assert_allclose(
-            result["ami_21d"][0],
-            62.5,
-            **tolerance.STANDARD,
-            err_msg=f"Expected ami_21d=62.5, got {result['ami_21d'][0]}",
-        )
+        assert result["ami_21d"][0] is None
 
     def test_ami_all_zero_dollar_volume_gives_null(self):
         """If all dolvol_d are zero, the Amihud ratio should be undefined."""
@@ -625,9 +733,10 @@ class TestMktrfVol:
         assert result.columns == ["id_int", "group_number", "__mktvol_21d"], (
             f"Unexpected columns: {result.columns}"
         )
+        assert result["__mktvol_21d"][1] is None
         np.testing.assert_allclose(
-            result["__mktvol_21d"].to_list(),
-            [1.0, 0.0],
+            result["__mktvol_21d"][0],
+            1.0,
             **tolerance.STANDARD,
             err_msg=f"Unexpected __mktvol_21d values: {result['__mktvol_21d'].to_list()}",
         )
@@ -1619,8 +1728,9 @@ class TestDimsonbeta:
 class TestPrepareDailyCorr:
     """Regression tests for the corr_data.parquet written by prepare_daily().
 
-    Verifies that the filter removing null 3l-sums and zero_obs>=10 rows
+    Verifies that the filter removing null 3l-sums and Compustat zero_obs>=10 rows
     is present in prepare_daily, guaranteeing null-free corr_data.parquet output.
+    CRSP rows with high zero_obs are kept (source-conditional gate).
     """
 
     def test_corr_data_null_free_and_zero_obs_filtered(self, test_paths):
@@ -1629,15 +1739,16 @@ class TestPrepareDailyCorr:
 
         # id "A": 5 consecutive days, all ret_exc non-null → all rows survive.
         # id "B": day1 ret_exc null → 3l-sums on days 1-3 null → those days filtered.
-        # id "C": zero_obs=10 every day → whole id filtered.
+        # id "C": Compustat, zero_obs=10 → whole id filtered.
         dates = [date(2020, 1, d) for d in range(2, 7)]
         eom = date(2020, 1, 31)
 
-        def make_rows(stock_id, ret_exc_vals, ret_local_vals):
+        def make_rows(stock_id, ret_exc_vals, ret_local_vals, source_crsp=1):
             n = len(dates)
             return {
                 "excntry": ["USA"] * n,
                 "id": [stock_id] * n,
+                "source_crsp": [source_crsp] * n,
                 "date": dates,
                 "eom": [eom] * n,
                 "prc": [10.0] * n,
@@ -1658,14 +1769,14 @@ class TestPrepareDailyCorr:
         df_b = pl.DataFrame(
             make_rows("B", [None, 0.02, 0.03, 0.04, 0.05], [None, 0.02, 0.03, 0.04, 0.05])
         )
-        # id "C": ret_local=0 every day → zero_obs=5 per eom (< 10 so NOT filtered by zero_obs)
-        #   Actually make zero_obs >= 10 by using 10 rows for id "C" spanning two eoms
+        # id "C": Compustat with all-zero ret_local → zero_obs=10 → filtered
         dates_c = [date(2020, 1, d) for d in range(2, 12)]  # 10 days
         eom_c_vals = [date(2020, 1, 31)] * 10
         df_c = pl.DataFrame(
             {
                 "excntry": ["USA"] * 10,
                 "id": ["C"] * 10,
+                "source_crsp": [0] * 10,
                 "date": dates_c,
                 "eom": eom_c_vals,
                 "prc": [10.0] * 10,
@@ -1676,7 +1787,7 @@ class TestPrepareDailyCorr:
                 "shares": [1000.0] * 10,
                 "tvol": [0.0] * 10,
                 "ret_lag_dif": [1] * 10,
-                "ret_local": [0.0] * 10,  # all zero → zero_obs=10 → filtered
+                "ret_local": [0.0] * 10,  # all zero → zero_obs=10 → Compustat filtered
             }
         )
 
@@ -1709,10 +1820,98 @@ class TestPrepareDailyCorr:
         # zero_obs column must not be present (it is dropped in select)
         assert "zero_obs" not in corr.columns, "zero_obs column should not be in corr_data"
 
-        # id "C" (zero_obs=10) must not appear — its id_int should be absent
-        # We know id "C" maps to some id_int; all rows from it should be gone.
-        # Simpler: row count should equal surviving rows from A and B only.
+        # id "C" (Compustat, zero_obs=10) must not appear.
         # id A: 5 rows, 3l non-null from row index 2 onwards → 3 rows survive.
         # id B: 5 rows, first ret_exc null → 3l null on rows 0-2 → rows 3,4 survive → 2 rows.
-        # id C: all filtered by zero_obs=10 → 0 rows.
+        # id C: all filtered by zero_obs gate → 0 rows.
         assert len(corr) == 5, f"Expected 5 rows (3 from A + 2 from B), got {len(corr)}"
+
+    def test_corr_data_keeps_crsp_high_zero_obs(self, test_paths):
+        """CRSP months with all-zero ret_local still appear in corr_data."""
+        from jkp.data.aux_functions import prepare_daily
+
+        dates = [date(2020, 1, d) for d in range(2, 12)]  # 10 days → zero_obs=10
+        eom = date(2020, 1, 31)
+        dsf = pl.DataFrame(
+            {
+                "excntry": ["USA"] * 10,
+                "id": ["CRSP"] * 10,
+                "source_crsp": [1] * 10,
+                "date": dates,
+                "eom": [eom] * 10,
+                "prc": [10.0] * 10,
+                "adjfct": [1.0] * 10,
+                "ret": [0.0] * 10,
+                "ret_exc": [0.0] * 10,
+                "dolvol": [0.0] * 10,
+                "shares": [1000.0] * 10,
+                "tvol": [0.0] * 10,
+                "ret_lag_dif": [1] * 10,
+                "ret_local": [0.0] * 10,
+            }
+        )
+        dsf_path = test_paths.interim_dir / "dsf.parquet"
+        dsf.write_parquet(dsf_path)
+
+        fcts = pl.DataFrame(
+            {
+                "excntry": ["USA"] * 10,
+                "date": dates,
+                "mktrf": [0.005] * 10,
+                "smb": [0.001] * 10,
+                "hml": [0.001] * 10,
+            }
+        )
+        fcts_path = test_paths.interim_dir / "fcts.parquet"
+        fcts.write_parquet(fcts_path)
+
+        prepare_daily(test_paths, dsf_path, fcts_path)
+        corr = pl.read_parquet(test_paths.interim_dir / "corr_data.parquet")
+        # 10 days; 3l non-null from index 2 onwards → 8 rows
+        assert len(corr) == 8, f"Expected 8 CRSP corr rows, got {len(corr)}"
+
+    def test_prepare_daily_drops_null_mktrf_stock_days(self, test_paths):
+        """Stock days whose date has no mktrf are absent from dsf1."""
+        from jkp.data.aux_functions import prepare_daily
+
+        dsf = pl.DataFrame(
+            {
+                "excntry": ["USA", "USA"],
+                "id": ["A", "A"],
+                "source_crsp": [1, 1],
+                "date": [date(2020, 1, 2), date(2020, 1, 3)],
+                "eom": [date(2020, 1, 31), date(2020, 1, 31)],
+                "prc": [10.0, 10.0],
+                "adjfct": [1.0, 1.0],
+                "ret": [0.01, 0.01],
+                "ret_exc": [0.005, 0.005],
+                "dolvol": [1e6, 1e6],
+                "shares": [1000.0, 1000.0],
+                "tvol": [100.0, 100.0],
+                "ret_lag_dif": [1, 1],
+                "ret_local": [0.01, 0.01],
+            }
+        )
+        dsf_path = test_paths.interim_dir / "dsf.parquet"
+        dsf.write_parquet(dsf_path)
+
+        # Only 2020-01-02 has a factor row
+        fcts = pl.DataFrame(
+            {
+                "excntry": ["USA"],
+                "date": [date(2020, 1, 2)],
+                "mktrf": [0.005],
+                "smb": [0.001],
+                "hml": [0.001],
+            }
+        )
+        fcts_path = test_paths.interim_dir / "fcts.parquet"
+        fcts.write_parquet(fcts_path)
+
+        prepare_daily(test_paths, dsf_path, fcts_path)
+        dsf1 = pl.read_parquet(test_paths.interim_dir / "dsf1.parquet")
+        assert dsf1["date"].to_list() == [date(2020, 1, 2)]
+
+        mkt = pl.read_parquet(test_paths.interim_dir / "mkt_lead_lag.parquet")
+        assert mkt["mktrf"].null_count() == 0
+        assert len(mkt) == 1

@@ -1,13 +1,85 @@
-from datetime import date
+from datetime import date, timedelta
 
-import polars as pl
 
-# Last calendar date kept in pipeline outputs.
-END_DATE = date(2025, 12, 31)
+def _previous_month_end(today: date | None = None) -> date:
+    """Return the final calendar day of the month before ``today``."""
+    current_date = date.today() if today is None else today
+    return current_date.replace(day=1) - timedelta(days=1)
 
-# Earliest fiscal-period-end date kept when building the standardized
-# accounting panel; rows with `datadate` before this are dropped.
-ACCOUNTING_START_DATE = pl.datetime(1949, 12, 31)
+
+# Last completed calendar month kept in pipeline outputs. This is evaluated
+# once when the process starts so every stage of a run uses the same cutoff.
+END_DATE = _previous_month_end()
+
+# Absolute floor for date-bearing source downloads and the standardized
+# accounting panel, used when a run asks for complete history.
+ACCOUNTING_START_DATE: date | None = date(1949, 12, 31)
+
+# Longest lookback any characteristic needs, in monthly observations:
+# ``seas_16_20`` requires 240. Everything else is 60 months (the ``ch5`` family,
+# ``beta_60m``, ``ret_60_36``), 1260 trading days, or shorter.
+MAX_LOOKBACK_MONTHS = 240
+
+# Source history retained by a default run, counted back from END_DATE, so cost
+# stays flat instead of growing a year every year.
+#
+# 23 rather than the bare 20 the 240-month lookback implies: that gate counts a
+# security's own rows, not calendar months, and the shifts behind it are
+# positional, so a security with missing months needs more than 20 calendar
+# years to accumulate 240 observations. Measured on the USA monthly panel
+# (1,849 securities mature enough to qualify), a 23-year window loses no
+# security that a 26-year window keeps, while 22 loses one and 21 loses two.
+# Shorten this only against a fresh measurement -- the emerging markets were
+# not sampled, and their panels are gappier.
+ROLLING_INPUT_YEARS = 23
+
+# History kept in the per-country production CSVs, counted back from END_DATE.
+# 0 emits everything, which a downstream re-seed needs.
+#
+# These CSVs feed an appending loader that only reads rows past the destination's
+# high-water mark -- normally one month. 3 years rather than 2 months so that
+# restatements keep propagating (the loader deletes and reinserts everything the
+# file covers) and so a loader that has not run for a while still finds its
+# overlap instead of leaving a permanent hole.
+#
+# Output only: every characteristic is still computed over the full input window,
+# so trimming here changes no value in the rows that remain.
+PRODUCTION_OUTPUT_YEARS = 3
+
+# Bypass CRSP entirely and build the dataset from Compustat only. When True the
+# pipeline skips all CRSP downloads/processing and mirrors the SAS `bypass_crsp=1`
+# path: Compustat-only security files, FF risk-free rate (with last-month
+# fallback) instead of the CRSP 30y T-bill, NYSE breakpoints from `comp_exchg=11`,
+# and industry codes from Compustat only. The `jkp build --bypass-crsp/--no-bypass-crsp`
+# flag overrides this default per run.
+BYPASS_CRSP = True
+
+# Also emit the alpha-beta production CSVs (per-country monthly characteristics
+# and daily returns, with company name, sedol/cusip/isin, turnover, ILS values),
+# mirroring the SAS `*_production_*` macros. Written under processed/production/.
+PRODUCTION_OUTPUT = True
+
+# Shared parallel workers for the indexed SECD/G_SECD batch downloads. The
+# `jkp build --daily-download-workers` flag overrides this default per run.
+# Measured on the 2026-07-26 full run: 2->4 workers scaled linearly (saturation
+# 4.00x/4, zero retries) while the source RDS stayed at ~40% CPU and 13% of
+# provisioned IOPS, so the client — not the database — was the limit.
+# With workers > 1 the batch queue also overlaps the remaining sequential
+# table downloads and the age anchor instead of running after them.
+DAILY_DOWNLOAD_WORKERS = 8
+
+# Hard ceiling on the above; also bounds the CLI flag. Raise only alongside
+# evidence that the source database tolerates the extra concurrency.
+MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS = 8
+
+# Independent rolling-window calculations executed concurrently by
+# `roll_apply_daily`. The 19 (window, variable) combinations are independent and
+# each writes its own parquet, but on the 2026-07-26 run they were issued
+# serially at a mean of 22.7 of 128 cores. A single call peaked at ~48 GiB of
+# real RAM with ~445 GiB free, so a small fan-out is safe; keep this modest
+# because each worker holds its own Polars collect buffers. Set to 1 to restore
+# fully sequential execution.
+ROLLING_DAILY_WORKERS = 4
 
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
@@ -218,7 +290,7 @@ ROLLING_DAILY_SPECS: list[tuple[str, int, list[str]]] = [
 PORTFOLIO_SETTINGS = {
     "end_date": END_DATE,
     "pfs": PORTFOLIO_PFS,
-    "source": ["CRSP", "COMPUSTAT"],
+    "source": ["COMPUSTAT"],
     "wins_ret": True,
     "bps": "non_mc",
     "bp_min_n": PORTFOLIO_BP_MIN_N,
@@ -234,3 +306,24 @@ PORTFOLIO_SETTINGS = {
     "daily_pf": True,
     "ind_pf": True,
 }
+
+# Compustat return corrections (Bessembinder et al. 2023 Data Appendix)
+
+# Compression for the scratch spill files written during the correction array
+# passes; read once then deleted, so favor encode speed over size.
+CORRECTION_SPILL_COMPRESSION = "lz4"
+
+# Valid decimal-correction methods. The floor variants gate the price
+# correction to the divide direction on >=$1 prices (handoff recommendation).
+DECIMAL_CORRECTION_METHODS = ("multiplier", "interpolation", "floor", "floor_interp")
+
+# Default multi-period detection windows (trading days), covering common error
+# durations 1 day to ~1 month; ~10x fewer iterations than an exhaustive search.
+DECIMAL_DETECTION_WINDOWS = [1, 2, 3, 5, 10, 21]
+
+# Countries with a $0.001 minimum-price threshold instead of $0.01.
+LOW_PRICE_COUNTRIES = ["BRA", "IDN", "NGA", "TUR"]
+
+# Drop the first observation after a calendar gap wider than this many trading
+# days (~11 months; converted to calendar days at 365/252).
+FILTER_GAP_TRADING_DAYS = 231

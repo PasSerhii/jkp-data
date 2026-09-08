@@ -344,7 +344,7 @@ class TestOhlsonO:
 
     Paper Reference: Ohlson (1980), used in JKP (2023) Appendix Table A.1
 
-    Formula coefficients:
+    Production coefficients:
         -1.32 - 0.407*log(TA) + 6.03*TLTA - 1.43*WCTA + 0.076*CLCA
         - 1.72*OENEG - 2.37*NITA - 1.83*FUTL + 0.285*INTWO - 0.52*CHIN
 
@@ -365,6 +365,40 @@ class TestOhlsonO:
             assert len(non_integers) > 0 or len(values) == 1, (
                 f"O-score should be continuous (non-integer), but all {len(values)} values are integers"
             )
+
+    def test_oscore_uses_production_working_capital_sign(self):
+        """Working capital LOWERS the distress score (-1.43*WCTA), per Ohlson
+        (1980) and the upstream SAS since 2025-03-05 (ReplicationCrisis@b0b01d5a);
+        the +1.43 in the pre-2025 SAS was a bug."""
+        dates = _generate_monthly_dates(24)
+        frame = pl.DataFrame(
+            {
+                "gvkey": ["001"] * 24,
+                "curcd": ["USD"] * 24,
+                "datadate": dates,
+                "count": list(range(1, 25)),
+                "at_x": [1000.0] * 24,
+                "lt": [300.0] * 24,
+                "ca_x": [400.0] * 24,
+                "cl_x": [100.0] * 24,
+                "debt_x": [200.0] * 24,
+                "nix_x": [100.0] * 24,
+                "pi_x": [120.0] * 24,
+                "dp": [30.0] * 24,
+            }
+        )
+
+        actual = ohlson_o(frame)["o_score"][20]
+        expected = (
+            -1.32
+            - 0.407 * np.log(1000.0)
+            + 6.03 * 0.2
+            - 1.43 * 0.3
+            + 0.076 * 0.25
+            - 2.37 * 0.1
+            - 1.83 * 0.5
+        )
+        assert actual == pytest.approx(expected)
 
     def test_oscore_requires_history(self):
         """O-score requires count > 12 for some components."""

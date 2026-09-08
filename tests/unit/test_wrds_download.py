@@ -5,6 +5,7 @@ This module tests the download_raw_data_tables function and its helper functions
 particularly the persistent connection feature that uses ATTACH instead of postgres_scan().
 """
 
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,6 +42,25 @@ class TestBuildProjection:
         assert "TRY_CAST(sic AS BIGINT) AS sic" in result
         assert "TRY_CAST(sich AS BIGINT) AS sich" in result
 
+    def test_selected_columns_are_projected_in_contract_order(self):
+        """A selected projection should omit every unused source column."""
+        from jkp.data.aux_functions import build_projection
+
+        result = build_projection(
+            ["gvkey", "iid", "datadate", "unused"],
+            ("gvkey", "iid", "datadate"),
+        )
+
+        assert result == '"gvkey", "iid", "datadate"'
+        assert "unused" not in result
+
+    def test_selected_columns_must_exist(self):
+        """A source schema change should fail before a partial download starts."""
+        from jkp.data.aux_functions import build_projection
+
+        with pytest.raises(RuntimeError, match="missing required columns: trfd"):
+            build_projection(["gvkey", "iid"], ("gvkey", "iid", "trfd"))
+
 
 class TestGenWrdsConnectionInfo:
     """Tests for gen_wrds_connection_info() function."""
@@ -54,9 +74,174 @@ class TestGenWrdsConnectionInfo:
         assert "host=wrds-pgdata.wharton.upenn.edu" in result
         assert "port=9737" in result
         assert "dbname=wrds" in result
-        assert "user=testuser" in result
-        assert "password=testpass" in result
+        assert "user='testuser'" in result
+        assert "password='testpass'" in result
         assert "sslmode=require" in result
+
+    def test_password_with_special_characters_is_quoted_and_escaped(self):
+        """A password containing spaces/quotes/backslashes must be single-quoted
+        with libpq escaping so it can't break the conninfo."""
+        from jkp.data.aux_functions import gen_wrds_connection_info
+
+        result = gen_wrds_connection_info("testuser", "p ss'w\\rd")
+
+        # spaces stay inside the quotes; ' and \ are backslash-escaped
+        assert "password='p ss\\'w\\\\rd'" in result
+        assert "sslmode=require" in result
+
+    def test_username_with_special_characters_is_quoted_and_escaped(self):
+        """A username with a space or quote must be single-quoted and escaped too,
+        or it breaks libpq's conninfo parsing just as an unquoted password would."""
+        from jkp.data.aux_functions import gen_wrds_connection_info
+
+        result = gen_wrds_connection_info("od d'user", None)
+
+        assert "user='od d\\'user'" in result
+
+    def test_password_omitted_when_none(self):
+        """With password=None the password= field is omitted so libpq reads
+        ~/.pgpass / $PGPASSFILE."""
+        from jkp.data.aux_functions import gen_wrds_connection_info
+
+        result = gen_wrds_connection_info("testuser", None)
+
+        assert "user='testuser'" in result
+        assert "password=" not in result
+        assert "sslmode=require" in result
+
+    def test_sql_literal_escapes_conninfo_for_embedding(self):
+        """_sql_literal must escape the conninfo so it embeds in single-quoted
+        ATTACH/postgres_scan SQL without a quoted password terminating the literal.
+        Proven at the parse layer — no postgres extension or network — so it runs
+        unconditionally in CI, unlike the ATTACH integration check below."""
+        duckdb = pytest.importorskip("duckdb")
+        from jkp.data.aux_functions import _sql_literal, gen_wrds_connection_info
+
+        conninfo = gen_wrds_connection_info("testuser", "p ss'w\\d")
+        con = duckdb.connect()
+
+        # Escaped: the whole conninfo parses as one string literal and round-trips.
+        # _sql_literal returns the literal WITH its surrounding quotes.
+        assert con.execute(f"SELECT {_sql_literal(conninfo)}").fetchone()[0] == conninfo
+        # Unescaped: the raw quote terminates the literal early -> ParserException.
+        with pytest.raises(Exception) as excinfo:
+            con.execute(f"SELECT '{conninfo}'")
+        assert "Parser" in type(excinfo.value).__name__
+
+    def test_conninfo_embeds_in_sql_without_parse_error(self):
+        """Integration check (needs the DuckDB postgres extension): a real ATTACH
+        with the escaped conninfo must fail at the *connection* stage, not with a
+        ParserException — proving the SQL literal held together AND libpq accepted
+        the quoted conninfo. Also pins the password's echo format for the masking
+        in _attach_wrds."""
+        duckdb = pytest.importorskip("duckdb")
+        from jkp.data.aux_functions import _sql_literal, gen_wrds_connection_info
+
+        con = duckdb.connect()
+        try:
+            con.execute("INSTALL postgres; LOAD postgres")
+        except Exception:  # pragma: no cover - environment without the extension
+            pytest.skip("duckdb postgres extension unavailable")
+
+        # A password with a space, a single quote, and a backslash — the exact
+        # class the libpq quoting targets. Point at a dead local endpoint so the
+        # ATTACH fails to *connect* rather than hanging on a real socket.
+        conninfo = (
+            gen_wrds_connection_info("testuser", "p ss'w\\d")
+            .replace("host=wrds-pgdata.wharton.upenn.edu", "host=127.0.0.1")
+            .replace("port=9737", "port=9")
+            .replace("sslmode=require", "sslmode=disable")
+            # cap any hang if something ever happens to listen on :9
+            + " connect_timeout=2"
+        )
+        # Guard the neutering: if the WRDS host/port constants ever change, the
+        # .replace() calls above would silently no-op and this test would dial the
+        # real WRDS endpoint. Assert the substitutions actually took effect.
+        assert "host=127.0.0.1" in conninfo and "port=9 " in conninfo
+        assert "wrds-pgdata.wharton.upenn.edu" not in conninfo
+
+        from jkp.data.aux_functions import _password_in_error
+
+        with pytest.raises(Exception) as excinfo:
+            con.execute(f"ATTACH {_sql_literal(conninfo)} AS wrds (TYPE postgres, READ_ONLY)")
+        err = str(excinfo.value)
+        # A ParserException would mean the SQL literal was broken by the password's
+        # quote (the SQL-escaping half of the fix).
+        assert "Parser" not in type(excinfo.value).__name__, err
+        # Reaching the connection stage proves libpq accepted the quoted conninfo
+        # (the libpq-escaping half): a regression from \' to ''-style escaping would
+        # fail here as a conninfo-syntax error even though the parse test still passes.
+        assert "connect" in err.lower(), err
+        # And DuckDB really echoes the password in the libpq-escaped form the masking
+        # matches — pinned against a real error, not a synthesized one, so a DuckDB
+        # echo-format change can't silently regress _attach_wrds's redaction.
+        assert _password_in_error(err, "p ss'w\\d")
+
+    def test_password_masking_matches_libpq_escaped_form(self):
+        """DuckDB echoes the connection string with the password in libpq-escaped
+        form, so the masking must match that form — a raw ``password in text``
+        check misses every special-character password."""
+        from jkp.data.aux_functions import (
+            _password_in_error,
+            _pg_escape_value,
+            _redact_password,
+        )
+
+        pw = "ab'cd\\e"
+        err = f"IO Error: Unable to connect at password='{_pg_escape_value(pw)}' sslmode=disable"
+
+        assert pw not in err  # the raw password does not appear verbatim
+        assert _password_in_error(err, pw)
+        redacted = _redact_password(err, pw)
+        assert "***" in redacted
+        assert _pg_escape_value(pw) not in redacted
+
+    def test_password_masking_matches_sql_doubled_form(self):
+        """A parser error echoes the *raw statement text*, where the password is
+        SQL-escaped over the libpq-escaped form. Masking must match that composed
+        form too — neither the raw nor the plain libpq-escaped form appears."""
+        from jkp.data.aux_functions import (
+            _password_in_error,
+            _pg_escape_value,
+            _redact_password,
+            _sql_literal,
+        )
+
+        pw = "ab'cd\\e"
+        composed = _sql_literal(_pg_escape_value(pw))
+        err = f"Parser Error: syntax error near ...{composed}... in statement"
+
+        assert pw not in err and _pg_escape_value(pw) not in err  # only the composed form
+        assert _password_in_error(err, pw)
+        assert composed not in _redact_password(err, pw)
+
+
+class TestStatementTimeoutConnectionInfo:
+    """Tests for applying the RDS session guardrail at connection startup."""
+
+    def test_adds_encoded_option_to_uri(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db")
+        assert result.endswith("?options=-c%20statement_timeout%3D300000")
+
+    def test_preserves_existing_uri_query(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db?sslmode=require")
+        assert "&options=-c%20statement_timeout%3D300000" in result
+
+    def test_adds_option_to_keyword_dsn(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("host=example dbname=wrds")
+        assert result.endswith(" options='-c statement_timeout=300000'")
+
+    def test_does_not_replace_existing_options(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        original = "postgresql://example/db?options=-c%20statement_timeout%3D120000"
+        assert with_pg_statement_timeout(original) == original
 
 
 class TestDownloadRawDataTablesBranching:
@@ -69,11 +254,24 @@ class TestDownloadRawDataTablesBranching:
     @pytest.fixture
     def mock_duckdb(self):
         """Create a mock DuckDB connection."""
-        with patch("jkp.data.aux_functions.duckdb") as mock:
+        from jkp.data.aux_functions import LARGE_COMPUSTAT_COLUMNS
+
+        available_columns = sorted(
+            {column for columns in LARGE_COMPUSTAT_COLUMNS.values() for column in columns}
+        )
+        with (
+            patch("jkp.data.aux_functions.duckdb") as mock,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched"),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched_attached"),
+        ):
             mock_conn = MagicMock()
             mock.connect.return_value = mock_conn
             mock_result = MagicMock()
-            mock_result.description = [("col1",), ("col2",)]
+            mock_result.description = [(column,) for column in available_columns]
             mock_conn.execute.return_value = mock_result
             yield mock, mock_conn
 
@@ -93,7 +291,9 @@ class TestDownloadRawDataTablesBranching:
         sql_joined = " ".join(executed_sql)
 
         assert "postgres_scan" in sql_joined
-        assert "ATTACH" not in sql_joined
+        # Ordinary tables retain postgres_scan. The compact full-history age
+        # aggregate uses one temporary attached connection.
+        assert "AS age_anchor_source" in sql_joined
 
     def test_persistent_connection_true_uses_attach(self, mock_duckdb, test_paths):
         """When persistent_connection=True, should use ATTACH."""
@@ -112,7 +312,7 @@ class TestDownloadRawDataTablesBranching:
 
         assert "ATTACH" in sql_joined
         assert "DETACH" in sql_joined
-        assert "wrds." in sql_joined
+        assert "source_db." in sql_joined
 
     def test_persistent_connection_true_single_attach(self, mock_duckdb, test_paths):
         """Persistent connection should only ATTACH once for all tables."""
@@ -147,6 +347,43 @@ class TestDownloadRawDataTablesBranching:
 
         download_raw_data_tables(test_paths, "user", "pass", persistent_connection=True)
         mock_conn.close.assert_called_once()
+
+    def test_persistent_connection_oom_retries_with_postgres_scan(self, mock_duckdb, test_paths):
+        """Attached downloads that hit DuckDB OOM should retry with postgres_scan."""
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        class OutOfMemoryException(Exception):
+            pass
+
+        attached_calls = 0
+
+        def attached_side_effect(*args, **kwargs):
+            nonlocal attached_calls
+            attached_calls += 1
+            if attached_calls == 1:
+                raise OutOfMemoryException("allocation failure")
+            return None
+
+        with (
+            patch(
+                "jkp.data.aux_functions.download_wrds_table_attached",
+                side_effect=attached_side_effect,
+            ) as mock_attached,
+            patch("jkp.data.aux_functions.download_wrds_table") as mock_postgres_scan,
+        ):
+            download_raw_data_tables(
+                test_paths,
+                "user",
+                "pass",
+                persistent_connection=True,
+                bypass_crsp=True,
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 1, 31),
+            )
+
+        assert mock_attached.called
+        assert mock_postgres_scan.called
+        assert mock_postgres_scan.call_args_list[0].args[2] == "comp.exrt_dly"
 
 
 class TestGetColumnsAttached:
@@ -204,3 +441,144 @@ class TestDownloadWrdsTableAttached:
         assert "wrds.crsp.msf" in copy_sql
         assert "/tmp/test.parquet" in copy_sql
         assert "FORMAT PARQUET" in copy_sql
+
+    def test_selected_columns_replace_wildcard(self):
+        """Large-table downloads should transfer only their frozen contract."""
+        from jkp.data.aux_functions import download_wrds_table_attached
+
+        mock_conn = MagicMock()
+        mock_result = MagicMock()
+        mock_result.description = [("gvkey",), ("iid",), ("datadate",), ("unused",)]
+        mock_conn.execute.return_value = mock_result
+
+        download_wrds_table_attached(
+            mock_conn,
+            "source",
+            "comp.secm",
+            "/tmp/secm.parquet",
+            selected_columns=("gvkey", "iid", "datadate"),
+        )
+
+        copy_sql = [
+            call.args[0] for call in mock_conn.execute.call_args_list if "COPY" in call.args[0]
+        ][0]
+        assert 'SELECT "gvkey", "iid", "datadate"' in copy_sql
+        assert "unused" not in copy_sql
+
+
+class TestDailyCompustatBatching:
+    """Tests for pair-indexed daily view extraction."""
+
+    def test_pair_clause_uses_scalar_predicates_and_dates(self):
+        from jkp.data.aux_functions import _pair_where_clause
+
+        result = _pair_where_clause(
+            [("001234", "01"), ("005678", "02W")],
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+        )
+
+        assert "gvkey = '001234' AND iid = '01'" in result
+        assert "gvkey = '005678' AND iid = '02W'" in result
+        assert "datadate >= '2000-01-01'" in result
+        assert "datadate <= '2026-06-30'" in result
+        assert "IN (" not in result
+
+    def test_download_writes_one_part_per_pair_batch(self, tmp_path):
+        import re
+
+        import polars as pl
+
+        from jkp.data.aux_functions import _download_pair_batches
+
+        conn = MagicMock()
+
+        def execute(sql):
+            if "COPY (" in sql:
+                output = re.search(r"TO '([^']+)'", sql)
+                assert output is not None
+                pl.DataFrame(
+                    {"gvkey": ["001234"], "iid": ["01"], "datadate": [date(2020, 1, 1)]}
+                ).write_parquet(output.group(1))
+            elif "SELECT COUNT(*)" in sql:
+                result = MagicMock()
+                result.fetchone.return_value = (1,)
+                return result
+            return conn
+
+        conn.execute.side_effect = execute
+        filename = str(tmp_path / "comp_secd.parquet")
+        _download_pair_batches(
+            conn,
+            "source_db.comp.secd",
+            '"gvkey", "iid", "datadate"',
+            [("001234", "01"), ("005678", "02"), ("009999", "01")],
+            filename,
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+            batch_size=2,
+        )
+
+        copy_sql = [
+            call.args[0] for call in conn.execute.call_args_list if "COPY (" in call.args[0]
+        ]
+        assert len(copy_sql) == 2
+        assert "incomplete-000001-worker-1-try-0.parquet" in copy_sql[0]
+        assert "incomplete-000002-worker-1-try-0.parquet" in copy_sql[1]
+        assert "009999" not in copy_sql[0]
+        assert "009999" in copy_sql[1]
+        assert "UNION ALL" in copy_sql[0]
+        assert copy_sql[0].count("FROM source_db.comp.secd") == 2
+        assert "gvkey = '001234' AND iid = '01'" in copy_sql[0]
+        assert "gvkey = '005678' AND iid = '02'" in copy_sql[0]
+        assert (tmp_path / "comp_secd_parts").is_dir()
+        assert (tmp_path / "comp_secd_parts" / "part-000001.parquet").is_file()
+        assert (tmp_path / "comp_secd_parts" / "part-000002.parquet").is_file()
+        assert len(list((tmp_path / "comp_secd_parts").glob("*.manifest.json"))) == 2
+
+
+class TestReusableRawValidation:
+    """Recovery runs must reject incomplete daily batch datasets."""
+
+    @staticmethod
+    def _write_complete_fixture(tmp_path, monkeypatch):
+        import polars as pl
+
+        import jkp.data.aux_functions as aux
+        from jkp.data.paths import DataPaths
+
+        paths = DataPaths(base_dir=tmp_path)
+        paths.raw_tables_dir.mkdir(parents=True)
+        monkeypatch.setattr(aux, "DAILY_COMPUSTAT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            ("comp.security", "comp.g_security", "comp.secd", "comp.g_secd"),
+        )
+        header = pl.DataFrame({"gvkey": ["001", "002", "003"], "iid": ["01", "01", "02"]})
+        for table in ("comp_security", "comp_g_security"):
+            header.write_parquet(paths.raw_tables_dir / f"{table}.parquet")
+        for table in ("comp_secd", "comp_g_secd"):
+            parts_dir = paths.raw_tables_dir / f"{table}_parts"
+            parts_dir.mkdir()
+            for number in (1, 2):
+                (parts_dir / f"part-{number:06d}.parquet").write_bytes(b"data")
+        (paths.raw_tables_dir / "comp_age_anchor.parquet").write_bytes(b"data")
+        return paths
+
+    def test_complete_daily_parts_are_reusable(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_missing_daily_part_is_rejected(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        (paths.raw_tables_dir / "comp_secd_parts" / "part-000002.parquet").unlink()
+
+        with pytest.raises(RuntimeError, match="comp.secd has 1 parts; expected 2"):
+            validate_reusable_raw_data(paths, bypass_crsp=True)

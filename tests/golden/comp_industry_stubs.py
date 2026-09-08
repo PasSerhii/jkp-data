@@ -35,7 +35,7 @@ class CompIndustryUpstreamStubs:
     def _comp_sic_naics(self, _paths: DataPaths) -> None:
         self.comp_sic_naics_called = True
 
-    def _hgics_join(self, _paths: DataPaths) -> None:
+    def _hgics_join(self, _paths: DataPaths, **_kwargs: object) -> None:
         self.hgics_join_called = True
 
     def assert_called(self) -> None:

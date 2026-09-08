@@ -1,0 +1,142 @@
+name: Publish Docker image
+
+# Keeps jkp-data:production in step with the branch. A launcher newer than its
+# image is the dangerous combination: launch.sh stopped passing --start-date once
+# the rolling window landed, so an image predating that change falls back to
+# ACCOUNTING_START_DATE and downloads from 1949 instead of 23 years.
+#
+# Paths mirror the freshness gate in scripts/production-run.sh. Keep them in step,
+# or the gate will fail a run for a change that never triggers a build.
+on:
+  push:
+    branches: [compustat_migration, main]
+    paths:
+      - "src/**"
+      - "sql/**"
+      # Only the operational scripts the image bakes in, not all of scripts/:
+      # the rest are one-off analyses that must not trigger a rebuild.
+      - "scripts/check_source_ready.py"
+      - "scripts/production-run.sh"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC; no long-lived AWS keys are stored
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: jkp-data
+
+jobs:
+  publish:
+    name: Build and push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Assume the ECR publish role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::485357734136:role/jkp-data-ecr-publish
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # linux/amd64 explicitly: the tag is pulled by Intel/AMD EC2 instances and
+      # an arm64 image fails at run time, not at push time.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:production
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:git-${{ steps.sha.outputs.short }}
+          # The run host reads this back off the pulled image and logs it, so a
+          # finished run says which commit produced it without anyone having to
+          # map the mutable :production tag to a digest after the fact.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image is what a two-hour production run pulls, so prove the CLI it
+      # ships actually carries the flags the launcher passes.
+      - name: Verify the published image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:git-${{ steps.sha.outputs.short }}"
+          docker pull "$IMAGE"
+          docker run --rm "$IMAGE" --version
+          HELP="$(docker run --rm "$IMAGE" build --help)"
+          for flag in --keep-interim --full-history --production-years --daily-download-workers; do
+            # Rich wraps and truncates long option names in the help panel, so match
+            # a prefix rather than the whole flag.
+            printf '%s' "$HELP" | grep -q -- "${flag:0:14}" \
+              || { echo "::error::published image is missing $flag"; exit 1; }
+          done
+
+          # The unattended run lifts these out of the image with `docker cp` and
+          # executes them on the host. A .dockerignore rule silently dropping one
+          # would only surface at 09:00 on the 1st.
+          for f in /opt/jkp/scripts/production-run.sh \
+                   /opt/jkp/scripts/check_source_ready.py \
+                   /opt/jkp/sql/xpressfeed_views/load_ff_factors.py \
+                   /opt/jkp/sql/xpressfeed_views/capture_sec_ids.py \
+                   /opt/jkp/sql/xpressfeed_views/gen_views.py; do
+            docker run --rm --entrypoint test "$IMAGE" -r "$f" \
+              || { echo "::error::published image is missing $f"; exit 1; }
+          done
+          docker run --rm --entrypoint test "$IMAGE" -x /opt/jkp/scripts/production-run.sh \
+            || { echo "::error::production-run.sh is not executable in the image"; exit 1; }
+          # psycopg 3 is what the two loaders import; the image has no `uv run --with`.
+          docker run --rm --entrypoint python "$IMAGE" -c "import psycopg" \
+            || { echo "::error::published image cannot import psycopg"; exit 1; }
+
+          REV=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
+          [ "$REV" = "${{ github.sha }}" ] \
+            || { echo "::error::revision label is '$REV', expected ${{ github.sha }}"; exit 1; }
+          echo "image verified: $IMAGE (revision $REV)"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo "| Tag | Value |"
+            echo "|---|---|"
+            echo "| production | \`${{ steps.sha.outputs.short }}\` |"
+            echo "| immutable | \`git-${{ steps.sha.outputs.short }}\` |"
+            echo "| commit | ${{ github.sha }} |"
+            echo ""
+            echo "Roll back with:"
+            echo '```bash'
+            echo "MANIFEST=\$(aws ecr batch-get-image --region ${{ env.AWS_REGION }} --repository-name ${{ env.ECR_REPOSITORY }} \\"
+            echo "  --image-ids imageTag=git-<goodsha> --query 'images[0].imageManifest' --output text)"
+            echo "aws ecr put-image --region ${{ env.AWS_REGION }} --repository-name ${{ env.ECR_REPOSITORY }} \\"
+            echo "  --image-tag production --image-manifest \"\$MANIFEST\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
