@@ -6808,7 +6808,7 @@ def ohlson_o(df, name="o_score"):
     Steps:
         1) Build features: lev=debt/at_x, roe=nix_x/at_x, cacl=cl_x/ca_x, lat=log(at_x),
         wc=(ca_x−cl_x)/at_x, ffo=(pi_x+dp)/lt, neg_eq=1[lt>at_x], neg_earn=1[both nix_x<0], nich=(Δnix)/( |nix|+|nix₋₁| ).
-        2) Apply linear index: −1.32 −0.407*lat +6.03*lev +1.43*wc +0.076*cacl −1.72*neg_eq −2.37*roe −1.83*ffo +0.285*neg_earn −0.52*nich.
+        2) Apply linear index: −1.32 −0.407*lat +6.03*lev −1.43*wc +0.076*cacl −1.72*neg_eq −2.37*roe −1.83*ffo +0.285*neg_earn −0.52*nich.
 
     Output:
         DataFrame with '{name}' continuous score.
@@ -6847,7 +6847,10 @@ def ohlson_o(df, name="o_score"):
                 -1.32
                 - 0.407 * col("__o_lat")
                 + 6.03 * col("__o_lev")
-                + 1.43 * col("__o_wc")
+                # Ohlson (1980) and the upstream SAS since 2025-03-05
+                # (ReplicationCrisis@b0b01d5a): more working capital lowers the
+                # distress score. The +1.43 the pre-2025 SAS carried was a bug.
+                - 1.43 * col("__o_wc")
                 + 0.076 * col("__o_cacl")
                 - 1.72 * col("__o_neg_eq")
                 - 2.37 * col("__o_roe")

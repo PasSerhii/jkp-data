@@ -345,7 +345,7 @@ class TestOhlsonO:
     Paper Reference: Ohlson (1980), used in JKP (2023) Appendix Table A.1
 
     Production coefficients:
-        -1.32 - 0.407*log(TA) + 6.03*TLTA + 1.43*WCTA + 0.076*CLCA
+        -1.32 - 0.407*log(TA) + 6.03*TLTA - 1.43*WCTA + 0.076*CLCA
         - 1.72*OENEG - 2.37*NITA - 1.83*FUTL + 0.285*INTWO - 0.52*CHIN
 
     Higher O-score indicates higher probability of bankruptcy.
@@ -367,7 +367,9 @@ class TestOhlsonO:
             )
 
     def test_oscore_uses_production_working_capital_sign(self):
-        """Research production adds 1.43*WCTA; guard that parity convention."""
+        """Working capital LOWERS the distress score (-1.43*WCTA), per Ohlson
+        (1980) and the upstream SAS since 2025-03-05 (ReplicationCrisis@b0b01d5a);
+        the +1.43 in the pre-2025 SAS was a bug."""
         dates = _generate_monthly_dates(24)
         frame = pl.DataFrame(
             {
@@ -391,7 +393,7 @@ class TestOhlsonO:
             -1.32
             - 0.407 * np.log(1000.0)
             + 6.03 * 0.2
-            + 1.43 * 0.3
+            - 1.43 * 0.3
             + 0.076 * 0.25
             - 2.37 * 0.1
             - 1.83 * 0.5
