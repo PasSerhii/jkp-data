@@ -126,6 +126,30 @@ class TestCompHgics:
         ]
         assert current["gics"].to_list() == [20202020, 20202020, 20202020]
 
+    def test_all_null_indfrom_does_not_crash(self, test_paths: DataPaths) -> None:
+        """Non-empty input with all-null indfrom must not raise TypeError."""
+        raw_data_dfs = test_paths.interim_dir / "raw_data_dfs"
+        raw_data_dfs.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "gvkey": ["001000"],
+                "indfrom": [None],
+                "indthru": [None],
+                "gics": [10101010],
+            },
+            schema={
+                "gvkey": pl.Utf8,
+                "indfrom": pl.Date,
+                "indthru": pl.Date,
+                "gics": pl.Int64,
+            },
+        ).write_parquet(raw_data_dfs / "comp_hgics_na.parquet")
+
+        comp_hgics(test_paths, "national")
+
+        output = pl.read_parquet(test_paths.interim_dir / "na_hgics.parquet")
+        assert set(output.columns) == {"gvkey", "date", "gics"}
+
     @pytest.mark.regression
     def test_independent_of_wall_clock(
         self, test_paths: DataPaths, monkeypatch: pytest.MonkeyPatch

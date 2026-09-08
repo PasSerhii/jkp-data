@@ -6,7 +6,7 @@ These cover the ``bypass_crsp=True`` branches added to mirror the SAS
 * ``combine_crsp_comp_sf`` builds the world files from Compustat only (no CRSP
   CTEs / UNION ALL, CRSP parquet inputs never read).
 * ``nyse_size_cutoffs`` identifies NYSE via ``comp_exchg = 11`` instead of
-  ``crsp_exchcd = 1``.
+  ``crsp_nyse = 1``.
 * ``merge_industry_to_world_msf`` takes SIC/NAICS from Compustat only.
 * ``add_rf_and_exchange_data_to_temporary_sf`` uses the FF risk-free rate with a
   last-month fallback instead of the CRSP 30y T-bill.
@@ -122,6 +122,10 @@ def _write_comp_dsf(interim: Path, n_gvkeys: int = 3) -> None:
                     "ret_local": 0.001 * (j + 1),
                     "ret": 0.001 * (j + 1),
                     "ret_exc": 0.0005 * (j + 1),
+                    "ret_intraday": 0.0004 * (j + 1),
+                    "ret_overnight": 0.0006 * (j + 1),
+                    "ret_intraday_local": 0.0004 * (j + 1),
+                    "ret_overnight_local": 0.0006 * (j + 1),
                     "ret_lag_dif": 1,
                 }
             )
@@ -152,7 +156,8 @@ def test_combine_bypass_is_compustat_only(tmp_path: Path) -> None:
     # CRSP-only identifiers are null (Compustat CTE emits NULL for these).
     assert msf["permno"].is_null().all()
     assert msf["permco"].is_null().all()
-    assert msf["crsp_exchcd"].is_null().all()
+    assert msf["primaryexch"].is_null().all()
+    assert msf["conditionaltype"].is_null().all()
 
     # Schema parity with the non-bypass output (key columns present).
     for c in ["id", "eom", "ret_exc_lead1m", "obs_main", "comp_exchg"]:
@@ -170,11 +175,11 @@ def test_nyse_size_cutoffs_bypass_uses_comp_exchg(tmp_path: Path) -> None:
     eom = date(2020, 1, 31)
     df = pl.DataFrame(
         {
-            # 3 NYSE-by-Compustat rows (comp_exchg=11) with crsp_exchcd null,
+            # 3 NYSE-by-Compustat rows (comp_exchg=11) with crsp_nyse zero,
             # plus 2 non-NYSE rows that crsp logic would have missed/changed.
             "eom": [eom] * 5,
             "comp_exchg": [11, 11, 11, 12, 14],
-            "crsp_exchcd": [None, None, None, None, None],
+            "crsp_nyse": [0, 0, 0, 0, 0],
             "obs_main": [1] * 5,
             "exch_main": [1] * 5,
             "primary_sec": [1] * 5,

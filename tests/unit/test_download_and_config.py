@@ -225,7 +225,7 @@ class TestRollingDailySpecs:
         assert isinstance(ROLLING_DAILY_SPECS, list) and ROLLING_DAILY_SPECS
 
     def test_suffixes_are_known(self):
-        """Every sfx must be in the set gen_aux_maps recognizes natively."""
+        """Every sfx must be in the set gen_aux_windows recognizes natively."""
         sfxs = [sfx for sfx, _, _ in ROLLING_DAILY_SPECS]
         unknown = set(sfxs) - self.KNOWN_SUFFIXES
         assert not unknown, f"Unknown suffixes: {sorted(unknown)}"
@@ -426,7 +426,12 @@ class TestDownloadRawDataTables:
         downloaded = {
             c.args[2] if len(c.args) > 2 else c.kwargs.get("table_name") for c in captured_calls
         }
-        expected_subset = {"comp.funda", "crsp.msf_v2", "crsp.dsf_v2", "comp.secd"}
+        expected_subset = {
+            "comp.funda",
+            "crsp.msf_v2",
+            "crsp.dsf_v2",
+            "comp.secd",
+        }
         assert expected_subset <= downloaded, f"Missing tables: {expected_subset - downloaded}"
 
     def test_bypass_crsp_skips_crsp_tables(self, test_paths):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import polars as pl
 import pytest
@@ -12,7 +12,6 @@ from jkp.data.aux_functions import (
     build_compustat_age_anchor_query,
     download_compustat_age_anchor_attached,
     firm_age,
-    gen_aux_maps,
 )
 
 
@@ -77,10 +76,3 @@ def test_firm_age_bypass_uses_full_anchor_without_crsp_file(test_paths) -> None:
     assert result.filter(pl.col("id") == 1)["age"].item() == 559
     assert result.filter(pl.col("id") == 2)["age"].to_list() == [0, 1]
     assert not (test_paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet").exists()
-
-
-def test_gen_aux_maps_uses_runtime_end_date() -> None:
-    with patch("jkp.data.aux_functions.group_mapping_dfs", side_effect=lambda dates, k: dates):
-        dates = gen_aux_maps("_21d", end_date=date(2026, 7, 31))
-
-    assert dates[-1] == 2026 * 12 + 7

@@ -134,6 +134,7 @@ def test_xpressfeed_pipeline_propagates_runtime_bounds(monkeypatch, tmp_path) ->
         "gen_raw_data_dfs",
         "prepare_comp_sf",
         "combine_crsp_comp_sf",
+        "compound_overnight_intraday",
         "comp_industry",
         "merge_industry_to_world_msf",
         "ff_ind_class",

@@ -36,6 +36,7 @@ from .config import (
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
+from .wrds_credentials import WRDS_DB, WRDS_HOST, WRDS_PORT
 
 # Frozen pipeline input contract for the three largest Compustat downloads.
 # Keeping the projection here makes the production downloader independent of
@@ -850,6 +851,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
         cfacshr_expr = sf.mthcumfacshr
         askhi_expr = sf.mthaskhi
         bidlo_expr = sf.mthbidlo
+        open_expr = None
+        close_expr = None
     else:  # freq == "d", validated above
         date_expr = sf.dlycaldt.cast("date")
         prc_expr = sf.dlyprc
@@ -860,6 +863,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
         cfacshr_expr = sf.dlycumfacshr
         askhi_expr = sf.dlyhigh
         bidlo_expr = sf.dlylow
+        open_expr = sf.dlyopen
+        close_expr = sf.dlyclose
 
     sf_senames_join = sf.join(
         senames,
@@ -903,24 +908,24 @@ def gen_crsp_sf(paths: DataPaths, freq):
         & (issuertype_expr.isin(["ACOR", "CORP"]))
     )
 
-    shrcd_expr = ibis.cases(
-        (is_common_expr, 10),
-        else_=ibis.null(),
-    ).cast("int32")
-
     primaryexch_expr = sf.primaryexch
     conditionaltype_expr = sf.conditionaltype
 
     exch_main_expr = (primaryexch_expr.isin(["A", "N", "Q"]) & (conditionaltype_expr == "RW")).cast(
         "int32"
     )
+    crsp_nyse_expr = ((primaryexch_expr == "N") & (conditionaltype_expr == "RW")).cast("int32")
 
-    exchcd_expr = ibis.cases(
-        ((primaryexch_expr == "N") & (conditionaltype_expr == "RW"), 1),
-        ((primaryexch_expr == "A") & (conditionaltype_expr == "RW"), 2),
-        ((primaryexch_expr == "Q") & (conditionaltype_expr == "RW"), 3),
-        else_=ibis.null(),
-    ).cast("int32")
+    prc_open_mutate = (
+        ibis.cases(((prc_expr > 0) & (open_expr > 0), open_expr), else_=ibis.null())
+        if open_expr is not None
+        else ibis.null()
+    )
+    prc_close_mutate = (
+        ibis.cases(((prc_expr > 0) & (close_expr > 0), close_expr), else_=ibis.null())
+        if close_expr is not None
+        else ibis.null()
+    )
 
     result = full_join.mutate(
         date=date_expr,
@@ -930,14 +935,18 @@ def gen_crsp_sf(paths: DataPaths, freq):
         me=(prc_expr * (sf.shrout / 1000)),
         prc_high=ibis.cases(((prc_expr > 0) & (askhi_expr > 0), askhi_expr), else_=ibis.null()),
         prc_low=ibis.cases(((prc_expr > 0) & (bidlo_expr > 0), bidlo_expr), else_=ibis.null()),
+        prc_open=prc_open_mutate,
+        prc_close=prc_close_mutate,
         iid=ccmxpf_lnkhist.liid,
         ret=ret_expr,
         retx=retx_expr,
         cfacshr=cfacshr_expr,
         vol=vol_expr,
-        exchcd=exchcd_expr,
+        common=is_common_expr.cast("int32"),
+        primaryexch=primaryexch_expr,
+        conditionaltype=conditionaltype_expr,
         exch_main=exch_main_expr,
-        shrcd=shrcd_expr,
+        crsp_nyse=crsp_nyse_expr,
         gvkey=ccmxpf_lnkhist.gvkey,
     ).select(
         [
@@ -946,6 +955,8 @@ def gen_crsp_sf(paths: DataPaths, freq):
             "date",
             "bidask",
             "prc",
+            "prc_open",
+            "prc_close",
             "shrout",
             "ret",
             "retx",
@@ -953,11 +964,13 @@ def gen_crsp_sf(paths: DataPaths, freq):
             "vol",
             "prc_high",
             "prc_low",
-            "exchcd",
+            "common",
+            "primaryexch",
+            "conditionaltype",
+            "crsp_nyse",
             "gvkey",
             "iid",
             "exch_main",
-            "shrcd",
             "me",
             "ticker",
         ]
@@ -965,12 +978,75 @@ def gen_crsp_sf(paths: DataPaths, freq):
     return result
 
 
-def gen_wrds_connection_info(user, password):
-    return (
-        f"host=wrds-pgdata.wharton.upenn.edu "
-        f"port=9737 dbname=wrds "
-        f"user={user} password={password} sslmode=require"
-    )
+def _pg_escape_value(value: str) -> str:
+    """libpq-escape a conninfo value (user or password) for a single-quoted field.
+
+    libpq accepts single-quoted values with backslash-escaped ``\\`` and ``'``,
+    so quoting lets a value hold spaces or special characters without breaking the
+    conninfo. For the password this is also the form that appears in any error text
+    echoing the connection string, so the credential-masking checks reuse it rather
+    than matching the raw password.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _sql_literal(value: str) -> str:
+    """Escape a string for embedding inside a single-quoted DuckDB SQL literal.
+
+    The conninfo is interpolated into ``ATTACH '...'`` / ``postgres_scan('...')``
+    SQL, so any single quote it contains (e.g. around a libpq-quoted password)
+    must be doubled or it terminates the SQL string literal.
+    """
+    return value.replace("'", "''")
+
+
+def gen_wrds_connection_info(user, password: str | None = None) -> str:
+    """Build a libpq conninfo for WRDS.
+
+    When ``password`` is ``None`` the ``password=`` field is omitted, so libpq
+    authenticates from ``$PGPASSFILE`` / ``~/.pgpass`` instead.
+    """
+    parts = [
+        f"host={WRDS_HOST}",
+        f"port={WRDS_PORT}",
+        f"dbname={WRDS_DB}",
+        # Quote the username too: a space or quote in it would otherwise break
+        # libpq's conninfo parsing exactly as an unquoted password would.
+        f"user='{_pg_escape_value(user)}'",
+    ]
+    if password is not None:
+        # Single-quote and escape so a password containing spaces or special
+        # characters can't break the conninfo (or split the value, which would
+        # defeat the password-masking check in _attach_wrds). The conninfo is
+        # itself embedded in a single-quoted SQL literal at each use site, so
+        # callers must additionally pass it through _sql_literal.
+        parts.append(f"password='{_pg_escape_value(password)}'")
+    parts.append("sslmode=require")
+    return " ".join(parts)
+
+
+def _password_forms(password: str) -> tuple[str, str, str]:
+    """The forms the password can take on its way into an error message: raw, the
+    libpq-escaped conninfo form (echoed by a connection IOException), and the
+    SQL-escaped-then-libpq-escaped form (echoed from the raw statement text by a
+    parser error). Ordered most-escaped first so redaction replaces the longest
+    match before its shorter substrings."""
+    escaped = _pg_escape_value(password)
+    return (_sql_literal(escaped), escaped, password)
+
+
+def _password_in_error(text: str, password: str) -> bool:
+    """True if the password appears in ``text`` in any of the forms it can take in
+    an error message (see :func:`_password_forms`)."""
+    return any(form in text for form in _password_forms(password))
+
+
+def _redact_password(text: str, password: str) -> str:
+    """Replace the password with ``***`` in every form it can take in an error
+    message (see :func:`_password_forms`)."""
+    for form in _password_forms(password):
+        text = text.replace(form, "***")
+    return text
 
 
 def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 300_000) -> str:
@@ -1003,6 +1079,18 @@ def get_columns_attached(conn, db_alias, lib, table):
     return [c[0] for c in cols]
 
 
+def _date_where(date_column: str | None, start_date: date | None, end_date: date | None) -> str:
+    """Build an inclusive ``WHERE date_column BETWEEN ...`` clause (empty if no date column)."""
+    if not date_column:
+        return ""
+    conds = []
+    if start_date is not None:
+        conds.append(f"{date_column} >= '{start_date}'")
+    if end_date is not None:
+        conds.append(f"{date_column} <= '{end_date}'")
+    return ("WHERE " + " AND ".join(conds)) if conds else ""
+
+
 def download_wrds_table_attached(
     duckdb_conn,
     db_alias,
@@ -1013,7 +1101,12 @@ def download_wrds_table_attached(
     start_date: date | None = None,
     selected_columns: tuple[str, ...] | None = None,
 ):
-    """Download a WRDS table using an attached persistent connection."""
+    """Download a WRDS table (or an inclusive date-range slice) via an attached connection.
+
+    When ``start_date``/``end_date`` are given (and the table has a ``date_column``), only rows
+    with ``start_date <= date_column <= end_date`` are downloaded. ``start_date`` enables
+    date-range chunking of large tables across parallel workers.
+    """
     lib, table = table_name.split(".")
     cols = get_columns_attached(duckdb_conn, db_alias, lib, table)
     projection = build_projection(cols, selected_columns)
@@ -2508,7 +2601,6 @@ def download_raw_data_tables(
     con.close()
 
 
-@measure_time
 def aug_msf_v2(paths: DataPaths):
     """
     Description:
@@ -2570,7 +2662,6 @@ def aug_msf_v2(paths: DataPaths):
     msf_aug.to_parquet(paths.interim_dir / "raw_data_dfs" / "crsp_msf_v2_aug.parquet")
 
 
-@measure_time
 def build_mcti(paths: DataPaths):
     """
     Description:
@@ -2714,24 +2805,24 @@ def compustat_fx(paths: DataPaths):
     return __fx1.collect()
 
 
-def adj_trd_vol_NASDAQ(datevar, col_to_adjust, exchg_var, exchg_val):
+def adj_trd_vol_NASDAQ(datevar, col_to_adjust, is_nasdaq_expr):
     """
     Description:
         Apply historic NASDAQ trade-volume adjustments (pre-decimalization reporting) to a volume column.
 
     Steps:
-        1) Build date cutoffs: <2001-02-01, ≤2001-12-31, <2003-12-31.
-        2) If exchg_var == exchg_val (NASDAQ) and within windows, scale col_to_adjust by
+        1) Build date cutoffs: <2001-02-01, ≤2001-12-31, ≤2003-12-31.
+        2) If is_nasdaq_expr is true and within windows, scale col_to_adjust by
         1/2, 1/1.8, or 1/1.6 respectively; otherwise keep original.
         3) Return the adjusted expression aliased as the original column name.
 
     Output:
         Polars expression that yields adjusted trade volume for NASDAQ histories.
     """
-    c1 = col(exchg_var) == exchg_val
+    c1 = is_nasdaq_expr
     c2 = col(datevar) < pl.datetime(2001, 2, 1)
     c3 = col(datevar) <= pl.datetime(2001, 12, 31)
-    c4 = col(datevar) < pl.datetime(2003, 12, 31)
+    c4 = col(datevar) <= pl.datetime(2003, 12, 31)
     adj_trd_vol = (
         pl.when(c1 & c2)
         .then(col(col_to_adjust) / 2)
@@ -2871,7 +2962,10 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN prcstd != 5 THEN prcld / qunit
             ELSE NULL
         END AS prc_low_lcl,
-        prcod AS prc_open_lcl,
+        CASE
+            WHEN prcod IS NOT NULL AND prcod > 0 THEN prcod / qunit
+            ELSE NULL
+        END AS prc_open_lcl,
         -- production SAS (Lior 15.12.2022): coalesce(trfd, 1) — a missing
         -- total-return factor never nulls the return index
         cshtrd, (prccd / qunit) / ajexdi * COALESCE(trfd, 1) AS ri_local,
@@ -2889,13 +2983,16 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN a.prcstd != 5 THEN a.prcld
             ELSE NULL
         END AS prc_low_lcl,
-        a.prcod AS prc_open_lcl,
+        CASE
+            WHEN a.prcod IS NOT NULL AND a.prcod > 0 THEN a.prcod
+            ELSE NULL
+        END AS prc_open_lcl,
         -- cast back to the column type: the original UPDATE assigned the
         -- divided value in place, implicitly rounding to DECIMAL(28,8)
         CAST(CASE
             WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrd / 2
             WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrd / 1.8
-            WHEN a.exchg = 14 AND a.datadate <  DATE '2003-12-31' THEN a.cshtrd / 1.6
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrd / 1.6
             ELSE a.cshtrd
         END AS DECIMAL(28, 8)) AS cshtrd,
         COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
@@ -2924,6 +3021,7 @@ def gen_comp_dsf(paths: DataPaths):
         prc_local    * fx AS prc,
         prc_high_lcl * fx AS prc_high,
         prc_low_lcl  * fx AS prc_low,
+        prc_open_lcl * fx AS prc_open,
         (prc_local   * fx) * cshoc AS me,
         cshtrd       * (prc_local * fx) AS dolvol,
         ri_local     * fx AS ri,
@@ -3073,7 +3171,7 @@ def gen_secm_data(paths: DataPaths):
             CASE
             WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrm/2
             WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrm/1.8
-            WHEN a.exchg = 14 AND a.datadate <  DATE '2003-12-31' THEN a.cshtrm/1.6
+            WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrm/1.6
             ELSE a.cshtrm
             END AS cshtrm,
             CASE WHEN a.curcdm    = 'USD' THEN 1 ELSE c.fx END AS fx,
@@ -3461,6 +3559,10 @@ def gen_returns_df(paths: DataPaths, freq):
             .otherwise(col("ret_local"))
         )
         .with_columns(
+            # Null only ±inf/NaN (an undefined pct_change, e.g. from a zero prior
+            # price). No magnitude filter: the production SAS never screens raw
+            # ret/ret_local — extreme returns are handled downstream by the
+            # winsorized ret_exc_wins column and the return-cutoff clipping.
             ret_local=pl.when(col("ret_local").is_infinite() | col("ret_local").is_nan())
             .then(None)
             .otherwise(col("ret_local")),
@@ -3618,19 +3720,33 @@ def process_comp_sf1(paths: DataPaths, freq, bypass_crsp: bool = False):
     """
     Description:
         Full pipeline to build Compustat monthly or daily security files with returns,
-        excess returns, exchange flags, and primary_sec indicator.
+        excess returns, exchange flags, and primary_sec indicator.  For daily
+        frequency, also computes the Lou, Polk, and Skouras (2019) overnight /
+        intraday decomposition in both USD and local currency:
+
+            ret_intraday       = prc / prc_open - 1
+            ret_overnight      = (1 + ret) / (1 + ret_intraday) - 1
+            ret_intraday_local = ret_intraday   # FX cancels in open/close ratio
+            ret_overnight_local = (1 + ret_local) / (1 + ret_intraday_local) - 1
+
+        so that (1 + ret_intraday)(1 + ret_overnight) = (1 + ret) and
+        (1 + ret_intraday_local)(1 + ret_overnight_local) = (1 + ret_local).
 
     Steps:
         1) If monthly, run gen_comp_msf() to ensure comp_msf/parquets exist.
         2) Compute __returns → gen_delist_df → gen_temporary_sf.
         3) Add RF/exchange metadata; write __comp_sf2.parquet.
-        4) Call add_primary_sec(...) to add primary_sec and write final comp_{freq}sf.parquet.
+        4) For daily, compute LPS (2019) overnight/intraday return decomposition
+           (USD and local) when prc_open is available.
+        5) Call add_primary_sec(...) to add primary_sec and write final comp_{freq}sf.parquet.
 
     When ``bypass_crsp`` is True, excess returns use the FF risk-free rate (with a
     last-month fallback) instead of the CRSP 30y T-bill. See config.BYPASS_CRSP.
 
     Output:
-        comp_msf.parquet or comp_dsf.parquet with enriched fields (ret_exc, primary_sec, etc.).
+        comp_msf.parquet or comp_dsf.parquet with enriched fields (ret_exc,
+        primary_sec, and for daily: ret_intraday, ret_overnight,
+        ret_intraday_local, ret_overnight_local).
     """
     # Eager mode is faster here
     if freq == "m":
@@ -3641,6 +3757,29 @@ def process_comp_sf1(paths: DataPaths, freq, bypass_crsp: bool = False):
     __comp_sf2 = add_rf_and_exchange_data_to_temporary_sf(
         paths, freq, __comp_sf2, bypass_crsp=bypass_crsp
     )
+
+    if freq == "d" and "prc_open" in __comp_sf2.columns:
+        __comp_sf2 = (
+            __comp_sf2.with_columns(
+                ret_intraday=pl.when((col("prc_open") > 0) & (col("prc") > 0))
+                .then(col("prc") / col("prc_open") - 1)
+                .otherwise(fl_none()),
+            )
+            .with_columns(
+                ret_overnight=pl.when(col("ret_intraday").is_not_null() & col("ret").is_not_null())
+                .then((1 + col("ret")) / (1 + col("ret_intraday")) - 1)
+                .otherwise(fl_none()),
+                ret_intraday_local=col("ret_intraday"),
+            )
+            .with_columns(
+                ret_overnight_local=pl.when(
+                    col("ret_intraday_local").is_not_null() & col("ret_local").is_not_null()
+                )
+                .then((1 + col("ret_local")) / (1 + col("ret_intraday_local")) - 1)
+                .otherwise(fl_none()),
+            )
+        )
+
     __comp_sf2.write_parquet(paths.interim_dir / "__comp_sf2.parquet")
     del __comp_sf2
     add_primary_sec(
@@ -3691,7 +3830,18 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         Clean and finalize the CRSP security-file panel (monthly or daily) produced by gen_crsp_sf.
         This step adds trading-volume diagnostics, dividend totals, delisting-return adjustments,
         excess returns (over T-bill / RF), and company-level market equity, using the CIZ delist
-        fields (DelReasonType/DelActionType/DelPaymentType/DelStatusType).
+        fields (DelReasonType/DelActionType/DelPaymentType/DelStatusType).  For daily frequency,
+        also computes the Lou, Polk, and Skouras (2019) overnight / intraday decomposition in both
+        USD and local currency.  The intraday leg uses prc_close (dlyclose, the actual closing
+        trade) rather than prc (dlyprc, which may be a bid–ask midpoint):
+
+            ret_intraday       = prc_close / prc_open - 1
+            ret_overnight      = (1 + ret) / (1 + ret_intraday) - 1
+            ret_intraday_local = ret_intraday   # FX cancels; for CRSP, ret_local == ret
+            ret_overnight_local = (1 + ret) / (1 + ret_intraday_local) - 1
+
+        so that (1 + ret_intraday)(1 + ret_overnight) = (1 + ret).  For CRSP (USD),
+        ret_overnight_local equals ret_overnight because ret_local equals ret.
 
     Steps:
         1) Read raw_data_dfs/__crsp_sf_{freq}.parquet; cast key numeric columns; apply NASDAQ volume adjustment.
@@ -3699,11 +3849,13 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         3) Join CRSP delists (crsp_{freq}sedelist); impute missing delret = −0.30 for “bad delist” buckets defined by CIZ codes;
            set ret=0 when ret is missing but delret exists; compound ret with delret.
         4) Join risk-free proxies (CRSP T-bill and FF RF) and compute excess return ret_exc; compute company ME by summing ME across permnos within permco-date.
-        5) If monthly, rescale vol and dolvol for unit alignment.
-        6) Drop helper columns, deduplicate by (permno, date), sort, and write crsp_{freq}sf.parquet.
+        5) If daily, compute LPS (2019) overnight/intraday returns (USD and local).
+        6) If monthly, rescale vol and dolvol for unit alignment.
+        7) Drop helper columns, deduplicate by (permno, date), sort, and write crsp_{freq}sf.parquet.
 
     Output:
-        Writes crsp_msf.parquet (freq="m") or crsp_dsf.parquet (freq="d") with cleaned returns and ret_exc.
+        Writes crsp_msf.parquet (freq="m") or crsp_dsf.parquet (freq="d") with cleaned returns,
+        ret_exc, and for daily: ret_intraday, ret_overnight, ret_intraday_local, ret_overnight_local.
     """
     assert freq in ("m", "d")
 
@@ -3714,11 +3866,26 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         .with_columns(
             [
                 col(var).cast(pl.Float64)
-                for var in ["prc", "cfacshr", "ret", "retx", "prc_high", "prc_low"]
+                for var in [
+                    "prc",
+                    "cfacshr",
+                    "ret",
+                    "retx",
+                    "prc_high",
+                    "prc_low",
+                    "prc_open",
+                    "prc_close",
+                ]
             ]
             + [col("vol").cast(pl.Int64)]
         )
-        .with_columns(adj_trd_vol_NASDAQ("date", "vol", "exchcd", 3))
+        .with_columns(
+            adj_trd_vol_NASDAQ(
+                "date",
+                "vol",
+                (pl.col("primaryexch") == "Q") & (pl.col("conditionaltype") == "RW"),
+            )
+        )
         .sort(["permno", "date"])
         .with_columns(
             dolvol=col("prc").abs() * col("vol"),
@@ -3818,6 +3985,31 @@ def prepare_crsp_sf(paths: DataPaths, freq):
         .with_columns(ret_exc=ret_exc_exp, me_company=me_company_exp)
     )
 
+    # LPS (2019) overnight/intraday return decomposition (daily only).
+    # prc_close is the actual closing trade price (dlyclose), distinct from
+    # prc (dlyprc) which may be a bid-ask midpoint.
+    if freq == "d":
+        __crsp_sf = (
+            __crsp_sf.with_columns(
+                ret_intraday=pl.when((col("prc_close") > 0) & (col("prc_open") > 0))
+                .then(col("prc_close") / col("prc_open") - 1)
+                .otherwise(fl_none()),
+            )
+            .with_columns(
+                ret_overnight=pl.when(col("ret_intraday").is_not_null() & col("ret").is_not_null())
+                .then((1 + col("ret")) / (1 + col("ret_intraday")) - 1)
+                .otherwise(fl_none()),
+                ret_intraday_local=col("ret_intraday"),
+            )
+            .with_columns(
+                ret_overnight_local=pl.when(
+                    col("ret_intraday_local").is_not_null() & col("ret").is_not_null()
+                )
+                .then((1 + col("ret")) / (1 + col("ret_intraday_local")) - 1)
+                .otherwise(fl_none()),
+            )
+        )
+
     if freq == "m":
         __crsp_sf = __crsp_sf.with_columns(
             [(col(var) * 100).alias(var) for var in ["vol", "dolvol"]]
@@ -3907,11 +4099,12 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                     permno AS id, permno, permco, gvkey, iid,
                     'USA' AS excntry,
                     exch_main::INT AS exch_main,
-                    CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
+                    common::INT AS common,
                     1 AS primary_sec,
                     bidask::INT AS bidask,
-                    shrcd::DOUBLE AS crsp_shrcd,
-                    exchcd::DOUBLE AS crsp_exchcd,
+                    primaryexch,
+                    conditionaltype,
+                    crsp_nyse::INT AS crsp_nyse,
                     NULL::VARCHAR AS comp_tpci,
                     NULL::BIGINT AS comp_exchg,
                     'USD' AS curcd,
@@ -3951,7 +4144,7 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                         permno AS id,
                         'USA' AS excntry,
                         exch_main::INT AS exch_main,
-                        CASE WHEN shrcd IN (10, 11, 12) THEN 1 ELSE 0 END AS common,
+                        common::INT AS common,
                         1 AS primary_sec,
                         bidask::INT AS bidask,
                         'USD' AS curcd,
@@ -3966,6 +4159,8 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                         NULL::DOUBLE AS prc_open_lcl,
                         ret AS ret_local,
                         ret, ret_exc,
+                        ret_intraday, ret_overnight,
+                        ret_intraday_local, ret_overnight_local,
                         1::BIGINT AS ret_lag_dif,
                         1 AS source_crsp
                     FROM read_parquet('{crsp_dsf_path}')
@@ -3999,8 +4194,9 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                     CASE WHEN tpci = '0' THEN 1 ELSE 0 END AS common,
                     primary_sec::INT AS primary_sec,
                     CASE WHEN prcstd = 4 THEN 1 ELSE 0 END AS bidask,
-                    NULL::DOUBLE AS crsp_shrcd,
-                    NULL::DOUBLE AS crsp_exchcd,
+                    NULL::VARCHAR AS primaryexch,
+                    NULL::VARCHAR AS conditionaltype,
+                    0 AS crsp_nyse,
                     tpci AS comp_tpci,
                     exchg::BIGINT AS comp_exchg,
                     curcdd AS curcd,
@@ -4076,7 +4272,7 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
             COPY (
                 SELECT
                     id, permno, permco, gvkey, iid, excntry, exch_main, common,
-                    primary_sec, bidask, crsp_shrcd, crsp_exchcd, comp_tpci, comp_exchg,
+                    primary_sec, bidask, primaryexch, conditionaltype, crsp_nyse, comp_tpci, comp_exchg,
                     curcd, fx, date, eom, adjfct, shares, me,
                     _me_company AS me_company, prc, prc_local,
                     prc_high, prc_low, dolvol, tvol, ret, ret_local, ret_exc, ret_lag_dif,
@@ -4131,6 +4327,8 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                         cshtrd AS tvol,
                         prc, prc_high, prc_low, prc_open_lcl,
                         ret_local, ret, ret_exc,
+                        ret_intraday, ret_overnight,
+                        ret_intraday_local, ret_overnight_local,
                         ret_lag_dif::BIGINT AS ret_lag_dif,
                         0 AS source_crsp
                     FROM read_parquet('{comp_dsf_path}')
@@ -4151,7 +4349,9 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
                 SELECT
                     id, excntry, exch_main, common, primary_sec, bidask, curcd, fx,
                     date, eom, adjfct, shares, me, dolvol, tvol, prc, prc_high, prc_low,
-                    prc_open_lcl, ret_local, ret, ret_exc, ret_lag_dif, source_crsp, obs_main
+                    prc_open_lcl, ret_local, ret, ret_exc, ret_intraday, ret_overnight,
+                    ret_intraday_local, ret_overnight_local,
+                    ret_lag_dif, source_crsp, obs_main
                 FROM ranked
                 WHERE _rn = 1
                 ORDER BY id, date
@@ -4160,6 +4360,70 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
     finally:
         con.close()
         (paths.interim_dir / "aux_combine_sf.ddb").unlink(missing_ok=True)
+
+
+@measure_time
+def compound_overnight_intraday(paths: DataPaths) -> None:
+    """
+    Description:
+        Compound daily overnight/intraday returns (USD and local) to monthly
+        and join onto world_msf.  This implements the monthly aggregation of
+        the LPS (2019) decomposition: ret_X_m = prod(1 + ret_X_d) - 1 for
+        X in {intraday, overnight, intraday_local, overnight_local}.  Also
+        computes one-month-ahead leads (_lead1m) mirroring the ret_exc_lead1m
+        logic.
+
+    Steps:
+        1) Read world_dsf.parquet with ret_intraday, ret_overnight,
+           ret_intraday_local, and ret_overnight_local.
+        2) For each (id, eom) group, compound daily returns to monthly.
+        3) Left-join onto world_msf (__msf_world.parquet).
+        4) Compute lead columns gated by ret_lag_dif == 1.
+        5) Overwrite __msf_world.parquet.
+
+    Output:
+        Overwrites __msf_world.parquet with ret_intraday, ret_overnight,
+        ret_intraday_local, ret_overnight_local, and their _lead1m variants.
+    """
+    msf_path = paths.interim_dir / "__msf_world.parquet"
+
+    oi_cols = [
+        "ret_intraday",
+        "ret_overnight",
+        "ret_intraday_local",
+        "ret_overnight_local",
+    ]
+
+    monthly_oi = (
+        pl.scan_parquet(paths.interim_dir / "world_dsf.parquet")
+        .select(["id", "eom"] + oi_cols)
+        .group_by(["id", "eom"])
+        .agg(
+            [
+                pl.when(col(c).is_null().any())
+                .then(fl_none())
+                .otherwise((col(c) + 1).product() - 1)
+                .alias(c)
+                for c in oi_cols
+            ]
+        )
+    )
+
+    msf = (
+        pl.scan_parquet(msf_path)
+        .join(monthly_oi, on=["id", "eom"], how="left")
+        .sort(["id", "eom"])
+        .with_columns(
+            [
+                pl.when(col("ret_lag_dif").shift(-1).over("id") == 1)
+                .then(col(c).shift(-1).over("id"))
+                .otherwise(fl_none())
+                .alias(f"{c}_lead1m")
+                for c in oi_cols
+            ]
+        )
+    )
+    msf.collect().write_parquet(msf_path)
 
 
 @measure_time
@@ -4231,9 +4495,12 @@ def comp_hgics(paths: DataPaths, lib, end_date: date = END_DATE):
         n=pl.len().over("gvkey"),
         n_aux=pl.cum_count("gvkey").over("gvkey"),
     )
+    # max() is None when every indfrom is null; fall back to end_date so the
+    # comparison cannot raise on a degenerate input.
+    max_indfrom = data[["indfrom"]].max()[0, 0]
     indthru_date = (
-        pl.lit(data[["indfrom"]].max()[0, 0])
-        if data[["indfrom"]].max()[0, 0] > end_date
+        pl.lit(max_indfrom)
+        if max_indfrom is not None and max_indfrom > end_date
         else pl.lit(end_date)
     )
     c1 = col("n") == col("n_aux")
@@ -4271,7 +4538,7 @@ def hgics_join(paths: DataPaths, end_date: date = END_DATE):
         .unique(["gvkey", "date"])
         .sort(["gvkey", "date"])
     )
-    gjoin.collect().write_parquet(paths.interim_dir / "comp_hgics.parquet")
+    gjoin.sink_parquet(paths.interim_dir / "comp_hgics.parquet")
 
 
 def comp_sic_naics(paths: DataPaths):
@@ -4375,7 +4642,7 @@ def comp_sic_naics(paths: DataPaths):
         .unique(["gvkey", "date"])
         .sort(["gvkey", "date"])
     )
-    comp.collect().write_parquet(paths.interim_dir / "comp_other.parquet")
+    comp.sink_parquet(paths.interim_dir / "comp_other.parquet")
     con.disconnect()
 
 
@@ -4383,78 +4650,54 @@ def comp_sic_naics(paths: DataPaths):
 def comp_industry(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
-        Merge daily GICS and SIC/NAICS into a single daily Compustat industry file,
-        filling gaps day-by-day to ensure continuity.
+        Merge daily GICS and SIC/NAICS into a single daily Compustat industry file with a
+        continuous daily date axis; days between observations carry null industry codes.
 
     Steps:
-        1) Run comp_sic_naics() and hgics_join(); load into DuckDB.
+        1) Run comp_sic_naics() and hgics_join(); scan both panels lazily.
         2) Full-outer-join on (gvkey,date); compute aux_date = next date − 1 day to detect gaps.
-        3) Build gap ranges via generate_series and fill from gap_dates; union with continuous rows.
-        4) Select distinct first by (gvkey,date); write comp_ind.parquet.
+        3) Emit interior gap days [date+1, aux_date] with null codes (only the gap-start day
+           carries values, matching the historical SQL gap-fill behaviour).
+        4) Concatenate joined rows with gap rows; sort; sink comp_ind.parquet.
 
     Output:
         Parquet comp_ind.parquet with {gvkey,date,gics,sic,naics} daily.
     """
     comp_sic_naics(paths)
     hgics_join(paths, end_date=end_date)
-    (paths.interim_dir / "aux_comp_ind.ddb").unlink(missing_ok=True)
-    con = ibis.duckdb.connect(str(paths.interim_dir / "aux_comp_ind.ddb"), threads=os.cpu_count())
-    con.create_table("comp_other", con.read_parquet(paths.interim_dir / "comp_other.parquet"))
-    con.create_table("comp_gics", con.read_parquet(paths.interim_dir / "comp_hgics.parquet"))
-    con.raw_sql("""
-                DROP TABLE IF EXISTS join_table;
-                CREATE TABLE join_table AS
-                SELECT          *,
-                                COALESCE( LEAD(date) OVER (PARTITION BY gvkey ORDER BY date) - INTERVAL '1 day', date )::DATE AS aux_date
-                FROM            comp_gics
-                FULL OUTER JOIN comp_other
-                USING           (gvkey, date);
-
-                DROP TABLE IF EXISTS gap_dates;
-                CREATE TABLE gap_dates AS
-                SELECT *
-                FROM join_table
-                WHERE date <> aux_date;
-
-                DROP TABLE IF EXISTS gaps;
-                CREATE TABLE gaps AS
-                WITH full_span AS (
-                SELECT
-                    j.gvkey, gs.gap_date::DATE AS date,
-                    FROM gap_dates as j
-                    CROSS JOIN LATERAL
-                    generate_series(j.date, j.aux_date, INTERVAL '1 day') AS gs(gap_date)
-                    ORDER BY gvkey, date
-                )
-                SELECT
-                fs.gvkey, fs.date, gd.gics, gd.sic, gd.naics
-                FROM full_span fs
-                LEFT JOIN gap_dates gd
-                ON gd.gvkey = fs.gvkey
-                AND gd.date  = fs.date
-                ORDER BY fs.gvkey, fs.date;
-
-                DROP TABLE IF EXISTS continuous;
-                CREATE TABLE continuous AS
-                SELECT *
-                FROM join_table
-                WHERE date = aux_date;
-
-                DROP TABLE IF EXISTS merged_data;
-                CREATE TABLE merged_data AS
-                SELECT gvkey, date, gics, sic, naics FROM continuous
-                UNION
-                SELECT gvkey, date, gics, sic, naics FROM gaps;
-
-                DROP TABLE IF EXISTS comp_industry;
-                CREATE TABLE comp_industry AS
-                SELECT DISTINCT ON (gvkey, date)
-                    *
-                FROM merged_data
-                ORDER BY (gvkey, date);
-    """)
-    con.table("comp_industry").to_parquet(paths.interim_dir / "comp_ind.parquet")
-    con.disconnect()
+    comp_gics = pl.scan_parquet(paths.interim_dir / "comp_hgics.parquet")
+    comp_other = pl.scan_parquet(paths.interim_dir / "comp_other.parquet")
+    joined = (
+        comp_gics.join(comp_other, on=["gvkey", "date"], how="full", coalesce=True)
+        # Null dates (from GICS records with null indfrom) were silently dropped by the
+        # historical SQL: both `WHERE date <> aux_date` and `WHERE date = aux_date`
+        # evaluate to NULL for them, excluding the rows from every output branch.
+        .filter(pl.col("date").is_not_null())
+        .sort(["gvkey", "date"])
+        .with_columns(
+            aux_date=pl.coalesce(
+                pl.col("date").shift(-1).over("gvkey") - pl.duration(days=1),
+                pl.col("date"),
+            )
+        )
+    )
+    schema = joined.collect_schema()
+    # Interior days of each gap get null industry codes: the historical SQL left-joined
+    # gap_dates on the exact date, so only the gap-start day (already present in the
+    # joined panel) carried values.
+    gap_rows = (
+        joined.filter(pl.col("date") != pl.col("aux_date"))
+        .select(
+            "gvkey",
+            pl.date_ranges(pl.col("date") + pl.duration(days=1), "aux_date").alias("date"),
+            *[pl.lit(None, dtype=schema[c]).alias(c) for c in ["gics", "sic", "naics"]],
+        )
+        .explode("date")
+    )
+    out = pl.concat([joined.select(["gvkey", "date", "gics", "sic", "naics"]), gap_rows]).sort(
+        ["gvkey", "date"]
+    )
+    out.sink_parquet(paths.interim_dir / "comp_ind.parquet")
 
 
 def _parse_siccodes_file(filename: str, label: str) -> pl.DataFrame:
@@ -4545,7 +4788,7 @@ def nyse_size_cutoffs(paths: DataPaths, data_path, bypass_crsp: bool = False):
     Output:
         'nyse_cutoffs.parquet' with [eom, n, nyse_p1, nyse_p20, nyse_p50, nyse_p80].
     """
-    nyse_filter = "comp_exchg = 11" if bypass_crsp else "crsp_exchcd = 1"
+    nyse_filter = "comp_exchg = 11" if bypass_crsp else "crsp_nyse = 1"
     nyse_sf = pl.scan_parquet(data_path).sql(f"""
             SELECT
                 eom,
@@ -8460,10 +8703,7 @@ def sort_ff_style(char, min_stocks_bp, min_stocks_pf, date_col, data, sf):
     # print(f"Executing sort_ff_style for {char}", flush=True)
     c1 = (
         ((col("size_grp_l").is_in(["small", "large", "mega"])) & (col("excntry_l") != "USA"))
-        | (
-            ((col("crsp_exchcd_l") == 1) | (col("comp_exchg_l") == 11))
-            & (col("excntry_l") == "USA")
-        )
+        | (((col("crsp_nyse_l") == 1) | (col("comp_exchg_l") == 11)) & (col("excntry_l") == "USA"))
     ) & col(f"{char}_l").is_not_null()
     char_pf_exp = (
         pl.when(col(f"{char}_l") >= col("bp_p70"))
@@ -8553,7 +8793,7 @@ def ap_factors(
     sf_cond = (col("ret_lag_dif") == 1) if freq == "m" else (col("ret_lag_dif") <= 5)
     lag_vars = [
         "comp_exchg",
-        "crsp_exchcd",
+        "crsp_nyse",
         "exch_main",
         "obs_main",
         "common",
@@ -8746,7 +8986,7 @@ def market_beta(
 
     Steps:
         1) Prep data via prep_data_factor_regs; load '__msf2' lazily.
-        2) Generate rolling-window mappings; run process_map_chunks(..., 'capm') per mapping.
+        2) Generate staggered window specs; run process_window(..., 'capm') per window.
         3) Map back to ids/dates; select beta_{__n}m and ivol_capm_{__n}m; sort.
 
     Output:
@@ -8754,9 +8994,8 @@ def market_beta(
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n, end_date=end_date)
     df = pl.concat(
-        [process_map_chunks(base_data, mapping, "capm", __n, __min) for mapping in aux_maps]
+        [process_window(base_data, w, "capm", __n, __min) for w in gen_aux_windows(__n)]
     ).collect()
     ids = con.table("__msf2").select(["id", "id_int"]).distinct().to_polars()
     dates = (
@@ -8801,7 +9040,7 @@ def residual_momentum(
         Compute residual momentum from FF3 regressions with rolling windows and skip/inclusion rules.
 
     Steps:
-        1) Prep '__msf2'; build window mappings; run process_map_chunks(..., 'res_mom', __n, __min, incl, skip).
+        1) Prep '__msf2'; build window specs; run process_window(..., 'res_mom', __n, __min, incl, skip).
         2) Join back ids/dates and keep resff3_{incl}_{skip}; sort.
 
     Output:
@@ -8812,11 +9051,10 @@ def residual_momentum(
     """
     con = prep_data_factor_regs(paths, data_path, fcts_path)
     base_data = con.table("__msf2").to_polars().lazy()
-    aux_maps = gen_aux_maps(__n, end_date=end_date)
     df = pl.concat(
         [
-            process_map_chunks(base_data, mapping, "res_mom", __n, __min, incl, skip)
-            for mapping in aux_maps
+            process_window(base_data, w, "res_mom", __n, __min, incl, skip)
+            for w in gen_aux_windows(__n)
         ]
     ).collect()
     ids = con.table("__msf2").select(["id", "id_int"]).distinct().to_polars()
@@ -8838,6 +9076,21 @@ def residual_momentum(
     con.disconnect()
 
 
+def zero_obs_gate_ok() -> pl.Expr:
+    """
+    Description:
+        Source-conditional quality screen for months with many zero local-return days.
+
+    Steps:
+        1) CRSP-sourced rows (source_crsp == 1) always pass.
+        2) Compustat rows pass only when zero_obs < 10.
+
+    Output:
+        Boolean Polars expression usable in .filter().
+    """
+    return (pl.col("source_crsp") == 1) | (pl.col("zero_obs") < 10)
+
+
 @measure_time
 def prepare_daily(paths: DataPaths, data_path, fcts_path):
     """
@@ -8848,8 +9101,9 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
         1) Join daily stock data with daily factors; filter rows with mktrf.
         2) Create zero_obs flags per (id,eom); cap returns to lag ≤14 days; compute prc_adj.
         3) Write dsf1.parquet and id_int_key.parquet.
-        4) Build market lead/lag series per day and write mkt_lead_lag.parquet.
-        5) Build 3-day rolling sums for stock and market excess returns; filter to non-null sums and zero_obs<10; write corr_data.parquet.
+        4) Build market lead/lag series per day (dropping null mktrf) and write mkt_lead_lag.parquet.
+        5) Build 3-day rolling sums for stock and market excess returns; filter to non-null
+           sums and zero_obs_gate_ok(); write corr_data.parquet.
 
     Output:
         Parquets: dsf1.parquet, id_int_key.parquet, mkt_lead_lag.parquet, corr_data.parquet.
@@ -8861,6 +9115,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
             [
                 "excntry",
                 "id",
+                "source_crsp",
                 "date",
                 "eom",
                 "prc",
@@ -8902,6 +9157,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
 
     mkt_lead_lag = (
         fcts.select(["excntry", "date", "mktrf", col("date").dt.month_end().alias("eom")])
+        .filter(col("mktrf").is_not_null())
         .sort(["excntry", "date"])
         .with_columns(
             mktrf_ld1=col("mktrf").shift(-1).over(["excntry", "eom"]),
@@ -8914,7 +9170,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
 
     corr_data = (
         pl.scan_parquet(paths.interim_dir / "dsf1.parquet")
-        .select(["ret_exc", "id_int", "date", "mktrf", "eom", "zero_obs"])
+        .select(["ret_exc", "id_int", "date", "mktrf", "eom", "zero_obs", "source_crsp"])
         .sort(["id_int", "date"])
         .with_columns(
             ret_exc_3l=(col("ret_exc") + col("ret_exc").shift(1) + col("ret_exc").shift(2)).over(
@@ -8925,9 +9181,7 @@ def prepare_daily(paths: DataPaths, data_path, fcts_path):
             ),
         )
         .filter(
-            col("ret_exc_3l").is_not_null()
-            & col("mkt_exc_3l").is_not_null()
-            & (col("zero_obs") < 10)
+            col("ret_exc_3l").is_not_null() & col("mkt_exc_3l").is_not_null() & zero_obs_gate_ok()
         )
         .select(["id_int", "eom", "ret_exc_3l", "mkt_exc_3l"])
         .select(pl.all().shrink_dtype())
@@ -10005,7 +10259,21 @@ def save_daily_ret(paths: DataPaths):
     """
     data = (
         pl.scan_parquet(paths.interim_dir / "world_dsf_output.parquet")
-        .select(["excntry", "id", "date", "me", "ret", "ret_exc", "ret_exc_wins"])
+        .select(
+            [
+                "excntry",
+                "id",
+                "date",
+                "me",
+                "ret",
+                "ret_exc",
+                "ret_exc_wins",
+                "ret_intraday",
+                "ret_overnight",
+                "ret_intraday_local",
+                "ret_overnight_local",
+            ]
+        )
         .with_columns(
             excntry=pl.when(col("excntry").is_null())
             .then(pl.lit("null_country"))
@@ -10140,15 +10408,9 @@ def merge_roll_apply_daily_results(paths: DataPaths, end_date: date = END_DATE):
         'roll_apply_daily.parquet' with merged roll regression results.
     """
     date_idx = end_date.month + end_date.year * 12
-    df_dates = pl.DataFrame(
-        {
-            "aux_date": [i + 1 for i in range(23112, date_idx + 1)],
-            "eom": [f"{i // 12}-{i % 12 + 1}-1" for i in range(23112, date_idx + 1)],
-        }
-    )
-    df_dates = df_dates.with_columns(
-        col("eom").str.strptime(pl.Date, "%Y-%m-%d").dt.month_end().alias("eom"),
+    df_dates = pl.DataFrame({"aux_date": range(23113, date_idx + 2)}).with_columns(
         col("aux_date").cast(pl.Int64),
+        eom=pl.date((col("aux_date") - 1) // 12, (col("aux_date") - 1) % 12 + 1, 1).dt.month_end(),
     )
     df_id = pl.scan_parquet(paths.interim_dir / "id_int_key.parquet")
     file_paths = sorted(
@@ -10278,93 +10540,49 @@ def roll_apply_daily(paths: DataPaths, stats, sfx, __min, end_date: date = END_D
         Run rolling daily-stat calculations over grouped date windows and save results.
 
     Steps:
-        1) Generate date-group mappings from sfx (e.g., _21d → k=1, _252d → k=12).
+        1) Generate staggered window specs from sfx (e.g., _21d → k=1, _252d → k=12).
         2) Prepare base daily data per stat.
-        3) Apply process_map_chunks for each mapping and concat results.
+        3) Apply process_window for each window spec and concat results.
         4) Write to '__roll{sfx}_{stats}.parquet'.
 
     Output:
-        Parquet with per-(id_int, group_number) rolling metrics for `stats`.
+        Parquet with per-(id_int, aux_date) rolling metrics for `stats`.
     """
     _report_progress(f"Processing {stats} - {sfx.replace('_', '')} - {__min}")
-    aux_maps = gen_aux_maps(sfx, end_date=end_date)
     base_data = prepare_base_data(paths, stat=stats)
     results = pl.concat(
-        [process_map_chunks(base_data, mapping, stats, sfx, __min) for mapping in aux_maps]
+        [process_window(base_data, w, stats, sfx, __min) for w in gen_aux_windows(sfx)]
     )
     results.collect(engine="streaming").write_parquet(
         paths.interim_dir / f"__roll{sfx}_{stats}.parquet"
     )
 
 
-def gen_consecutive_lists(input_list, k):
+def gen_aux_windows(sfx: str | int) -> list[tuple[int, int, int]]:
     """
     Description:
-        Split a list into consecutive, non-overlapping sublists of length k.
+        Build k staggered window specs from suffix window length.
 
     Steps:
-        1) Slice input_list in steps of k.
-        2) Keep only full-length chunks.
+        1) Map suffix to k: {'_21d':1,'_126d':6,'_252d':12,'_1260d':60} or int(sfx).
+        2) For each offset in [0..k-1], compute the window start month and the
+           end of the last full k-month window that fits before the END_DATE
+           month index. Within an offset, month m belongs to
+           group_number = (m - start) // k, and the group's window ends at
+           start + (group_number + 1) * k - 1.
 
     Output:
-        List of k-length sublists.
+        List of k tuples (start, k, last_end), one per offset.
     """
-    return [
-        input_list[i : i + k]
-        for i in range(0, len(input_list), k)
-        if len(input_list[i : i + k]) == k
-    ]
-
-
-def build_groups(input_list, k):
-    """
-    Description:
-        Build k staggered groupings (offset windows) over a list.
-
-    Steps:
-        1) For each offset in [0..k-1], take consecutive k-sublists from input_list[offset:].
-        2) Aggregate into a list of group lists.
-
-    Output:
-        List of k lists, each containing k-length sublists.
-    """
-    return [gen_consecutive_lists(input_list[offset:], k) for offset in range(k)]
-
-
-def group_mapping_dfs(input_list, k):
-    """
-    Description:
-        Create mapping DataFrames linking aux_date to group_number, and group_number to new (max) aux_date.
-
-    Steps:
-        1) Build groups via build_groups(input_list, k).
-        2) For each group, create a DataFrame with aux_date arrays and group_number.
-        3) Return:
-        - group_map: exploded (aux_date, group_number)
-        - date_map : (group_number, aux_date=max group date)
-
-    Output:
-        List of dicts: {'group_map': LazyFrame, 'date_map': LazyFrame}.
-    """
-    groups = build_groups(input_list, k)
-    dfs = [
-        pl.DataFrame({"aux_date": group}).with_columns(
-            group_number=pl.cum_count("aux_date"), new_date=col("aux_date").list.max()
-        )
-        for group in groups
-    ]
-    return [
-        {
-            "group_map": df.explode("aux_date")
-            .select([col("aux_date").cast(pl.Int32), "group_number"])
-            .lazy(),
-            "date_map": df.select(["group_number", col("new_date").alias("aux_date")])
-            .unique()
-            .sort(["group_number"])
-            .lazy(),
-        }
-        for df in dfs
-    ]
+    parameter_mapping = {"_21d": 1, "_126d": 6, "_252d": 12, "_1260d": 60}
+    k = parameter_mapping[sfx] if sfx in parameter_mapping else int(sfx)
+    date_aux = END_DATE.month + END_DATE.year * 12
+    windows = []
+    for offset in range(k):
+        start = 23113 - k + offset
+        n_groups = (date_aux - start + 1) // k
+        windows.append((start, k, start + n_groups * k - 1))
+    return windows
 
 
 def base_data_filter_exp(stat):
@@ -10374,22 +10592,20 @@ def base_data_filter_exp(stat):
 
     Steps:
         1) Choose required non-null columns by stat.
-        2) For return-based stats, also require zero_obs < 10.
+        2) For return-based stats, require non-null ret_exc and zero_obs_gate_ok().
 
     Output:
         Polars expression usable in .filter().
     """
-    if stat == "zero_trades":
+    if stat in ("zero_trades", "turnover"):
         return col("tvol").is_not_null()
     elif stat == "dolvol":
         return col("dolvol_d").is_not_null()
-    elif stat == "turnover":
-        return col("tvol").is_not_null()
     elif stat == "mktcorr":
         # corr_data.parquet pre-filtered upstream in prepare_daily.
         return pl.lit(True)
     else:
-        return (col("ret_exc").is_not_null()) & (col("zero_obs") < 10)
+        return col("ret_exc").is_not_null() & zero_obs_gate_ok()
 
 
 def prepare_base_data(paths: DataPaths, stat):
@@ -10439,7 +10655,7 @@ def apply_group_filter(df, stat, min_obs):
     Output:
         Filtered LazyFrame for subsequent aggregation/regression.
     """
-    if stat == "turnover" or stat == "mktcorr":
+    if stat in ("turnover", "mktcorr"):
         pass
     elif stat == "dimsonbeta":
         df = df.with_columns(
@@ -10452,31 +10668,31 @@ def apply_group_filter(df, stat, min_obs):
             & (col("mktrf_ld1").is_not_null())
         )
     else:
-        if stat == "zero_trades":
-            filter_var = "tvol"
-        elif stat == "dolvol":
-            filter_var = "dolvol_d"
-        else:
-            filter_var = "ret_exc"
+        filter_var = {"zero_trades": "tvol", "dolvol": "dolvol_d"}.get(stat, "ret_exc")
         df = df.with_columns(n=pl.count(filter_var).over(["id_int", "group_number"])).filter(
             col("n") >= min_obs
         )
     return df
 
 
-def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=None):
+def process_window(
+    base_data, window: tuple[int, int, int], stats, sfx, __min, incl=None, skip=None
+):
     """
     Description:
-        Execute a rolling computation for a mapping: join groups, filter, compute stat, remap to end date.
+        Execute a rolling computation for one staggered window offset:
+        assign groups arithmetically, filter, compute stat, stamp end date.
 
     Steps:
-        1) Join base_data with mapping['group_map'] on aux_date.
+        1) Filter base_data to [start, last_end] and assign
+           group_number = (aux_date - start) // k.
         2) Apply apply_group_filter(stat, __min).
         3) Run the appropriate function from `funcs` dict (res_mom with incl/skip).
-        4) Join mapping['date_map'] to replace group_number by new aux_date.
+        4) Replace group_number by the window end month:
+           aux_date = start + (group_number + 1) * k - 1.
 
     Output:
-        LazyFrame of per-(id_int, group_number) results with remapped aux_date.
+        LazyFrame of per-(id_int, aux_date) results.
     """
     funcs = {
         "rvol": rvol,
@@ -10499,8 +10715,11 @@ def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=No
         "res_mom": res_mom,
     }
 
-    df = base_data.join(mapping["group_map"], how="inner", on="aux_date").pipe(
-        apply_group_filter, stat=stats, min_obs=__min
+    start, k, last_end = window
+    df = (
+        base_data.filter(pl.col("aux_date").is_between(start, last_end))
+        .with_columns(group_number=(pl.col("aux_date") - start) // k)
+        .pipe(apply_group_filter, stat=stats, min_obs=__min)
     )
 
     if stats == "res_mom":
@@ -10508,9 +10727,9 @@ def process_map_chunks(base_data, mapping, stats, sfx, __min, incl=None, skip=No
     else:
         df = df.pipe(funcs[stats], sfx=sfx, __min=__min)
 
-    df = df.join(mapping["date_map"], how="left", on="group_number").drop("group_number")
-
-    return df
+    return df.with_columns(
+        aux_date=(start + (pl.col("group_number") + 1) * k - 1).cast(pl.Int64)
+    ).drop("group_number")
 
 
 def res_mom(df, sfx, __min, incl, skip):
@@ -10533,7 +10752,12 @@ def res_mom(df, sfx, __min, incl, skip):
         .over(["id_int", "group_number"])
     )
     df = (
-        df.filter(col("hml").is_not_null() & col("smb_ff").is_not_null())
+        # Fix within-group row order before the OLS: base_data comes from a
+        # multithreaded DuckDB scan whose row order is nondeterministic, and the
+        # least-squares solve is float-order-sensitive, so an unsorted input
+        # yields byte-different residuals across runs.
+        df.sort(["id_int", "group_number", "aux_date"])
+        .filter(col("hml").is_not_null() & col("smb_ff").is_not_null())
         .with_columns(
             res=res_exp.alias("res"),
             max_date_gn=pl.max("aux_date").over("group_number"),
@@ -10548,30 +10772,6 @@ def res_mom(df, sfx, __min, incl, skip):
         .agg((col("res").mean() / col("res").std()).fill_nan(None).alias(f"resff3_{incl}_{skip}"))
     )
     return df
-
-
-def gen_aux_maps(sfx, end_date: date = END_DATE):
-    """
-    Description:
-        Build date-group maps from suffix window length.
-
-    Steps:
-        1) Map suffix to k: {'_21d':1,'_126d':6,'_252d':12,'_1260d':60} or int(sfx).
-        2) Build aux_date range from start index to the runtime end-date month.
-        3) Create grouped mappings via group_mapping_dfs(date_idx, k).
-
-    Output:
-        List of {'group_map','date_map'} mappings.
-    """
-    parameter_mapping = {"_21d": 1, "_126d": 6, "_252d": 12, "_1260d": 60}
-    date_aux = end_date.month + end_date.year * 12
-    if sfx in parameter_mapping:
-        date_idx = list(range(23113 - parameter_mapping[sfx], date_aux + 1))
-        aux_maps = group_mapping_dfs(date_idx, parameter_mapping[sfx])
-    else:
-        date_idx = list(range(23113 - int(sfx), date_aux + 1))
-        aux_maps = group_mapping_dfs(date_idx, int(sfx))
-    return aux_maps
 
 
 def rvol(df, sfx, __min):
@@ -10690,16 +10890,24 @@ def capm(df, sfx, __min):
     Output:
         LazyFrame with f'beta{sfx}' and f'ivol_capm{sfx}'.
     """
+    # Fix within-group row order before the reductions: base_data comes from a
+    # multithreaded DuckDB scan whose row order is nondeterministic, and cov/var/
+    # std are float-order-sensitive, so an unsorted input yields byte-different
+    # betas across runs.
     beta_exp = pl.cov("ret_exc", "mktrf") / pl.var("mktrf")
     residual_exp = col("ret_exc") - col("mktrf") * beta_exp
-    df = df.group_by(["id_int", "group_number"]).agg(
-        [
-            beta_exp.alias(f"beta{sfx}"),
-            pl.when(col("ret_exc").min() < col("ret_exc").max())
-            .then(residual_exp.std())
-            .otherwise(fl_none())
-            .alias(f"ivol_capm{sfx}"),
-        ]
+    df = (
+        df.sort(["id_int", "group_number", "aux_date"])
+        .group_by(["id_int", "group_number"])
+        .agg(
+            [
+                beta_exp.alias(f"beta{sfx}"),
+                pl.when(col("ret_exc").min() < col("ret_exc").max())
+                .then(residual_exp.std())
+                .otherwise(fl_none())
+                .alias(f"ivol_capm{sfx}"),
+            ]
+        )
     )
     return df
 
@@ -11272,6 +11480,7 @@ def portfolios(
     ind_pf=True,  # Should industry portfolio returns be estimated
     ret_cutoffs=None,  # Data frame for monthly winsorization. Neccesary when wins_ret=T
     ret_cutoffs_daily=None,  # Data frame for daily winsorization. Neccesary when wins_ret=T and daily_pf=T
+    daily_ret_col: str = "ret_exc",  # Daily return column to aggregate into portfolios
 ):
     if source is None:
         source = ["CRSP", "COMPUSTAT"]
@@ -11285,7 +11494,7 @@ def portfolios(
             "eom",
             "source_crsp",
             "comp_exchg",
-            "crsp_exchcd",
+            "crsp_nyse",
             "size_grp",
             "ret_exc",
             "ret_exc_lead1m",
@@ -11301,13 +11510,20 @@ def portfolios(
     # polars push predicate/null filters into the parquet reader (skipping row
     # groups on real production files) and fuse the ~15 intermediate steps into
     # one pass instead of allocating ~15 intermediate DataFrames.
-    cast_exclude = {"id", "eom", "source_crsp", "size_grp", "excntry"}
+    cast_exclude = {
+        "id",
+        "eom",
+        "source_crsp",
+        "size_grp",
+        "excntry",
+        "crsp_nyse",
+    }
     cast_cols = [c for c in columns if c not in cast_exclude]
 
     if bps == "nyse":
         bp_stock_expr = (
-            ((pl.col("crsp_exchcd") == 1) & pl.col("comp_exchg").is_null())
-            | ((pl.col("comp_exchg") == 11) & pl.col("crsp_exchcd").is_null())
+            ((pl.col("crsp_nyse") == 1) & pl.col("comp_exchg").is_null())
+            | ((pl.col("comp_exchg") == 11) & (pl.col("crsp_nyse") != 1))
         ).alias("bp_stock")
     else:  # "non_mc"
         bp_stock_expr = pl.col("size_grp").is_in(["mega", "large", "small"]).alias("bp_stock")
@@ -11341,7 +11557,7 @@ def portfolios(
     if daily_pf:
         daily_lazy = (
             pl.scan_parquet(daily_file_path)
-            .select(["id", "date", "ret_exc"])
+            .select(["id", "date", pl.col(daily_ret_col).alias("ret_exc")])
             .with_columns((pl.col("date").dt.month_start().dt.offset_by("-1d")).alias("eom_lag1"))
             .with_columns(pl.col("ret_exc").cast(pl.Float64))
         )
@@ -11369,8 +11585,9 @@ def portfolios(
             .drop(["source_crsp", "p001", "p999"])
         )
 
-        # Daily winsorization
-        if daily_pf:
+        # Daily winsorization (only for standard ret_exc; O/I component
+        # returns are not excess returns and use different distributions).
+        if daily_pf and daily_ret_col == "ret_exc":
             daily_lazy = (
                 daily_lazy.with_columns(pl.col("date").dt.month_end().alias("eom"))
                 .join(
