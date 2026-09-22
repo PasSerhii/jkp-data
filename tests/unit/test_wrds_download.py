@@ -69,19 +69,19 @@ class TestStatementTimeoutConnectionInfo:
         from jkp.data.aux_functions import with_pg_statement_timeout
 
         result = with_pg_statement_timeout("postgresql://example/db")
-        assert result.endswith("?options=-c%20statement_timeout%3D300000")
+        assert result.endswith("?options=-c%20statement_timeout%3D900000")
 
     def test_preserves_existing_uri_query(self):
         from jkp.data.aux_functions import with_pg_statement_timeout
 
         result = with_pg_statement_timeout("postgresql://example/db?sslmode=require")
-        assert "&options=-c%20statement_timeout%3D300000" in result
+        assert "&options=-c%20statement_timeout%3D900000" in result
 
     def test_adds_option_to_keyword_dsn(self):
         from jkp.data.aux_functions import with_pg_statement_timeout
 
         result = with_pg_statement_timeout("host=example dbname=wrds")
-        assert result.endswith(" options='-c statement_timeout=300000'")
+        assert result.endswith(" options='-c statement_timeout=900000'")
 
     def test_does_not_replace_existing_options(self):
         from jkp.data.aux_functions import with_pg_statement_timeout

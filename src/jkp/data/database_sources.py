@@ -25,7 +25,7 @@ class CompustatSource(StrEnum):
 
 COMPUSTAT_ENV_VAR = "COMPUSTAT"
 RESEARCH_UPDATE_ENV_VAR = "RESEARCH_UPDATE"
-RDS_STATEMENT_TIMEOUT_MS = "300000"
+RDS_STATEMENT_TIMEOUT_MS = "900000"
 
 
 def _find_dotenv(start: Path | None = None) -> Path | None:
