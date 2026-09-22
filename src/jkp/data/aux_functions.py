@@ -119,10 +119,14 @@ DAILY_COMPUSTAT_PAIR_HEADERS = {
 }
 # 350 pairs per batch. Each batch is one query against the secd/g_secd views, and
 # only g_secd carries a measurable fixed cost per query (~2.5s, against ~1.79s per
-# MiB of payload), so larger batches amortise that away. The ceiling is the 300s
-# statement timeout in with_pg_statement_timeout: at 250 pairs the slowest observed
-# batch was 64.6s, so 350 projects to ~90s and leaves a 3.3x margin before a batch
-# would be killed. Raise this only with that margin recomputed from a real run.
+# MiB of payload), so larger batches amortise that away. The ceiling is the
+# statement timeout in with_pg_statement_timeout (900s): at 250 pairs the slowest
+# observed batch was 64.6s, so 350 projects to ~90s and leaves a 10x margin before
+# a batch would be killed. The timeout was 300s until 2026-09-22, when the whole-
+# table comp.g_fundq download (240s on 2026-09-01) exceeded it on a slower RDS day
+# and failed the run; the same conninfo serves the header tables and the batches,
+# and the largest header view needs the headroom more than the batches need a
+# tight kill. Raise the batch size only with that margin recomputed from a real run.
 DAILY_COMPUSTAT_BATCH_SIZE = 350
 DAILY_COMPUSTAT_BATCH_MAX_RETRIES = 3
 DAILY_COMPUSTAT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0)
@@ -978,7 +982,7 @@ def gen_crsp_sf(paths: DataPaths, freq):
     return result
 
 
-def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 300_000) -> str:
+def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 900_000) -> str:
     """Add a PostgreSQL startup timeout without exposing or reparsing credentials."""
     if re.search(r"(^|[?&\s])options=", conninfo):
         return conninfo

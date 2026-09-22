@@ -28,7 +28,7 @@ def test_xpressfeed_url_is_duckdb_compatible_and_guarded(monkeypatch):
     assert query["sslmode"] == ["require"]
     assert query["connect_timeout"] == ["15"]
     assert query["application_name"] == ["jkp-data"]
-    assert query["options"] == ["-c statement_timeout=300000"]
+    assert query["options"] == ["-c statement_timeout=900000"]
 
 
 @pytest.mark.unit
