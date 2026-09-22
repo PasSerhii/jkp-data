@@ -7,6 +7,9 @@ Covers the daily SIC/NAICS expansion from Compustat NA + Global histories:
 - Hard-coded filter removing ``gvkey='175650'`` / ``datadate=2005-12-31`` / null naics
 - ``LPAD(gvkey, 6, '0')`` zero-padding
 - Daily expansion of [datadate, next datadate) gaps with ``closed="left"``
+- The newest record of each gvkey runs through ``end_date`` (the panel end); the
+  per-test ``end_date`` equals that test's latest datadate where the terminal row is
+  expected to stay a single day
 - Dedup + sort by ``(gvkey, date)``
 - A regression golden fixture locking the output bit-for-bit.
 """
@@ -26,6 +29,9 @@ from tests.conftest import assert_sorted_by_keys, assert_unique_keys
 from tests.golden.comp_sic_naics_inputs import empty_sic_naics_frame, sic_naics_frame
 
 GOLDEN_DIR = Path(__file__).parent.parent / "golden" / "fixtures" / "comp_sic_naics"
+# Panel end used for the golden fixture (the latest datadate among its inputs), so the
+# newest record of every gvkey runs through it, as in production.
+GOLDEN_END = date(2020, 6, 15)
 
 
 def _write_inputs(paths: DataPaths, na: pl.DataFrame, gl: pl.DataFrame) -> None:
@@ -49,7 +55,7 @@ class TestCompSicNaics:
         na = sic_naics_frame(["001000"], [date(2020, 1, 1)], [7372], [511210])
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2020, 1, 1))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -63,7 +69,7 @@ class TestCompSicNaics:
         gl = sic_naics_frame(["002000"], [date(2020, 6, 15)], [2834], [325412])
         _write_inputs(self.paths, empty_sic_naics_frame(), gl)
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2020, 6, 15))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -77,7 +83,7 @@ class TestCompSicNaics:
         gl = sic_naics_frame(["004000"], [date(2019, 3, 1)], [4813], [517110])
         _write_inputs(self.paths, na, gl)
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2019, 3, 1))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -91,7 +97,7 @@ class TestCompSicNaics:
         gl = sic_naics_frame(["003000"], [date(2018, 5, 1)], [6021], [522120])
         _write_inputs(self.paths, na, gl)
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2018, 5, 1))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -110,7 +116,7 @@ class TestCompSicNaics:
         )
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2006, 6, 30))
 
         result = pl.read_parquet(self.output_path)
         # The 2005-12-31 row was dropped; only the 2006-06-30 row remains and
@@ -125,7 +131,7 @@ class TestCompSicNaics:
         na = sic_naics_frame(["500"], [date(2021, 7, 15)], [7372], [511210])
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2021, 7, 15))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -141,7 +147,7 @@ class TestCompSicNaics:
         )
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2020, 1, 4))
 
         result = pl.read_parquet(self.output_path).sort("date")
         # First span Jan-1 -> Jan-4 (closed="left") = Jan-1, Jan-2, Jan-3 (3 rows)
@@ -174,7 +180,7 @@ class TestCompSicNaics:
         )
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2020, 1, 1))
 
         result = pl.read_parquet(self.output_path)
         assert result.height == 1
@@ -194,11 +200,62 @@ class TestCompSicNaics:
         )
         _write_inputs(self.paths, na, empty_sic_naics_frame())
 
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=date(2020, 6, 15))
 
         result = pl.read_parquet(self.output_path)
         assert_unique_keys(result, ["gvkey", "date"])
         assert_sorted_by_keys(result, "gvkey", "date")
+
+    def test_newest_record_runs_through_panel_end(self) -> None:
+        """The newest record has no successor and must run through ``end_date``.
+
+        Ending it on its own datadate (the SAS ``if FIRST.gvkey then valid_to = date``)
+        left every month after the last fiscal year-end with null sic/naics/ff49.
+        """
+        end = date(2026, 8, 31)
+        na = sic_naics_frame(
+            ["001000", "001000"],
+            [date(2024, 12, 31), date(2025, 12, 31)],
+            [1000, 2000],
+            [111, 222],
+        )
+        _write_inputs(self.paths, na, empty_sic_naics_frame())
+
+        comp_sic_naics(self.paths, end_date=end)
+
+        result = pl.read_parquet(self.output_path).sort("date")
+        first = result.filter(pl.col("sic") == 1000)
+        last = result.filter(pl.col("sic") == 2000)
+        assert (first["date"].min(), first["date"].max()) == (
+            date(2024, 12, 31),
+            date(2025, 12, 30),
+        )
+        assert (last["date"].min(), last["date"].max()) == (date(2025, 12, 31), end)
+        assert last.height == (end - date(2025, 12, 31)).days + 1
+        assert_unique_keys(result, ["gvkey", "date"])
+
+    def test_record_after_panel_end_keeps_one_day(self) -> None:
+        na = sic_naics_frame(["001001"], [date(2026, 12, 31)], [3000], [333])
+        _write_inputs(self.paths, na, empty_sic_naics_frame())
+
+        comp_sic_naics(self.paths, end_date=date(2026, 8, 31))
+
+        result = pl.read_parquet(self.output_path)
+        assert result.height == 1
+        assert result["date"][0] == date(2026, 12, 31)
+
+    def test_global_only_company_is_extended_too(self) -> None:
+        gl = sic_naics_frame(["300001"], [date(2025, 6, 30)], [4000], [None])
+        _write_inputs(self.paths, empty_sic_naics_frame(), gl)
+
+        comp_sic_naics(self.paths, end_date=date(2026, 8, 31))
+
+        result = pl.read_parquet(self.output_path)
+        assert (result["date"].min(), result["date"].max()) == (
+            date(2025, 6, 30),
+            date(2026, 8, 31),
+        )
+        assert result["sic"].unique().to_list() == [4000]
 
     @pytest.mark.regression
     def test_comp_sic_naics_golden_fixture(self) -> None:
@@ -207,7 +264,7 @@ class TestCompSicNaics:
 
         na, gl = build_sic_naics_inputs()
         _write_inputs(self.paths, na, gl)
-        comp_sic_naics(self.paths)
+        comp_sic_naics(self.paths, end_date=GOLDEN_END)
 
         result = pl.read_parquet(self.output_path)
         golden = pl.read_parquet(GOLDEN_DIR / "comp_other.parquet")

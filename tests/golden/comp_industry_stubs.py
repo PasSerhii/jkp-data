@@ -32,7 +32,7 @@ class CompIndustryUpstreamStubs:
     comp_sic_naics_called: bool = field(default=False, init=False)
     hgics_join_called: bool = field(default=False, init=False)
 
-    def _comp_sic_naics(self, _paths: DataPaths) -> None:
+    def _comp_sic_naics(self, _paths: DataPaths, **_kwargs: object) -> None:
         self.comp_sic_naics_called = True
 
     def _hgics_join(self, _paths: DataPaths, **_kwargs: object) -> None:

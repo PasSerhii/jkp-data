@@ -4470,7 +4470,7 @@ def hgics_join(paths: DataPaths, end_date: date = END_DATE):
     gjoin.sink_parquet(paths.interim_dir / "comp_hgics.parquet")
 
 
-def comp_sic_naics(paths: DataPaths):
+def comp_sic_naics(paths: DataPaths, end_date: date = END_DATE):
     """
     Description:
         Combine and reconcile Compustat SIC/NAICS from US and Global datasets into a
@@ -4479,9 +4479,18 @@ def comp_sic_naics(paths: DataPaths):
     Steps:
         1) Load NA and GL tables; drop a known problematic row; outer-join on (gvkey,datadate).
         2) Coalesce ids/dates/codes; order to prefer non-null SIC; select distinct per (gvkey,date).
-        3) Convert to daily spans by joining to next datadate; expand date ranges [datadate,end_date).
+        3) Convert to daily spans by joining to next datadate; expand date ranges [datadate,next).
+           The newest record of each gvkey runs through ``end_date`` (the panel end), like
+           the GICS spans in comp_hgics; a record dated after ``end_date`` keeps its one day.
         4) Handle single-date rows; project to {gvkey,date,sic,naics}; deduplicate, sort.
         5) Write comp_other.parquet.
+
+    Note:
+        Ending the newest record on its own datadate (the SAS ``if FIRST.gvkey then
+        valid_to = date`` under a descending sort, ported here as ``.then(col("datadate"))``)
+        made every month after the last fiscal year-end carry null sic/naics/ff49 for the
+        whole universe, which is why recent months in the research database had to be
+        backfilled by hand.
 
     Output:
         Parquet comp_other.parquet with daily SIC/NAICS per gvkey.
@@ -4557,7 +4566,7 @@ def comp_sic_naics(paths: DataPaths):
         .with_columns(end_date=col("datadate").shift(-1).over("gvkey"))
         .with_columns(
             end_date=pl.when(col("end_date").is_null())
-            .then(col("datadate"))
+            .then(pl.max_horizontal(col("datadate"), pl.lit(end_date).dt.offset_by("1d")))
             .otherwise(col("end_date"))
         )
         .with_columns(date=pl.date_ranges("datadate", "end_date", closed="left"))
@@ -4592,7 +4601,7 @@ def comp_industry(paths: DataPaths, end_date: date = END_DATE):
     Output:
         Parquet comp_ind.parquet with {gvkey,date,gics,sic,naics} daily.
     """
-    comp_sic_naics(paths)
+    comp_sic_naics(paths, end_date=end_date)
     hgics_join(paths, end_date=end_date)
     comp_gics = pl.scan_parquet(paths.interim_dir / "comp_hgics.parquet")
     comp_other = pl.scan_parquet(paths.interim_dir / "comp_other.parquet")
