@@ -85,7 +85,13 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
      ```
      Kindly follow the prompts.
 
-     Note: If you need to change your password or credentials, run `jkp connect --reset` and then `jkp connect`
+     `jkp connect` opens a real WRDS connection, so a successful run confirms
+     that your credentials, connectivity, and MFA all work. A password typed at
+     the prompt is verified before it is stored, so a typo is never saved: just
+     run `jkp connect` again and re-enter it.
+
+     Note: if you have changed your password at WRDS, run `jkp connect --reset`
+     and then `jkp connect`.
 
    - **Credential precedence.** When the pipeline needs WRDS credentials, it
      resolves them from the `WRDS_USERNAME`/`WRDS_PASSWORD` environment
@@ -133,7 +139,7 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
    **IMPORTANT:** When starting the code, you may be prompted to grant access to WRDS using two-factor authentication, for example via a Duo notification. You need to approve this request, as the program will otherwise fail. After a few seconds or minutes, you should see data being created in the output directory. If that is not the case, please check your internet connection or credentials.
 
 When the code is finished, you can find the output in the `processed/` subdirectory of your output directory (e.g. `data/processed/`).
-Please see the release notes (`documentation/release_notes.html`) for a description of the output files and a comparison between the output of the SAS/R codebase and the new Python codebase.
+Please see the release notes (`documentation/sas_to_python/release_notes.html`) for a description of the output files and a comparison between the output of the SAS/R codebase and the new Python codebase.
 
 ### Docker and AWS
 

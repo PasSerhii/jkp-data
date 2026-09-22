@@ -36,7 +36,7 @@ from .config import (
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
-from .wrds_credentials import WRDS_DB, WRDS_HOST, WRDS_PORT
+from .wrds_connection import gen_wrds_connection_info
 
 # Frozen pipeline input contract for the three largest Compustat downloads.
 # Keeping the projection here makes the production downloader independent of
@@ -976,77 +976,6 @@ def gen_crsp_sf(paths: DataPaths, freq):
         ]
     )
     return result
-
-
-def _pg_escape_value(value: str) -> str:
-    """libpq-escape a conninfo value (user or password) for a single-quoted field.
-
-    libpq accepts single-quoted values with backslash-escaped ``\\`` and ``'``,
-    so quoting lets a value hold spaces or special characters without breaking the
-    conninfo. For the password this is also the form that appears in any error text
-    echoing the connection string, so the credential-masking checks reuse it rather
-    than matching the raw password.
-    """
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _sql_literal(value: str) -> str:
-    """Escape a string for embedding inside a single-quoted DuckDB SQL literal.
-
-    The conninfo is interpolated into ``ATTACH '...'`` / ``postgres_scan('...')``
-    SQL, so any single quote it contains (e.g. around a libpq-quoted password)
-    must be doubled or it terminates the SQL string literal.
-    """
-    return value.replace("'", "''")
-
-
-def gen_wrds_connection_info(user, password: str | None = None) -> str:
-    """Build a libpq conninfo for WRDS.
-
-    When ``password`` is ``None`` the ``password=`` field is omitted, so libpq
-    authenticates from ``$PGPASSFILE`` / ``~/.pgpass`` instead.
-    """
-    parts = [
-        f"host={WRDS_HOST}",
-        f"port={WRDS_PORT}",
-        f"dbname={WRDS_DB}",
-        # Quote the username too: a space or quote in it would otherwise break
-        # libpq's conninfo parsing exactly as an unquoted password would.
-        f"user='{_pg_escape_value(user)}'",
-    ]
-    if password is not None:
-        # Single-quote and escape so a password containing spaces or special
-        # characters can't break the conninfo (or split the value, which would
-        # defeat the password-masking check in _attach_wrds). The conninfo is
-        # itself embedded in a single-quoted SQL literal at each use site, so
-        # callers must additionally pass it through _sql_literal.
-        parts.append(f"password='{_pg_escape_value(password)}'")
-    parts.append("sslmode=require")
-    return " ".join(parts)
-
-
-def _password_forms(password: str) -> tuple[str, str, str]:
-    """The forms the password can take on its way into an error message: raw, the
-    libpq-escaped conninfo form (echoed by a connection IOException), and the
-    SQL-escaped-then-libpq-escaped form (echoed from the raw statement text by a
-    parser error). Ordered most-escaped first so redaction replaces the longest
-    match before its shorter substrings."""
-    escaped = _pg_escape_value(password)
-    return (_sql_literal(escaped), escaped, password)
-
-
-def _password_in_error(text: str, password: str) -> bool:
-    """True if the password appears in ``text`` in any of the forms it can take in
-    an error message (see :func:`_password_forms`)."""
-    return any(form in text for form in _password_forms(password))
-
-
-def _redact_password(text: str, password: str) -> str:
-    """Replace the password with ``***`` in every form it can take in an error
-    message (see :func:`_password_forms`)."""
-    for form in _password_forms(password):
-        text = text.replace(form, "***")
-    return text
 
 
 def with_pg_statement_timeout(conninfo: str, timeout_ms: int = 300_000) -> str:
