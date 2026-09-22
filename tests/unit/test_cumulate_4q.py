@@ -11,7 +11,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from jkp.data.aux_functions import cumulate_4q
+from jkp.data.aux_functions import cumulate_4q, quarterize, resolve_dual_package_rows
 
 pytestmark = pytest.mark.unit
 
@@ -90,3 +90,42 @@ def test_frame_without_source_column_still_works() -> None:
         + [{"fyearq": 2027, "fqtr": 1, "saleq": 5.0, "saley": 5.0}]
     ).drop("source")
     assert _sale(df) == [None, None, None, 20.0, 20.0]
+
+
+def test_cross_package_ytd_difference_cannot_contaminate_later_same_source_ttm() -> None:
+    """Q2 must stay null when its YTD predecessor belongs to another package.
+
+    Without the quarterize guard, Q2 becomes 20 - 100 = -80. That corrupt
+    value survives the TTM source check at next year's Q1, yielding -50.
+    """
+    df = _frame(
+        [
+            {"fqtr": 1, "saley": 100.0},
+            {"fqtr": 2, "source": "NA", "saley": 20.0},
+            {"fqtr": 3, "source": "NA", "saley": 30.0},
+            {"fqtr": 4, "source": "NA", "saley": 40.0},
+            {"fyearq": 2027, "fqtr": 1, "source": "NA", "saley": 10.0},
+            {"fyearq": 2027, "fqtr": 2, "source": "NA", "saley": 20.0},
+        ]
+    )
+    quarters = quarterize(df.lazy(), ["saley"]).collect().rename({"saley_q": "saleq"})
+    assert quarters["saleq"].to_list() == [100.0, None, 10.0, 10.0, 10.0, 10.0]
+    # Preserve the Q4 annual fallback; a clean trailing window becomes valid again.
+    assert _sale(quarters) == [None, None, None, 40.0, None, 40.0]
+
+
+def test_global_preference_then_quarterization_preserves_semiannual_total() -> None:
+    """Exercise selection and flow arithmetic together for the BHP-shaped case."""
+    rows = []
+    for fqtr, saley in ((1, 13951.0), (2, 27902.0), (3, 43331.0), (4, 58760.0)):
+        rows.append({"fqtr": fqtr, "saley": saley, "capxy": None})
+    for fqtr, saley in ((1, None), (2, 27902.0), (3, None), (4, 59274.0)):
+        rows.append({"fqtr": fqtr, "source": "NA", "saley": saley, "capxy": 1000.0})
+    selected = resolve_dual_package_rows(
+        _frame(rows).lazy(), key_cols=["gvkey", "fyr", "fyearq", "fqtr"]
+    )
+    quarters = quarterize(selected, ["saley"]).collect().rename({"saley_q": "saleq"})
+    assert quarters["source"].to_list() == ["GLOBAL"] * 4
+    assert quarters["saleq"].to_list() == [13951.0, 13951.0, 15429.0, 15429.0]
+    # This is the fiscal-year-end total, not an August publication-date expectation.
+    assert _sale(quarters) == [None, None, None, 58760.0]

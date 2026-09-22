@@ -12,6 +12,7 @@ from jkp.data.cli import app
 from jkp.data.config import (
     BYPASS_CRSP,
     DAILY_DOWNLOAD_WORKERS,
+    MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
     PRODUCTION_OUTPUT,
     PRODUCTION_OUTPUT_YEARS,
 )
@@ -290,9 +291,20 @@ class TestBuildCommand:
         assert result.exit_code == 0
         assert mock_run_pipeline.call_args.kwargs["full_history"] is True
 
-    def test_build_rejects_more_than_four_daily_download_workers(self, tmp_path):
-        result = runner.invoke(app, ["build", str(tmp_path), "--daily-download-workers", "5"])
-        assert result.exit_code != 0
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_rejects_daily_download_workers_above_limit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "build",
+                str(tmp_path),
+                "--daily-download-workers",
+                str(MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS + 1),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--daily-download-workers" in _strip_ansi(result.output)
+        mock_run_pipeline.assert_not_called()
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_wrds_source(self, mock_run_pipeline, tmp_path):
