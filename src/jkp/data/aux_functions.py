@@ -10955,7 +10955,9 @@ def ami(df, sfx, __min):
         Amihud illiquidity proxy using daily abs returns over dollar volume.
 
     Steps:
-        1) Define dolvol guard (None if zero).
+        1) Define dolvol guard (None if zero), so zero-volume days drop out of the
+           mean instead of nulling the window (SAS: a division by zero is a missing
+           value that mean() skips; market_chars.sas Amihud block).
         2) Group by (id_int,group_number); compute mean(|ret|/dolvol * 1e6) and count.
         3) Keep groups with n ≥ __min.
 
@@ -10967,7 +10969,7 @@ def ami(df, sfx, __min):
         df.group_by(["id_int", "group_number"])
         .agg(
             [
-                pl.when((col("ret").min() < col("ret").max()) & (~(col("dolvol_d") == 0).any()))
+                pl.when(col("ret").min() < col("ret").max())
                 .then((col("ret").abs() / aux_1 * 1e6).mean())
                 .otherwise(fl_none())
                 .alias(f"ami{sfx}"),

@@ -614,8 +614,12 @@ class TestCapm:
 class TestAmi:
     """Tests for ami() Amihud illiquidity helper."""
 
-    def test_ami_zero_dollar_volume_nulls_window_and_min_filter_applied(self):
-        """A zero-volume day makes the window's Amihud estimate unreliable."""
+    def test_ami_skips_zero_dollar_volume_days_and_min_filter_applied(self, tolerance):
+        """A zero-volume day drops out of the mean, as in the SAS (a missing ratio).
+
+        Nulling the whole window instead removed `ami_126d` for 689 illiquid
+        US/Canadian securities in August 2026 that the SAS still covered.
+        """
         df = pl.DataFrame(
             {
                 "id_int": [1, 1, 1, 2, 2],
@@ -627,12 +631,13 @@ class TestAmi:
 
         result = ami(df, "_21d", __min=3).sort(["id_int", "group_number"])
 
-        # group (1,10):
-        # A zero dolvol day invalidates the whole group's estimate.
-        # n = count(dolvol_d) = 3, so the group itself still passes.
+        # group (1,10): mean over the two traded days, (0.10/1000 + 0.05/2000) / 2 * 1e6 = 62.5.
+        # n = count(dolvol_d) = 3 (the zero-volume day is not missing), so it passes.
         # group (2,20): n=2, filtered out
         assert len(result) == 1, f"Expected 1 group after min filter, got {len(result)}"
-        assert result["ami_21d"][0] is None
+        assert result["ami_21d"][0] == pytest.approx(
+            62.5, rel=tolerance.STANDARD["rtol"], abs=tolerance.STANDARD["atol"]
+        )
 
     def test_ami_all_zero_dollar_volume_gives_null(self):
         """If all dolvol_d are zero, the Amihud ratio should be undefined."""
