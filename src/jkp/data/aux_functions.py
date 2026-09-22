@@ -5276,7 +5276,8 @@ def cumulate_4q(df, var_list):
 
     Steps:
         1) For each *_q in var_list, create year-level name by stripping trailing 'q'.
-        2) Compute TTM via ttm(*_q) and continuity flags (same gvkey/fyr/currency & ttm(fqtr)==10).
+        2) Compute TTM via ttm(*_q) and continuity flags (same gvkey/fyr/currency at lag 3,
+           same Compustat package (`source`) at lags 1-3, & ttm(fqtr)==10).
         3) Keep TTM only when continuity holds; backfill at fqtr==4 if missing.
         4) Drop helpers and *_q inputs.
 
@@ -5284,6 +5285,16 @@ def cumulate_4q(df, var_list):
         Frame with validated 4Q cumulative variables for each input (e.g., sales, oibdp).
     """
     var_yrl_name_list = [var[:-1] for var in var_list]
+    # A window mixing the Global and NA packages is not a trailing year: Global
+    # halves semi-annual flows across quarters, NA does not. All three lags are
+    # needed -- checking lag 3 alone would pass an alternating G/NA/G/NA window.
+    same_source = (
+        (col("source") == col("source").shift(1))
+        & (col("source") == col("source").shift(2))
+        & (col("source") == col("source").shift(3))
+        if "source" in df.collect_schema().names()
+        else pl.lit(True)
+    )
     df = (
         df.with_columns(
             [
@@ -5295,6 +5306,7 @@ def cumulate_4q(df, var_list):
                     (col("gvkey") == col("gvkey").shift(3))
                     & (col("fyr") == col("fyr").shift(3))
                     & (col("curcdq") == col("curcdq").shift(3))
+                    & same_source
                     & (ttm("fqtr") == 10)
                 ).alias("not_null_flag")
             ]
@@ -5417,18 +5429,30 @@ _ACCOUNTING_META_COLUMNS = frozenset(
 )
 
 
-def resolve_dual_package_rows(df, key_cols):
+def resolve_dual_package_rows(df, key_cols, group_cols=None):
     """
     Description:
         Pick one row per key when a company files in both the Global and NA
         Compustat packages, preferring whichever row carries more data.
 
     Steps:
+        0) If group_cols is given, first choose the package once per group by the
+           summed populated count of its rows (tie toward Global) and drop the
+           other package's rows for that group.
         1) Count populated (non-null) reported values on each candidate row.
         2) Keep only rows tied for the highest count within the key.
         3) Break any remaining tie toward the Global row.
 
     Rationale:
+        The quarterly panel needs one package per fiscal year (group_cols =
+        gvkey/fyr/fyearq): ytd differencing and the trailing-4-quarter sums span
+        quarters, and the packages encode semi-annual reporters differently --
+        Global halves each half-year flow across two quarters while NA carries
+        the full half in fqtr 2 and 4 only. A per-quarter choice can alternate
+        packages and sum full halves with half-halves (BHP FY2026: 83,514 against
+        a reported 58,760).
+
+
         The SAS leaves this undefined: `set __gfunda __funda` concatenates both
         rows and the survivor is decided by a later `proc sort nodupkey` with no
         ORDER BY and no stable-sort guarantee (accounting_chars.sas:413-423 and
@@ -5456,9 +5480,16 @@ def resolve_dual_package_rows(df, key_cols):
         if value_cols
         else pl.lit(0, dtype=pl.Int32)
     )
+    df = df.with_columns(_populated=populated)
+    if group_cols:
+        df = (
+            df.with_columns(_group_populated=col("_populated").sum().over([*group_cols, "source"]))
+            .filter(col("_group_populated") == col("_group_populated").max().over(group_cols))
+            .filter((col("source").n_unique().over(group_cols) == 1) | (col("source") == "GLOBAL"))
+            .drop("_group_populated")
+        )
     return (
-        df.with_columns(_populated=populated)
-        .filter(col("_populated") == col("_populated").max().over(key_cols))
+        df.filter(col("_populated") == col("_populated").max().over(key_cols))
         .filter((pl.len().over(key_cols) == 1) | (col("source") == "GLOBAL"))
         .drop("_populated")
     )
@@ -5538,7 +5569,8 @@ def standardized_accounting_data(
     Steps:
         1) Inspect FUNDQ schemas; define target income/CF/BS/other vars; collect quarterly suffix vars (…q/…y).
         2) Load & filter raw GLOBAL and/or NA (annual/quarterly) via helper; add computed fields (e.g., ni, niq, ppegtq); drop vars as needed; apply INDFMT resolver.
-        3) If world: concat NA+GLOBAL and break ties per key by preferring NA.
+        3) If world: concat NA+GLOBAL and keep the more populated row per key (annual: per
+           gvkey/datadate; quarterly: package chosen once per gvkey/fyr/fyearq), tie -> GLOBAL.
         4) If convert_to_usd: join FX and convert listed vars (annual & quarterly).
         5) Load ME and join to annual/quarterly panels.
         6) Quarterly: quarterize …y → …y_q, coalesce to …q; create ni_qtr/sale_qtr/ocf_qtr; cumulate 4Q flows with continuity checks; normalize currency codes; de-dupe, prefer later/NA rows.
@@ -5792,7 +5824,9 @@ def standardized_accounting_data(
             resolve_dual_package_rows, key_cols=["gvkey", "datadate"]
         )
         __wfundq = pl.concat([__gfundq, __fundq], how="diagonal_relaxed").pipe(
-            resolve_dual_package_rows, key_cols=["gvkey", "fyr", "fyearq", "fqtr"]
+            resolve_dual_package_rows,
+            key_cols=["gvkey", "fyr", "fyearq", "fqtr"],
+            group_cols=["gvkey", "fyr", "fyearq"],
         )
     else:
         pass

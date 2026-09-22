@@ -112,6 +112,83 @@ def test_one_row_per_key_across_many_companies() -> None:
     assert picked["000002"] == "GLOBAL"
 
 
+QKEY = ["gvkey", "fyr", "fyearq", "fqtr"]
+QGROUP = ["gvkey", "fyr", "fyearq"]
+
+
+def _qrow(gvkey: str, source: str, fyearq: int, fqtr: int, **values) -> dict:
+    base = {
+        "gvkey": gvkey,
+        "fyr": 6,
+        "fyearq": fyearq,
+        "fqtr": fqtr,
+        "source": source,
+        "curcdq": "USD",
+        "n": 0,
+        "atq": None,
+        "saley": None,
+        "capxy": None,
+    }
+    base.update(values)
+    return base
+
+
+def _resolve_q(rows: list[dict]) -> pl.DataFrame:
+    return (
+        resolve_dual_package_rows(pl.DataFrame(rows).lazy(), key_cols=QKEY, group_cols=QGROUP)
+        .collect()
+        .sort(QKEY)
+    )
+
+
+def test_quarterly_choice_is_constant_within_fiscal_year() -> None:
+    """BHP-shaped semi-annual reporter filed in both packages.
+
+    Global carries (halved) values in all four quarters; NA carries the full
+    half only in fqtr 2 and 4 but with one extra field there, so a per-quarter
+    choice would alternate GLOBAL/NA/GLOBAL/NA and corrupt the trailing sums.
+    """
+    rows = []
+    for fqtr, saley in ((1, 13951.0), (2, 27902.0), (3, 43331.0), (4, 58760.0)):
+        rows.append(_qrow("013312", "GLOBAL", 2026, fqtr, atq=121387.0, saley=saley))
+    rows.append(_qrow("013312", "NA", 2026, 1))
+    rows.append(_qrow("013312", "NA", 2026, 2, atq=116012.0, saley=27902.0, capxy=5000.0))
+    rows.append(_qrow("013312", "NA", 2026, 3))
+    rows.append(_qrow("013312", "NA", 2026, 4, atq=121387.0, saley=59274.0, capxy=10000.0))
+    out = _resolve_q(rows)
+    assert out.height == 4
+    assert out.group_by(QKEY).len()["len"].max() == 1
+    assert out["source"].n_unique() == 1
+    assert out["source"][0] == "GLOBAL"
+    assert out["saley"].to_list() == [13951.0, 27902.0, 43331.0, 58760.0]
+
+
+def test_quarterly_group_tie_prefers_global() -> None:
+    rows = [
+        _qrow("001005", s, 2025, q, atq=10.0, saley=float(q))
+        for s in ("GLOBAL", "NA")
+        for q in (1, 2, 3, 4)
+    ]
+    out = _resolve_q(rows)
+    assert out.height == 4
+    assert out["source"].unique().to_list() == ["GLOBAL"]
+
+
+def test_quarterly_choice_can_differ_across_fiscal_years() -> None:
+    """A stub Global year loses to NA without dragging the earlier, richer Global year."""
+    rows = []
+    for q in (1, 2, 3, 4):
+        rows.append(_qrow("001006", "GLOBAL", 2024, q, atq=10.0, saley=float(q), capxy=1.0))
+        rows.append(_qrow("001006", "NA", 2024, q, atq=10.0, saley=float(q)))
+        rows.append(_qrow("001006", "GLOBAL", 2025, q, atq=11.0))
+        rows.append(_qrow("001006", "NA", 2025, q, atq=11.0, saley=float(q), capxy=2.0))
+    out = _resolve_q(rows)
+    assert out.height == 8
+    picked = dict(zip(out["fyearq"].to_list(), out["source"].to_list(), strict=True))
+    assert picked == {2024: "GLOBAL", 2025: "NA"}
+    assert out.filter(pl.col("fyearq") == 2025)["source"].n_unique() == 1
+
+
 def test_quarterly_key_is_supported() -> None:
     rows = [
         {
