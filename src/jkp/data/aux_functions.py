@@ -33,6 +33,7 @@ from .config import (
     MAIN_FILTERS,
     MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
 )
+from .industry import build_industry_history_query, fill_missing_sic, resolve_sic_history
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
@@ -140,6 +141,7 @@ REUSABLE_COMPUSTAT_TABLES: tuple[str, ...] = (
     "comp.g_sec_history",
     "comp.sec_history",
     "comp.sec_id_history",
+    "comp.industry_history",
     "comp.company",
     "comp.g_company",
     "comp.funda",
@@ -2046,6 +2048,46 @@ def download_compustat_age_anchor_attached(
     )
 
 
+def download_compustat_industry_history_attached(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    db_alias: str,
+    paths: DataPaths,
+    raw_schema: str,
+    start_date: date | None,
+    end_date: date | None,
+    source_label: str,
+) -> None:
+    """Download dated industry history separately from annual financial filings."""
+    table = "comp.industry_history"
+    filename = str(paths.raw_tables_dir / "comp_industry_history.parquet")
+    started_at = datetime.now(UTC).isoformat()
+    started = time.monotonic()
+    _report_progress(f"Downloading {source_label} dated industry history")
+    try:
+        download_postgres_query_attached(
+            duckdb_conn,
+            db_alias,
+            build_industry_history_query(raw_schema, start_date, end_date),
+            filename,
+        )
+    except Exception as exc:
+        _record_table_download_failure(
+            table,
+            started_at_utc=started_at,
+            started_monotonic=started,
+            error=exc,
+            timeouts=int(_is_timeout_error(exc)),
+        )
+        _raise_redacted_source_error(source_label, "industry-history download", exc)
+    _record_single_table_download(
+        duckdb_conn,
+        table,
+        filename,
+        started_at_utc=started_at,
+        started_monotonic=started,
+    )
+
+
 def _raise_redacted_source_error(source_label: str, action: str, exc: Exception) -> None:
     """Raise a useful source error without echoing a connection string."""
     raise RuntimeError(
@@ -2360,6 +2402,9 @@ def download_raw_data_tables(
                 started_at_utc=anchor_started_at,
                 started_monotonic=anchor_started,
             )
+            download_compustat_industry_history_attached(
+                con, "source_db", paths, raw_schema, start_date, end_date, source_label
+            )
             if queue_future is not None:
                 try:
                     queue_future.result()
@@ -2508,16 +2553,20 @@ def download_raw_data_tables(
                         timeouts=int(_is_timeout_error(e)),
                     )
                     _raise_redacted_source_error(source_label, "age-anchor download", e)
+                else:
+                    _record_single_table_download(
+                        con,
+                        "comp.age_anchor",
+                        anchor_filename,
+                        started_at_utc=anchor_started_at,
+                        started_monotonic=anchor_started,
+                    )
+                    download_compustat_industry_history_attached(
+                        con, anchor_alias, paths, raw_schema, start_date, end_date, source_label
+                    )
                 finally:
                     with contextlib.suppress(Exception):
                         con.execute(f"DETACH {anchor_alias}")
-                _record_single_table_download(
-                    con,
-                    "comp.age_anchor",
-                    anchor_filename,
-                    started_at_utc=anchor_started_at,
-                    started_monotonic=anchor_started,
-                )
 
                 if queue_future is not None:
                     try:
@@ -10425,7 +10474,8 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
         1) Load __msf_world, comp_ind, and crsp_ind datasets.
         2) Join compustat and CRSP industry codes on matching keys.
         3) Coalesce SIC/NAICS from both sources.
-        4) Drop redundant columns.
+        4) Fill remaining missing SIC from dated industry history; preserve NAICS.
+           Save the candidate's source/date in sic_history_fallback.parquet.
 
     When ``bypass_crsp`` is True there is no CRSP industry file, so SIC/NAICS come
     from Compustat only (no crsp_ind join), mirroring the SAS bypass path
@@ -10456,7 +10506,14 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
             )
             .drop(["sic_crsp", "naics_crsp"])
         )
-    __msf_world.collect().write_parquet(paths.interim_dir / "__msf_world2.parquet")
+    history = pl.scan_parquet(paths.raw_tables_dir / "comp_industry_history.parquet")
+    resolved = resolve_sic_history(
+        __msf_world.filter(pl.col("sic").is_null()).select("gvkey", "eom"), history
+    ).collect()
+    resolved.write_parquet(paths.interim_dir / "sic_history_fallback.parquet")
+    fill_missing_sic(__msf_world, resolved.lazy()).collect().write_parquet(
+        paths.interim_dir / "__msf_world2.parquet"
+    )
 
 
 @measure_time

@@ -230,6 +230,16 @@ def test_merge_industry_bypass_no_crsp_ind(tmp_path: Path) -> None:
 
     # No crsp_ind.parquet exists.
     assert not (paths.interim_dir / "crsp_ind.parquet").exists()
+    pl.DataFrame(
+        schema={
+            "gvkey": pl.String,
+            "datadate": pl.Date,
+            "sich": pl.Int64,
+            "naicsh": pl.String,
+            "popsrc": pl.String,
+            "consol": pl.String,
+        }
+    ).write_parquet(paths.raw_tables_dir / "comp_industry_history.parquet")
 
     merge_industry_to_world_msf(paths, bypass_crsp=True)
     out = pl.read_parquet(paths.interim_dir / "__msf_world2.parquet").sort("gvkey")

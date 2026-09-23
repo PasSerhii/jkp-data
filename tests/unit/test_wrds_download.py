@@ -141,6 +141,30 @@ class TestDownloadRawDataTablesBranching:
         # aggregate uses one temporary attached connection.
         assert "AS age_anchor_source" in sql_joined
 
+    @pytest.mark.parametrize("persistent", [True, False])
+    def test_industry_history_uses_native_source_and_window_anchor(
+        self, mock_duckdb, test_paths, persistent
+    ):
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        _, conn = mock_duckdb
+        download_raw_data_tables(
+            test_paths,
+            connection_info="host=test",
+            raw_schema="public",
+            start_date=date(2005, 8, 31),
+            end_date=date(2026, 8, 31),
+            persistent_connection=persistent,
+        )
+        sql = [call.args[0] for call in conn.execute.call_args_list]
+        history_copies = [s for s in sql if "COPY (" in s and "comp_industry_history.parquet" in s]
+        assert len(history_copies) == 1
+        query = history_copies[0]
+        assert '"public"."co_industry"' in query
+        assert "MAX(datadate) AS anchor_date" in query
+        assert "2005-08-31" in query and "2026-08-31" in query
+        assert "comp.funda" not in query
+
     def test_persistent_connection_true_uses_attach(self, mock_duckdb, test_paths):
         """When persistent_connection=True, should use ATTACH."""
         from jkp.data.aux_functions import download_raw_data_tables
@@ -428,3 +452,14 @@ class TestReusableRawValidation:
 
         with pytest.raises(RuntimeError, match="comp.secd has 1 parts; expected 2"):
             validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_old_raw_cache_without_industry_history_is_rejected(self, tmp_path, monkeypatch):
+        import jkp.data.aux_functions as aux
+
+        assert "comp.industry_history" in aux.REUSABLE_COMPUSTAT_TABLES
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            aux, "REUSABLE_COMPUSTAT_TABLES", (*aux.REUSABLE_COMPUSTAT_TABLES, "comp.industry_history")
+        )
+        with pytest.raises(RuntimeError, match="missing or empty comp_industry_history.parquet"):
+            aux.validate_reusable_raw_data(paths, bypass_crsp=True)
