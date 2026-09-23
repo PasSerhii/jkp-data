@@ -5,6 +5,7 @@ This module tests the download_raw_data_tables function and its helper functions
 particularly the persistent connection feature that uses ATTACH instead of postgres_scan().
 """
 
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,22 +42,52 @@ class TestBuildProjection:
         assert "TRY_CAST(sic AS BIGINT) AS sic" in result
         assert "TRY_CAST(sich AS BIGINT) AS sich" in result
 
+    def test_selected_columns_are_projected_in_contract_order(self):
+        """A selected projection should omit every unused source column."""
+        from jkp.data.aux_functions import build_projection
 
-class TestGenWrdsConnectionInfo:
-    """Tests for gen_wrds_connection_info() function."""
+        result = build_projection(
+            ["gvkey", "iid", "datadate", "unused"],
+            ("gvkey", "iid", "datadate"),
+        )
 
-    def test_connection_string_format(self):
-        """Connection string should have correct format."""
-        from jkp.data.aux_functions import gen_wrds_connection_info
+        assert result == '"gvkey", "iid", "datadate"'
+        assert "unused" not in result
 
-        result = gen_wrds_connection_info("testuser", "testpass")
+    def test_selected_columns_must_exist(self):
+        """A source schema change should fail before a partial download starts."""
+        from jkp.data.aux_functions import build_projection
 
-        assert "host=wrds-pgdata.wharton.upenn.edu" in result
-        assert "port=9737" in result
-        assert "dbname=wrds" in result
-        assert "user=testuser" in result
-        assert "password=testpass" in result
-        assert "sslmode=require" in result
+        with pytest.raises(RuntimeError, match="missing required columns: trfd"):
+            build_projection(["gvkey", "iid"], ("gvkey", "iid", "trfd"))
+
+
+class TestStatementTimeoutConnectionInfo:
+    """Tests for applying the RDS session guardrail at connection startup."""
+
+    def test_adds_encoded_option_to_uri(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db")
+        assert result.endswith("?options=-c%20statement_timeout%3D900000")
+
+    def test_preserves_existing_uri_query(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("postgresql://example/db?sslmode=require")
+        assert "&options=-c%20statement_timeout%3D900000" in result
+
+    def test_adds_option_to_keyword_dsn(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        result = with_pg_statement_timeout("host=example dbname=wrds")
+        assert result.endswith(" options='-c statement_timeout=900000'")
+
+    def test_does_not_replace_existing_options(self):
+        from jkp.data.aux_functions import with_pg_statement_timeout
+
+        original = "postgresql://example/db?options=-c%20statement_timeout%3D120000"
+        assert with_pg_statement_timeout(original) == original
 
 
 class TestDownloadRawDataTablesBranching:
@@ -69,11 +100,24 @@ class TestDownloadRawDataTablesBranching:
     @pytest.fixture
     def mock_duckdb(self):
         """Create a mock DuckDB connection."""
-        with patch("jkp.data.aux_functions.duckdb") as mock:
+        from jkp.data.aux_functions import LARGE_COMPUSTAT_COLUMNS
+
+        available_columns = sorted(
+            {column for columns in LARGE_COMPUSTAT_COLUMNS.values() for column in columns}
+        )
+        with (
+            patch("jkp.data.aux_functions.duckdb") as mock,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched"),
+            patch("jkp.data.aux_functions.download_wrds_daily_table_batched_attached"),
+        ):
             mock_conn = MagicMock()
             mock.connect.return_value = mock_conn
             mock_result = MagicMock()
-            mock_result.description = [("col1",), ("col2",)]
+            mock_result.description = [(column,) for column in available_columns]
             mock_conn.execute.return_value = mock_result
             yield mock, mock_conn
 
@@ -93,7 +137,33 @@ class TestDownloadRawDataTablesBranching:
         sql_joined = " ".join(executed_sql)
 
         assert "postgres_scan" in sql_joined
-        assert "ATTACH" not in sql_joined
+        # Ordinary tables retain postgres_scan. The compact full-history age
+        # aggregate uses one temporary attached connection.
+        assert "AS age_anchor_source" in sql_joined
+
+    @pytest.mark.parametrize("persistent", [True, False])
+    def test_industry_history_uses_native_source_and_window_anchor(
+        self, mock_duckdb, test_paths, persistent
+    ):
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        _, conn = mock_duckdb
+        download_raw_data_tables(
+            test_paths,
+            connection_info="host=test",
+            raw_schema="public",
+            start_date=date(2005, 8, 31),
+            end_date=date(2026, 8, 31),
+            persistent_connection=persistent,
+        )
+        sql = [call.args[0] for call in conn.execute.call_args_list]
+        history_copies = [s for s in sql if "COPY (" in s and "comp_industry_history.parquet" in s]
+        assert len(history_copies) == 1
+        query = history_copies[0]
+        assert '"public"."co_industry"' in query
+        assert "MAX(datadate) AS anchor_date" in query
+        assert "2005-08-31" in query and "2026-08-31" in query
+        assert "comp.funda" not in query
 
     def test_persistent_connection_true_uses_attach(self, mock_duckdb, test_paths):
         """When persistent_connection=True, should use ATTACH."""
@@ -112,7 +182,7 @@ class TestDownloadRawDataTablesBranching:
 
         assert "ATTACH" in sql_joined
         assert "DETACH" in sql_joined
-        assert "wrds." in sql_joined
+        assert "source_db." in sql_joined
 
     def test_persistent_connection_true_single_attach(self, mock_duckdb, test_paths):
         """Persistent connection should only ATTACH once for all tables."""
@@ -147,6 +217,43 @@ class TestDownloadRawDataTablesBranching:
 
         download_raw_data_tables(test_paths, "user", "pass", persistent_connection=True)
         mock_conn.close.assert_called_once()
+
+    def test_persistent_connection_oom_retries_with_postgres_scan(self, mock_duckdb, test_paths):
+        """Attached downloads that hit DuckDB OOM should retry with postgres_scan."""
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        class OutOfMemoryException(Exception):
+            pass
+
+        attached_calls = 0
+
+        def attached_side_effect(*args, **kwargs):
+            nonlocal attached_calls
+            attached_calls += 1
+            if attached_calls == 1:
+                raise OutOfMemoryException("allocation failure")
+            return None
+
+        with (
+            patch(
+                "jkp.data.aux_functions.download_wrds_table_attached",
+                side_effect=attached_side_effect,
+            ) as mock_attached,
+            patch("jkp.data.aux_functions.download_wrds_table") as mock_postgres_scan,
+        ):
+            download_raw_data_tables(
+                test_paths,
+                "user",
+                "pass",
+                persistent_connection=True,
+                bypass_crsp=True,
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 1, 31),
+            )
+
+        assert mock_attached.called
+        assert mock_postgres_scan.called
+        assert mock_postgres_scan.call_args_list[0].args[2] == "comp.exrt_dly"
 
 
 class TestGetColumnsAttached:
@@ -204,3 +311,157 @@ class TestDownloadWrdsTableAttached:
         assert "wrds.crsp.msf" in copy_sql
         assert "/tmp/test.parquet" in copy_sql
         assert "FORMAT PARQUET" in copy_sql
+
+    def test_selected_columns_replace_wildcard(self):
+        """Large-table downloads should transfer only their frozen contract."""
+        from jkp.data.aux_functions import download_wrds_table_attached
+
+        mock_conn = MagicMock()
+        mock_result = MagicMock()
+        mock_result.description = [("gvkey",), ("iid",), ("datadate",), ("unused",)]
+        mock_conn.execute.return_value = mock_result
+
+        download_wrds_table_attached(
+            mock_conn,
+            "source",
+            "comp.secm",
+            "/tmp/secm.parquet",
+            selected_columns=("gvkey", "iid", "datadate"),
+        )
+
+        copy_sql = [
+            call.args[0] for call in mock_conn.execute.call_args_list if "COPY" in call.args[0]
+        ][0]
+        assert 'SELECT "gvkey", "iid", "datadate"' in copy_sql
+        assert "unused" not in copy_sql
+
+
+class TestDailyCompustatBatching:
+    """Tests for pair-indexed daily view extraction."""
+
+    def test_pair_clause_uses_scalar_predicates_and_dates(self):
+        from jkp.data.aux_functions import _pair_where_clause
+
+        result = _pair_where_clause(
+            [("001234", "01"), ("005678", "02W")],
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+        )
+
+        assert "gvkey = '001234' AND iid = '01'" in result
+        assert "gvkey = '005678' AND iid = '02W'" in result
+        assert "datadate >= '2000-01-01'" in result
+        assert "datadate <= '2026-06-30'" in result
+        assert "IN (" not in result
+
+    def test_download_writes_one_part_per_pair_batch(self, tmp_path):
+        import re
+
+        import polars as pl
+
+        from jkp.data.aux_functions import _download_pair_batches
+
+        conn = MagicMock()
+
+        def execute(sql):
+            if "COPY (" in sql:
+                output = re.search(r"TO '([^']+)'", sql)
+                assert output is not None
+                pl.DataFrame(
+                    {"gvkey": ["001234"], "iid": ["01"], "datadate": [date(2020, 1, 1)]}
+                ).write_parquet(output.group(1))
+            elif "SELECT COUNT(*)" in sql:
+                result = MagicMock()
+                result.fetchone.return_value = (1,)
+                return result
+            return conn
+
+        conn.execute.side_effect = execute
+        filename = str(tmp_path / "comp_secd.parquet")
+        _download_pair_batches(
+            conn,
+            "source_db.comp.secd",
+            '"gvkey", "iid", "datadate"',
+            [("001234", "01"), ("005678", "02"), ("009999", "01")],
+            filename,
+            "datadate",
+            date(2000, 1, 1),
+            date(2026, 6, 30),
+            batch_size=2,
+        )
+
+        copy_sql = [
+            call.args[0] for call in conn.execute.call_args_list if "COPY (" in call.args[0]
+        ]
+        assert len(copy_sql) == 2
+        assert "incomplete-000001-worker-1-try-0.parquet" in copy_sql[0]
+        assert "incomplete-000002-worker-1-try-0.parquet" in copy_sql[1]
+        assert "009999" not in copy_sql[0]
+        assert "009999" in copy_sql[1]
+        assert "UNION ALL" in copy_sql[0]
+        assert copy_sql[0].count("FROM source_db.comp.secd") == 2
+        assert "gvkey = '001234' AND iid = '01'" in copy_sql[0]
+        assert "gvkey = '005678' AND iid = '02'" in copy_sql[0]
+        assert (tmp_path / "comp_secd_parts").is_dir()
+        assert (tmp_path / "comp_secd_parts" / "part-000001.parquet").is_file()
+        assert (tmp_path / "comp_secd_parts" / "part-000002.parquet").is_file()
+        assert len(list((tmp_path / "comp_secd_parts").glob("*.manifest.json"))) == 2
+
+
+class TestReusableRawValidation:
+    """Recovery runs must reject incomplete daily batch datasets."""
+
+    @staticmethod
+    def _write_complete_fixture(tmp_path, monkeypatch):
+        import polars as pl
+
+        import jkp.data.aux_functions as aux
+        from jkp.data.paths import DataPaths
+
+        paths = DataPaths(base_dir=tmp_path)
+        paths.raw_tables_dir.mkdir(parents=True)
+        monkeypatch.setattr(aux, "DAILY_COMPUSTAT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            ("comp.security", "comp.g_security", "comp.secd", "comp.g_secd"),
+        )
+        header = pl.DataFrame({"gvkey": ["001", "002", "003"], "iid": ["01", "01", "02"]})
+        for table in ("comp_security", "comp_g_security"):
+            header.write_parquet(paths.raw_tables_dir / f"{table}.parquet")
+        for table in ("comp_secd", "comp_g_secd"):
+            parts_dir = paths.raw_tables_dir / f"{table}_parts"
+            parts_dir.mkdir()
+            for number in (1, 2):
+                (parts_dir / f"part-{number:06d}.parquet").write_bytes(b"data")
+        (paths.raw_tables_dir / "comp_age_anchor.parquet").write_bytes(b"data")
+        return paths
+
+    def test_complete_daily_parts_are_reusable(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_missing_daily_part_is_rejected(self, tmp_path, monkeypatch):
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        (paths.raw_tables_dir / "comp_secd_parts" / "part-000002.parquet").unlink()
+
+        with pytest.raises(RuntimeError, match="comp.secd has 1 parts; expected 2"):
+            validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_old_raw_cache_without_industry_history_is_rejected(self, tmp_path, monkeypatch):
+        import jkp.data.aux_functions as aux
+
+        assert "comp.industry_history" in aux.REUSABLE_COMPUSTAT_TABLES
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            (*aux.REUSABLE_COMPUSTAT_TABLES, "comp.industry_history"),
+        )
+        with pytest.raises(RuntimeError, match="missing or empty comp_industry_history.parquet"):
+            aux.validate_reusable_raw_data(paths, bypass_crsp=True)

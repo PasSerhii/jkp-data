@@ -1,6 +1,7 @@
 """Tests for the JKP CLI entry point."""
 
 import re
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,6 +9,14 @@ from typer.testing import CliRunner
 
 from jkp.data import __version__
 from jkp.data.cli import app
+from jkp.data.config import (
+    BYPASS_CRSP,
+    DAILY_DOWNLOAD_WORKERS,
+    MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
+    PRODUCTION_OUTPUT,
+    PRODUCTION_OUTPUT_YEARS,
+)
+from jkp.data.database_sources import CompustatSource
 
 runner = CliRunner()
 
@@ -35,7 +44,11 @@ class TestCliHelp:
     def test_build_help(self):
         result = runner.invoke(app, ["build", "--help"])
         assert result.exit_code == 0
-        assert "--persistent-connection" in _strip_ansi(result.output)
+        assert "--persistent-co" in _strip_ansi(result.output)
+        assert "--start-date" in _strip_ansi(result.output)
+        assert "--end-date" in _strip_ansi(result.output)
+        assert "--compustat-sou" in _strip_ansi(result.output)
+        assert "--daily-downloa" in _strip_ansi(result.output)
         assert "OUTPUT_DIR" in _strip_ansi(result.output)
 
     def test_portfolio_help(self):
@@ -83,22 +96,228 @@ class TestBuildCommand:
     def test_build_calls_run_pipeline(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path)])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=False, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_db_update_flag_forwarded(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--db-update"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["db_update"] is True
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path), "--persistent-connection"])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=True, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=True,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection_short(self, mock_run_pipeline, tmp_path):
         result = runner.invoke(app, ["build", str(tmp_path), "-p"])
         assert result.exit_code == 0
-        mock_run_pipeline.assert_called_once_with(persistent_connection=True, output_dir=tmp_path)
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=True,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_bypass_crsp_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--bypass-crsp"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_no_bypass_crsp_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--no-bypass-crsp"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=False,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_no_production_explicit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--no-production"])
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=False,
+            start_date=None,
+            end_date=None,
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_date_filter(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "build",
+                str(tmp_path),
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-12-31",
+            ],
+        )
+        assert result.exit_code == 0
+        mock_run_pipeline.assert_called_once_with(
+            persistent_connection=False,
+            output_dir=tmp_path,
+            bypass_crsp=BYPASS_CRSP,
+            production_output=PRODUCTION_OUTPUT,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            compustat_source=CompustatSource.xpressfeed,
+            metrics_interval_seconds=60.0,
+            reuse_raw=False,
+            daily_download_workers=DAILY_DOWNLOAD_WORKERS,
+            keep_interim=False,
+            full_history=False,
+            production_years=PRODUCTION_OUTPUT_YEARS,
+            db_update=False,
+        )
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_reuses_raw_downloads(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--reuse-raw"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["reuse_raw"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_daily_download_workers(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--daily-download-workers", "4"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["daily_download_workers"] == 4
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_keep_interim(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--keep-interim"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["keep_interim"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_production_years(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--production-years", "5"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["production_years"] == 5
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_production_years_zero_means_full_history(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--production-years", "0"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["production_years"] == 0
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_full_history(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--full-history"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["full_history"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_rejects_daily_download_workers_above_limit(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(
+            app,
+            [
+                "build",
+                str(tmp_path),
+                "--daily-download-workers",
+                str(MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS + 1),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--daily-download-workers" in _strip_ansi(result.output)
+        mock_run_pipeline.assert_not_called()
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_wrds_source(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--compustat-source", "wrds"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["compustat_source"] is CompustatSource.wrds
 
     def test_build_missing_output_dir(self):
         result = runner.invoke(app, ["build"])
+        assert result.exit_code != 0
+
+    def test_build_country_option_is_not_supported(self, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--country", "ISR"])
         assert result.exit_code != 0
 
 
@@ -110,16 +329,30 @@ class TestPortfolioCommand:
     def test_portfolio_calls_run_portfolio(self, mock_run_portfolio, tmp_path):
         result = runner.invoke(app, ["portfolio", str(tmp_path)])
         assert result.exit_code == 0
-        mock_run_portfolio.assert_called_once_with(output_format="parquet", output_dir=tmp_path)
+        mock_run_portfolio.assert_called_once_with(
+            output_format="parquet", output_dir=tmp_path, end_date=None
+        )
 
     @patch("jkp.data.portfolio.run_portfolio")
     def test_portfolio_csv_format(self, mock_run_portfolio, tmp_path):
         result = runner.invoke(app, ["portfolio", str(tmp_path), "--output-format", "csv"])
         assert result.exit_code == 0
-        mock_run_portfolio.assert_called_once_with(output_format="csv", output_dir=tmp_path)
+        mock_run_portfolio.assert_called_once_with(
+            output_format="csv", output_dir=tmp_path, end_date=None
+        )
+
+    @patch("jkp.data.portfolio.run_portfolio")
+    def test_portfolio_end_date(self, mock_run_portfolio, tmp_path):
+        result = runner.invoke(app, ["portfolio", str(tmp_path), "--end-date", "2026-07-31"])
+        assert result.exit_code == 0
+        assert mock_run_portfolio.call_args.kwargs["end_date"] == date(2026, 7, 31)
 
     def test_portfolio_missing_output_dir(self):
         result = runner.invoke(app, ["portfolio"])
+        assert result.exit_code != 0
+
+    def test_portfolio_country_option_is_not_supported(self, tmp_path):
+        result = runner.invoke(app, ["portfolio", str(tmp_path), "--country", "ISR"])
         assert result.exit_code != 0
 
 
@@ -127,13 +360,17 @@ class TestPortfolioCommand:
 class TestConnectCommand:
     """Test the connect command routes to wrds_credentials correctly."""
 
+    @patch("jkp.data.wrds_connection.verify_wrds_connection")
     @patch("jkp.data.wrds_credentials.get_wrds_credentials")
-    def test_connect_shows_username(self, mock_get_creds):
+    def test_connect_shows_username(self, mock_get_creds, mock_verify):
         mock_get_creds.return_value = MagicMock(username="testuser")
         result = runner.invoke(app, ["connect"])
         assert result.exit_code == 0
         assert "testuser" in result.output
-        mock_get_creds.assert_called_once()
+        # The verifier is handed to the resolver rather than called on its result, so
+        # the freshly-prompted path can run it between the prompt and the store.
+        mock_get_creds.assert_called_once_with(verify=mock_verify)
+        mock_verify.assert_not_called()
 
     @patch("jkp.data.wrds_credentials.reset_credentials")
     def test_connect_reset(self, mock_reset):
@@ -147,3 +384,15 @@ class TestConnectCommand:
         result = runner.invoke(app, ["connect", "-r"])
         assert result.exit_code == 0
         mock_reset.assert_called_once_with(full_reset=True)
+
+
+@pytest.mark.unit
+class TestCliAppConfig:
+    """Guard the app-level configuration that hardens credential handling."""
+
+    def test_pretty_exceptions_show_locals_disabled(self) -> None:
+        """Frame locals must never be rendered in tracebacks: a WRDS Credentials
+        object bound in a command frame would otherwise be exposed to Typer's
+        pretty exception handler. This pins the setting so a future refactor of
+        the Typer(...) constructor cannot silently drop it."""
+        assert app.pretty_exceptions_show_locals is False
