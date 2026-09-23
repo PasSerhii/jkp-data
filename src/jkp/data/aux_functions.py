@@ -33,7 +33,11 @@ from .config import (
     MAIN_FILTERS,
     MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS,
 )
-from .industry import build_industry_history_query, fill_missing_sic, resolve_sic_history
+from .industry import (
+    build_industry_history_query,
+    fill_missing_industry_codes,
+    resolve_industry_history,
+)
 from .output_writer import write_dataframe
 from .paths import DataPaths
 from .runtime_monitor import get_active_monitor
@@ -10474,8 +10478,9 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
         1) Load __msf_world, comp_ind, and crsp_ind datasets.
         2) Join compustat and CRSP industry codes on matching keys.
         3) Coalesce SIC/NAICS from both sources.
-        4) Fill remaining missing SIC from dated industry history; preserve NAICS.
-           Save the candidate's source/date in sic_history_fallback.parquet.
+        4) Fill remaining missing SIC/NAICS from the latest dated industry row.
+           Preserve populated codes and save candidate provenance in
+           sic_history_fallback.parquet (now includes NAICS candidates too).
 
     When ``bypass_crsp`` is True there is no CRSP industry file, so SIC/NAICS come
     from Compustat only (no crsp_ind join), mirroring the SAS bypass path
@@ -10507,11 +10512,14 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
             .drop(["sic_crsp", "naics_crsp"])
         )
     history = pl.scan_parquet(paths.raw_tables_dir / "comp_industry_history.parquet")
-    resolved = resolve_sic_history(
-        __msf_world.filter(pl.col("sic").is_null()).select("gvkey", "eom"), history
+    resolved = resolve_industry_history(
+        __msf_world.filter(pl.any_horizontal(pl.col("sic", "naics").is_null())).select(
+            "gvkey", "eom"
+        ),
+        history,
     ).collect()
     resolved.write_parquet(paths.interim_dir / "sic_history_fallback.parquet")
-    fill_missing_sic(__msf_world, resolved.lazy()).collect().write_parquet(
+    fill_missing_industry_codes(__msf_world, resolved.lazy()).collect().write_parquet(
         paths.interim_dir / "__msf_world2.parquet"
     )
 

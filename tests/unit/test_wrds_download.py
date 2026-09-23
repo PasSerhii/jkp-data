@@ -459,7 +459,9 @@ class TestReusableRawValidation:
         assert "comp.industry_history" in aux.REUSABLE_COMPUSTAT_TABLES
         paths = self._write_complete_fixture(tmp_path, monkeypatch)
         monkeypatch.setattr(
-            aux, "REUSABLE_COMPUSTAT_TABLES", (*aux.REUSABLE_COMPUSTAT_TABLES, "comp.industry_history")
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            (*aux.REUSABLE_COMPUSTAT_TABLES, "comp.industry_history"),
         )
         with pytest.raises(RuntimeError, match="missing or empty comp_industry_history.parquet"):
             aux.validate_reusable_raw_data(paths, bypass_crsp=True)

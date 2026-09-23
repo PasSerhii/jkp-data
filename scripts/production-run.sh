@@ -108,8 +108,9 @@ else
 fi
 
 # 2. Credential --------------------------------------------------------------
-# COMPUSTAT is fatal: nothing runs without it. The WRDS pair only gates the
-# Fama-French refresh, which is already allowed to fail without stopping a run.
+# COMPUSTAT is fatal: nothing runs without it. Identifier reconciliation also
+# requires WRDS access (the standard jkp credential resolver is supported).
+# The legacy credential pair below still gates only the Fama-French refresh.
 if [ "$UNATTENDED" = true ]; then
   CRED_SRC="$ENV_FILE"
 else
@@ -254,10 +255,11 @@ else
 fi
 
 # Identifier capture ---------------------------------------------------------
-# Must precede the download. Skipping does not fail the build, but that month's
-# identifier changes are then lost for good: the feed only exposes current values.
+# Must precede the download. The script reconciles dated WRDS history and then
+# captures feed-only values. A failed reconciliation stops the run via set -e;
+# current-only feed values cannot supply exact historical effective dates.
 echo
-echo "== capturing point-in-time identifiers =="
+echo "== reconciling point-in-time identifiers =="
 py "$SQL/capture_sec_ids.py"
 
 if [ "$UNATTENDED" = true ]; then

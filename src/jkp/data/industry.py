@@ -1,4 +1,4 @@
-"""Dated Compustat industry history used only to recover missing SIC codes."""
+"""Dated Compustat industry history used to recover missing SIC/NAICS codes."""
 
 from __future__ import annotations
 
@@ -45,19 +45,20 @@ WHERE h.datadate >= {lower} OR h.datadate = a.anchor_date"""
     return f"WITH history AS MATERIALIZED ({sources})\n{selection}"
 
 
-def resolve_sic_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFrame:
+def resolve_industry_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFrame:
     """Resolve one dated candidate per (gvkey, eom), retaining its provenance.
 
     Latest industry-bearing ROW wins, rather than independently carrying old
     fields through a newer partial classification. At the same date prefer NA
-    over Global, then consolidated over unconsolidated. Conflicting SIC values
-    within that priority are left unresolved. Never use a future observation.
+    over Global, then consolidated over unconsolidated. Conflicting values
+    within that priority are left unresolved per code. Never use a future row.
     """
     history = (
         history.with_columns(
             pl.col("gvkey").cast(pl.String).str.strip_chars().str.pad_start(6, "0"),
             pl.col("datadate").cast(pl.Date),
             pl.col("sich").cast(pl.Int64, strict=False),
+            pl.col("naicsh").cast(pl.String).str.strip_chars(),
             pl.col("popsrc", "consol").cast(pl.String).str.strip_chars(),
         )
         .filter(
@@ -70,14 +71,19 @@ def resolve_sic_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFra
             pl.when(pl.col("sich").is_between(1, 9999))
             .then(pl.col("sich"))
             .otherwise(None)
-            .alias("sic_history")
+            .alias("sic_history"),
+            pl.when(pl.col("naicsh").str.contains(r"^[1-9]\d{1,5}$"))
+            .then(pl.col("naicsh").cast(pl.Int64, strict=False))
+            .otherwise(None)
+            .alias("naics_history"),
         )
         .group_by("gvkey", "datadate", "popsrc", "consol")
         .agg(
-            pl.when(pl.col("sic_history").n_unique() == 1)
-            .then(pl.col("sic_history").first())
+            pl.when(pl.col(code).n_unique() == 1)
+            .then(pl.col(code).first())
             .otherwise(None)
-            .alias("sic_history")
+            .alias(code)
+            for code in ("sic_history", "naics_history")
         )
         .with_columns((pl.col("consol") != "C").fill_null(True).alias("_not_consolidated"))
         .sort("gvkey", "datadate", "popsrc", "_not_consolidated", "consol", nulls_last=True)
@@ -100,16 +106,38 @@ def resolve_sic_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFra
     )
 
 
-def fill_missing_sic(data: pl.LazyFrame, resolved: pl.LazyFrame) -> pl.LazyFrame:
-    """Fill only null SIC; preserve all rows, their order and every other column."""
+def resolve_sic_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFrame:
+    """SIC-only projection for callers that do not request NAICS recovery."""
+    return resolve_industry_history(keys, history).drop("naics_history")
+
+
+def _fill_missing_codes(
+    data: pl.LazyFrame, resolved: pl.LazyFrame, codes: tuple[str, ...]
+) -> pl.LazyFrame:
+    schema = data.collect_schema()
     return (
         data.join(
-            resolved.select("gvkey", "eom", "sic_history"),
+            resolved.select("gvkey", "eom", *[f"{code}_history" for code in codes]),
             on=["gvkey", "eom"],
             how="left",
             validate="m:1",
             maintain_order="left",
         )
-        .with_columns(pl.coalesce("sic", "sic_history").cast(pl.Int64).alias("sic"))
-        .drop("sic_history")
+        .with_columns(
+            pl.coalesce(code, f"{code}_history")
+            .cast(pl.Int64 if schema[code] == pl.Null else schema[code])
+            .alias(code)
+            for code in codes
+        )
+        .drop([f"{code}_history" for code in codes])
     )
+
+
+def fill_missing_sic(data: pl.LazyFrame, resolved: pl.LazyFrame) -> pl.LazyFrame:
+    """Fill only null SIC; preserve all rows, their order and every other column."""
+    return _fill_missing_codes(data, resolved, ("sic",))
+
+
+def fill_missing_industry_codes(data: pl.LazyFrame, resolved: pl.LazyFrame) -> pl.LazyFrame:
+    """Fill only null SIC/NAICS after the existing Compustat/CRSP selections."""
+    return _fill_missing_codes(data, resolved, ("sic", "naics"))

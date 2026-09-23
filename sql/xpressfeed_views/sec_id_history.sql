@@ -8,11 +8,12 @@
 -- identifier on months that closed long before it happened.
 --
 -- This table closes that gap with two sources:
---   * `wrds` rows, seeded once from the `comp.sec_idhist` snapshot copied from
---     WRDS. This is the historical backfill and is never modified afterwards.
---   * `feed` rows, appended by capture_sec_ids.py on each monthly run by
---     diffing `public.sec_idcurrent` against the open interval. From the first
---     capture onward the history maintains itself with no WRDS dependency.
+--   * `wrds` rows, reconciled from live comp.sec_idhist on each capture run,
+--     including corrected effective dates and deleted/reassigned intervals.
+--   * `feed` rows, observations of identifiers not yet dated by WRDS. Their
+--     start date is a capture date, not an exact vendor effective date. Exact
+--     WRDS history supersedes these approximations when available.
+-- capture_sec_ids.py stages/validates the result and publishes atomically.
 --
 -- `effthru = 2900-01-01` marks an open interval, matching the sentinel used by
 -- sec_idhist and sec_history.

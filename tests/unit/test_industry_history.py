@@ -1,4 +1,4 @@
-"""Missing SIC recovery must not rewrite other values or leak future codes."""
+"""Missing industry recovery must not rewrite populated values or leak future codes."""
 
 from datetime import date
 
@@ -8,7 +8,13 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from jkp.data.aux_functions import ff_ind_class, merge_industry_to_world_msf
-from jkp.data.industry import build_industry_history_query, fill_missing_sic, resolve_sic_history
+from jkp.data.industry import (
+    build_industry_history_query,
+    fill_missing_industry_codes,
+    fill_missing_sic,
+    resolve_industry_history,
+    resolve_sic_history,
+)
 
 
 def history_frame(rows):
@@ -170,7 +176,73 @@ def test_pipeline_merge_and_ff49_keep_existing_source_precedence(test_paths, byp
     ff_ind_class(paths, paths.interim_dir / "__msf_world2.parquet")
     result = pl.read_parquet(paths.interim_dir / "__msf_world3.parquet").sort("id")
     assert result["sic"].to_list() == [4813, 7372, 4813 if bypass_crsp else 6020]
-    assert result["naics"].to_list() == [None, 511210, None if bypass_crsp else 522110]
+    assert result["naics"].to_list() == [517, 511210, 517 if bypass_crsp else 522110]
     assert result["ff49"].to_list() == [32, 36, 32 if bypass_crsp else 45]
     assert_frame_equal(result.select(world.columns), world, check_exact=True)
     assert pl.read_parquet(paths.interim_dir / "sic_history_fallback.parquet")["datadate"].to_list()
+
+
+def test_naics_latest_partial_update_blocks_older_code_and_never_uses_future():
+    history = history_frame(
+        [
+            ("001000", date(2014, 12, 31), 6799, "523999", "D", "C"),
+            ("001000", date(2025, 12, 31), 6799, None, "D", "C"),
+            ("001000", date(2026, 9, 1), 7011, "721110", "D", "C"),
+            ("002000", date(2002, 1, 1), 1000, "2122", "I", "N"),
+        ]
+    )
+    data = pl.DataFrame(
+        {
+            "gvkey": ["001000", "001000", "002000"],
+            "eom": [date(2024, 8, 31), date(2026, 8, 31), date(2026, 8, 31)],
+            "sic": [6799, 6799, None],
+            "naics": [None, None, None],
+        }
+    )
+    out = fill_missing_industry_codes(
+        data.lazy(), resolve_industry_history(data.lazy(), history.lazy())
+    ).collect()
+    assert out["naics"].to_list() == [523999, None, 2122]
+    assert out["sic"].to_list() == [6799, 6799, 1000]
+
+
+def test_naics_conflicts_and_invalid_codes_do_not_invalidate_unambiguous_sic():
+    stamp = date(2000, 1, 1)
+    history = history_frame(
+        [
+            ("001000", stamp, 4813, "517", "D", "C"),
+            ("001000", stamp, 4813, "518", "D", "C"),
+            ("002000", stamp, 4813, "523999.5", "D", "C"),
+            ("003000", stamp, 4813, "522", "D", "C"),
+            ("003000", stamp, 4813, None, "D", "C"),
+            ("004000", stamp, 4813, "00", "D", "C"),
+        ]
+    )
+    keys = pl.DataFrame(
+        {"gvkey": ["001000", "002000", "003000", "004000"], "eom": [date(2026, 8, 31)] * 4}
+    )
+    out = resolve_industry_history(keys.lazy(), history.lazy()).collect().sort("gvkey")
+    assert out["naics_history"].to_list() == [None, None, None, None]
+    assert out["sic_history"].to_list() == [4813, 4813, 4813, 4813]
+
+
+def test_naics_fill_preserves_populated_values_row_order_types_and_other_fields():
+    data = pl.DataFrame(
+        {
+            "id": [4, 1, 9],
+            "gvkey": ["001000"] * 3,
+            "eom": [date(2026, 8, 31)] * 3,
+            "sic": [7372] * 3,
+            "naics": [None, 511210, None],
+            "ret": [0.1, None, -0.2],
+        },
+        schema_overrides={"naics": pl.Int32},
+    )
+    history = history_frame([("001000", date(2000, 1, 1), 4813, "517", "D", "C")])
+    resolved = resolve_industry_history(data.lazy(), history.lazy())
+    out = fill_missing_industry_codes(data.lazy(), resolved).collect()
+    assert out["naics"].to_list() == [517, 511210, 517]
+    assert out.schema["naics"] == pl.Int32
+    assert_frame_equal(data.drop("naics"), out.drop("naics"), check_exact=True)
+    with pytest.raises(pl.exceptions.ComputeError, match="m:1"):
+        fill_missing_industry_codes(data.lazy(), pl.concat([resolved, resolved])).collect()

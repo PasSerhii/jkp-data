@@ -1,134 +1,136 @@
-"""Accumulate point-in-time security identifiers from the XpressFeed feed.
+"""Reconcile dated WRDS identifier history, then capture feed-only identifiers.
 
-Run once per monthly build, before the pipeline downloads its raw tables:
+Run before each monthly download. Requires WRDS access: the native feed has no
+identifier effective dates. Failure leaves the existing history intact and
+stops the build rather than treating capture dates as exact vendor dates.
+Only comp.sec_id_history is updated; no Fama-French tables are read or refreshed.
 
-    uv run --with "psycopg[binary]" python sql/xpressfeed_views/capture_sec_ids.py
-
-On first run the table is seeded from the `comp.sec_idhist` snapshot copied from
-WRDS, which supplies the historical backfill. Every run then diffs
-`public.sec_idcurrent` against the open intervals and records changes, so the
-history maintains itself from the native feed with no further WRDS dependency.
-
-Idempotent: re-running on the same day is a no-op, because a value that already
-matches its open interval produces no change.
-
-Known limitation: capture granularity is the run cadence. A value that changes
-mid-month is detected at the next capture, so `efffrom` is the capture date
-rather than the true change date, and the intervening days keep the previous
-value. That is the conservative direction — it reports what was known, never a
-future identifier — but it is not exact, and the seeded `wrds` rows remain the
-only source of exact intervals before the first capture.
+Use --dry-run to validate the staged result without publishing it. Existing
+ENV_USERNAME/ENV_PASSWORD credentials are supported, as are jkp's standard
+WRDS credentials. The old comp.sec_idhist seed is no longer used.
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import date, timedelta
+from datetime import date
 
+import polars as pl
 import psycopg
 from gen_views import load_env
+from psycopg import sql
 
-ITEMS = ("CUSIP", "ISIN", "SEDOL", "TIC")
-OPEN_SENTINEL = date(2900, 1, 1)
+from jkp.data.identifier_history import HISTORY_SCHEMA, ITEMS, reconcile_identifier_history
+from jkp.data.wrds_connection import gen_wrds_connection_info
+from jkp.data.wrds_credentials import get_wrds_credentials
 
 
-def _seed_from_wrds_snapshot(cur: psycopg.Cursor) -> int:
-    """Load the historical backfill once; later runs leave these rows alone."""
-    cur.execute("SELECT count(*) FROM comp.sec_id_history WHERE source = 'wrds'")
-    if cur.fetchone()[0]:
-        return 0
+def read_authoritative_history(env: dict[str, str]) -> pl.DataFrame:
+    """Read one complete, current WRDS snapshot before opening a write transaction."""
+    if env.get("ENV_USERNAME") and env.get("ENV_PASSWORD"):
+        username, password = env["ENV_USERNAME"], env["ENV_PASSWORD"]
+    else:
+        credentials = get_wrds_credentials()
+        username, password = credentials.username, credentials.password
+    dsn = gen_wrds_connection_info(username, password)
+    with psycopg.connect(dsn, connect_timeout=30) as conn, conn.cursor() as cur:
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        cur.execute("SET LOCAL statement_timeout = '300s'")
+        cur.execute(
+            """SELECT gvkey, iid, item, itemvalue, efffrom, effthru
+                 FROM comp.sec_idhist WHERE item = ANY(%s)""",
+            (list(ITEMS),),
+        )
+        schema = {k: v for k, v in HISTORY_SCHEMA.items() if k != "source"}
+        return pl.DataFrame(cur.fetchall(), schema=schema, orient="row")
+
+
+def stage_history(cur: psycopg.Cursor, history: pl.DataFrame) -> None:
+    """Check database types/constraints before changing any persistent rows."""
     cur.execute(
-        """INSERT INTO comp.sec_id_history
-               (gvkey, iid, item, itemvalue, efffrom, effthru, source)
-           SELECT gvkey, iid, item, itemvalue, efffrom,
-                  COALESCE(effthru, DATE '2900-01-01'), 'wrds'
-             FROM comp.sec_idhist
-            WHERE item = ANY(%s)
-              AND itemvalue IS NOT NULL
-              AND btrim(itemvalue) <> ''
-              AND efffrom IS NOT NULL
-              AND COALESCE(effthru, DATE '2900-01-01') >= efffrom""",
-        (list(ITEMS),),
+        """CREATE TEMP TABLE identifier_history_stage
+           (LIKE comp.sec_id_history INCLUDING ALL) ON COMMIT DROP"""
     )
-    return cur.rowcount
+    with cur.copy(
+        "COPY identifier_history_stage (gvkey,iid,item,itemvalue,efffrom,effthru,source) FROM STDIN"
+    ) as copy:
+        for row in history.select(list(HISTORY_SCHEMA)).iter_rows():
+            copy.write_row(row)
+    cur.execute("ANALYZE identifier_history_stage")
 
 
-def _capture(cur: psycopg.Cursor, captured_on: date) -> tuple[int, int]:
-    """Close intervals whose value changed and open one for the new value."""
+def publish_history(cur: psycopg.Cursor) -> tuple[int, int]:
+    """Apply only changed rows; the caller owns the lock and transaction."""
+    columns = sql.SQL(", ").join(map(sql.Identifier, HISTORY_SCHEMA))
+    same_row = sql.SQL(" AND ").join(
+        sql.SQL("h.{0} = s.{0}").format(sql.Identifier(c)) for c in HISTORY_SCHEMA
+    )
     cur.execute(
-        """CREATE TEMP TABLE current_ids ON COMMIT DROP AS
-           SELECT btrim(gvkey) AS gvkey, btrim(iid) AS iid, item,
-                  btrim(itemvalue) AS itemvalue
-             FROM public.sec_idcurrent
-            WHERE item = ANY(%s)
-              AND itemvalue IS NOT NULL
-              AND btrim(itemvalue) <> ''""",
-        (list(ITEMS),),
+        sql.SQL("""DELETE FROM comp.sec_id_history h
+                   WHERE NOT EXISTS (SELECT 1 FROM identifier_history_stage s WHERE {})""").format(
+            same_row
+        )
     )
-    cur.execute("CREATE INDEX ON current_ids (gvkey, iid, item)")
-
-    # An issue-item is "changed" when the feed disagrees with its open interval,
-    # and "new" when it has no open interval at all. Both need a fresh interval;
-    # only the former needs the previous one closed.
+    removed = cur.rowcount
     cur.execute(
-        """CREATE TEMP TABLE changed ON COMMIT DROP AS
-           SELECT c.gvkey, c.iid, c.item, c.itemvalue
-             FROM current_ids c
-             LEFT JOIN comp.sec_id_history h
-                    ON h.gvkey = c.gvkey AND h.iid = c.iid AND h.item = c.item
-                   AND h.effthru = DATE '2900-01-01'
-            WHERE h.gvkey IS NULL OR h.itemvalue IS DISTINCT FROM c.itemvalue"""
+        sql.SQL("""INSERT INTO comp.sec_id_history ({0})
+                   SELECT {0} FROM identifier_history_stage
+                   EXCEPT SELECT {0} FROM comp.sec_id_history""").format(columns)
     )
-
-    # Guard against a capture dated on or before an interval's start, which
-    # would otherwise create effthru < efffrom and trip the range check.
+    inserted = cur.rowcount
     cur.execute(
-        """UPDATE comp.sec_id_history h
-              SET effthru = GREATEST(%s::date, h.efffrom)
-             FROM changed ch
-            WHERE h.gvkey = ch.gvkey AND h.iid = ch.iid AND h.item = ch.item
-              AND h.effthru = DATE '2900-01-01'""",
-        (captured_on - timedelta(days=1),),
+        """SELECT (SELECT count(*) FROM comp.sec_id_history)
+                  = (SELECT count(*) FROM identifier_history_stage)"""
     )
-    closed = cur.rowcount
-
-    cur.execute(
-        """INSERT INTO comp.sec_id_history
-               (gvkey, iid, item, itemvalue, efffrom, effthru, source)
-           SELECT gvkey, iid, item, itemvalue, %s, DATE '2900-01-01', 'feed'
-             FROM changed""",
-        (captured_on,),
-    )
-    return closed, cur.rowcount
+    if not cur.fetchone()[0]:
+        raise RuntimeError("Identifier history row-count verification failed")
+    return removed, inserted
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--captured-on",
-        type=date.fromisoformat,
-        default=date.today(),
-        help="Capture date recorded as efffrom for new intervals (default: today).",
-    )
+    parser.add_argument("--captured-on", type=date.fromisoformat, default=date.today())
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-
-    dsn = load_env()["COMPUSTAT"].replace("postgresql+psycopg2://", "postgresql://")
-    with psycopg.connect(dsn, connect_timeout=30) as conn, conn.cursor() as cur:
-        cur.execute("SET statement_timeout = '900s'")
-        seeded = _seed_from_wrds_snapshot(cur)
-        closed, opened = _capture(cur, args.captured_on)
-        cur.execute(
-            "SELECT count(*), count(*) FILTER (WHERE source = 'feed') FROM comp.sec_id_history"
-        )
-        total, from_feed = cur.fetchone()
-        conn.commit()
-
-    if seeded:
-        print(f"seeded {seeded:,} historical rows from the WRDS sec_idhist snapshot")
-    print(
-        f"capture {args.captured_on}: closed {closed:,} intervals, opened {opened:,}; "
-        f"table holds {total:,} rows ({from_feed:,} accumulated from the feed)"
-    )
+    env = load_env()
+    try:
+        authoritative = read_authoritative_history(env)
+        dsn = env["COMPUSTAT"].replace("postgresql+psycopg2://", "postgresql://")
+        with psycopg.connect(dsn, connect_timeout=30) as conn, conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '900s'")
+            # Serialize captures/reconciliations while retaining concurrent readers.
+            cur.execute("LOCK TABLE comp.sec_id_history IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(
+                "SELECT gvkey,iid,item,itemvalue,efffrom,effthru,source FROM comp.sec_id_history"
+            )
+            previous = pl.DataFrame(cur.fetchall(), schema=HISTORY_SCHEMA, orient="row")
+            cur.execute(
+                """SELECT gvkey,iid,item,itemvalue FROM public.sec_idcurrent
+                   WHERE item = ANY(%s)""",
+                (list(ITEMS),),
+            )
+            current = pl.DataFrame(
+                cur.fetchall(),
+                schema=dict.fromkeys(list(HISTORY_SCHEMA)[:4], pl.String),
+                orient="row",
+            )
+            history = reconcile_identifier_history(
+                authoritative, previous, current, args.captured_on
+            )
+            stage_history(cur, history)
+            if args.dry_run:
+                conn.rollback()
+                print(f"Dry run: validated {history.height:,} reconciled identifier intervals")
+            else:
+                removed, inserted = publish_history(cur)
+                conn.commit()
+                print(
+                    f"Identifiers reconciled: replaced {removed:,} rows, inserted {inserted:,} rows"
+                )
+    except psycopg.Error:
+        raise SystemExit(
+            "Identifier reconciliation failed; no changes committed; credentials omitted"
+        ) from None
 
 
 if __name__ == "__main__":

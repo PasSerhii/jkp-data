@@ -205,8 +205,8 @@ def _identifier_history(paths: DataPaths) -> pl.LazyFrame | None:
     """Point-in-time identifier intervals, or None when unavailable.
 
     ``comp.sec_id_history`` is maintained by sql/xpressfeed_views/capture_sec_ids.py:
-    a one-time backfill from WRDS plus a monthly diff of the feed's current
-    identifiers. Returns None when the table has not been downloaded, so a run
+    reconciled WRDS effective dates plus observations of feed-only identifiers.
+    Returns None when the table has not been downloaded, so a run
     against an older raw set still produces output rather than failing.
     """
     source = paths.raw_table_source("comp.sec_id_history")
