@@ -64,6 +64,10 @@ WORKERS="${WORKERS:-}"
 # Pin it only to reproduce an older run; a window shorter than 240 months nulls
 # the seasonality characteristics.
 START_DATE="${START_DATE:-}"
+# Full source history and full CSV history are separate CLI options. Both are
+# needed when rebuilding the downstream history rather than a monthly update.
+FULL_HISTORY="${FULL_HISTORY:-0}"
+PRODUCTION_YEARS="${PRODUCTION_YEARS:-}"
 # Last month end, computed rather than pinned. This was hardcoded to a literal
 # date, which is silent and wrong the moment the month rolls over: the run
 # succeeds, uploads, and delivers the previous month again. It matches the target
@@ -87,8 +91,20 @@ KEEP_INTERIM="${KEEP_INTERIM:-1}"
 # RESEARCH_UPDATE URL in the credential parameter (currently research_test).
 # The URL must name "ODBC Driver 18 for SQL Server" -- that is the driver baked
 # into the image. Ignored by images that predate --db-update; the host probes
-# for it before starting. 0 skips the upload.
-DB_UPDATE="${DB_UPDATE:-1}"
+# for it before starting. 0 skips the upload. A full-history build defaults to
+# no incremental upload; use DB_REPLACE to load it.
+if [ "$FULL_HISTORY" = "1" ]; then
+  DB_UPDATE="${DB_UPDATE:-0}"
+else
+  DB_UPDATE="${DB_UPDATE:-1}"
+fi
+# 1 passes --db-replace instead of --db-update: the eight research tables in the
+# same RESEARCH_UPDATE database are emptied and reloaded from the CSVs, keeping
+# their definitions. Needs PRODUCTION_YEARS=0 (the pipeline refuses it otherwise)
+# and a target database in SIMPLE recovery.
+DB_REPLACE="${DB_REPLACE:-0}"
+# Either upload needs a driver-18 RESEARCH_UPDATE URL on the host.
+if [ "$DB_UPDATE" = "1" ] || [ "$DB_REPLACE" = "1" ]; then DB_UPLOAD=1; else DB_UPLOAD=0; fi
 # Point at an existing SSM SecureString (see scripts/put-production-credentials.sh)
 # instead of staging one from .env. The host then keeps the parameter rather than
 # deleting it, which is what lets a scheduled run start with no human and no .env
@@ -98,6 +114,21 @@ CREDENTIAL_PARAM="${CREDENTIAL_PARAM:-}"
 # the readiness poll, the FF refresh and the identifier capture. 0 assumes a human
 # already did those on their own machine, which is what production-run.sh does.
 UNATTENDED="${UNATTENDED:-0}"
+
+# Validate before any AWS call, so an invalid history request cannot launch a
+# paid host. Leave an unspecified CSV window to the image's configured default.
+case "$FULL_HISTORY" in
+  0|1) ;;
+  *) echo "FULL_HISTORY must be 0 or 1." >&2; exit 1 ;;
+esac
+if [ "$FULL_HISTORY" = "1" ] && [ -n "$START_DATE" ]; then
+  echo "FULL_HISTORY=1 cannot be combined with START_DATE; unset START_DATE." >&2
+  exit 1
+fi
+case "$PRODUCTION_YEARS" in
+  "") ;;
+  *[!0-9]*) echo "PRODUCTION_YEARS must be a non-negative integer (0 exports all years)." >&2; exit 1 ;;
+esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -118,25 +149,25 @@ if [ -n "$CREDENTIAL_PARAM" ]; then
   # check locally and a twenty-minute boot-and-die remotely.
   aws ssm get-parameter --region "$REGION" --name "$CREDENTIAL_PARAM" >/dev/null \
     || { echo "CREDENTIAL_PARAM $CREDENTIAL_PARAM not found in SSM; run scripts/put-production-credentials.sh" >&2; exit 1; }
-  if [ "$DB_UPDATE" = "1" ]; then
+  if [ "$DB_UPLOAD" = "1" ]; then
     # The upload runs last, hours in; a wrong driver name would waste the whole
     # run. The image ships only "ODBC Driver 18 for SQL Server". Grep, never
     # print: the value is a SecureString for a reason.
     aws ssm get-parameter --region "$REGION" --name "$CREDENTIAL_PARAM" --with-decryption \
       --query Parameter.Value --output text \
       | grep -q '^RESEARCH_UPDATE=.*ODBC+Driver+18+for+SQL+Server' \
-      || { echo "DB_UPDATE=1 but $CREDENTIAL_PARAM carries no RESEARCH_UPDATE naming ODBC Driver 18 (the image's driver). Re-seed with scripts/put-production-credentials.sh, or set DB_UPDATE=0." >&2; exit 1; }
+      || { echo "DB_UPDATE/DB_REPLACE set but $CREDENTIAL_PARAM carries no RESEARCH_UPDATE naming ODBC Driver 18 (the image's driver). Re-seed with scripts/put-production-credentials.sh, or set DB_UPDATE=0 DB_REPLACE=0." >&2; exit 1; }
   fi
 else
   grep -q '^COMPUSTAT=' "$REPO/.env" || { echo "No COMPUSTAT= line in $REPO/.env" >&2; exit 1; }
-  if [ "$DB_UPDATE" = "1" ]; then
+  if [ "$DB_UPLOAD" = "1" ]; then
     # Environment wins over the file, as everywhere in this repo. A workstation
     # .env usually names driver 17 (the Windows install); the container has 18.
     RESEARCH_UPDATE_VALUE="${RESEARCH_UPDATE:-$(grep '^RESEARCH_UPDATE=' "$REPO/.env" | cut -d= -f2- || true)}"
     case "$RESEARCH_UPDATE_VALUE" in
       *ODBC+Driver+18+for+SQL+Server*) ;;
-      "") echo "DB_UPDATE=1 but RESEARCH_UPDATE is not set (environment or .env). Set it or pass DB_UPDATE=0." >&2; exit 1 ;;
-      *) echo "DB_UPDATE=1 but RESEARCH_UPDATE does not name 'ODBC+Driver+18+for+SQL+Server' -- the only driver in the image. Export the driver-18 form (see scripts/put-production-credentials.sh) or pass DB_UPDATE=0." >&2; exit 1 ;;
+      "") echo "DB_UPDATE/DB_REPLACE set but RESEARCH_UPDATE is not set (environment or .env). Set it or pass DB_UPDATE=0 DB_REPLACE=0." >&2; exit 1 ;;
+      *) echo "DB_UPDATE/DB_REPLACE set but RESEARCH_UPDATE does not name 'ODBC+Driver+18+for+SQL+Server' -- the only driver in the image. Export the driver-18 form (see scripts/put-production-credentials.sh) or pass DB_UPDATE=0 DB_REPLACE=0." >&2; exit 1 ;;
     esac
   fi
 fi
@@ -222,7 +253,7 @@ trap cleanup EXIT
 if [ "$PARAM_EPHEMERAL" = "1" ]; then
   TMP="$(mktemp)"
   grep '^COMPUSTAT=' "$REPO/.env" > "$TMP"
-  if [ "$DB_UPDATE" = "1" ]; then
+  if [ "$DB_UPLOAD" = "1" ]; then
     printf 'RESEARCH_UPDATE=%s\n' "$RESEARCH_UPDATE_VALUE" >> "$TMP"
   fi
   aws ssm put-parameter --region "$REGION" --name "$PARAM" --type SecureString \
@@ -238,7 +269,9 @@ USER_DATA="$(mktemp)"
 sed -e "s|@@REGION@@|$REGION|g" -e "s|@@BUCKET@@|$BUCKET|g" -e "s|@@TOPIC@@|$TOPIC|g" \
     -e "s|@@IMAGE@@|$IMAGE|g" -e "s|@@RUN_TAG@@|$RUN_TAG|g" -e "s|@@COUNTRIES@@|$COUNTRIES|g" \
     -e "s|@@START_DATE@@|$START_DATE|g" -e "s|@@END_DATE@@|$END_DATE|g" -e "s|@@WORKERS@@|$WORKERS|g" \
+    -e "s|@@FULL_HISTORY@@|$FULL_HISTORY|g" -e "s|@@PRODUCTION_YEARS@@|$PRODUCTION_YEARS|g" \
     -e "s|@@KEEP_INTERIM@@|$KEEP_INTERIM|g" -e "s|@@DB_UPDATE@@|$DB_UPDATE|g" -e "s|@@PARAM@@|$PARAM|g" \
+    -e "s|@@DB_REPLACE@@|$DB_REPLACE|g" \
     -e "s|@@MARKET@@|$MARKET|g" -e "s|@@PARAM_EPHEMERAL@@|$PARAM_EPHEMERAL|g" \
     -e "s|@@UNATTENDED@@|$UNATTENDED|g" \
     "$HERE/user-data.sh" | tr -d '\r' > "$USER_DATA"
@@ -267,7 +300,9 @@ cat <<EOF
 
 Launched. Instance: $INSTANCE   Artifacts: s3://$BUCKET/$RUN_TAG/
 Instance type: $INSTANCE_TYPE ($MARKET)   Workers: ${WORKERS:-config default}
-Keep interim: $KEEP_INTERIM   DB update: $DB_UPDATE   Countries to S3: ${COUNTRIES:-all (~95 GiB)}
+Full source history: $FULL_HISTORY   Start date: ${START_DATE:-image default}   End date: $END_DATE
+Production CSV years: ${PRODUCTION_YEARS:-image default} (0 means all history)
+Keep interim: $KEEP_INTERIM   DB update: $DB_UPDATE   DB replace: $DB_REPLACE   Countries to S3: ${COUNTRIES:-all}
 Credential: $PARAM $([ "$PARAM_EPHEMERAL" = 1 ] && echo "(per-run, host deletes it)" || echo "(persistent, host keeps it)")
 Unattended prep on host: $([ "$UNATTENDED" = 1 ] && echo "yes (readiness poll, FF refresh, identifier capture)" || echo "no")
 

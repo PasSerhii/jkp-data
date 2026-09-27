@@ -314,6 +314,26 @@ emits everything for a re-seed. This bounds the *output* only: characteristics
 are computed over the full source window either way, so the retained rows are
 identical. The six cross-country files keep full history.
 
+For a complete Python-history rebuild on EC2, the launcher accepts
+`FULL_HISTORY=1 PRODUCTION_YEARS=0`. Leave `START_DATE` unset: the full-history
+option uses the configured source floor (1949-12-31), the same floor as
+upstream's unbounded build. Pin `END_DATE` to the required month end and leave
+`COUNTRIES` empty to upload every country. Memory is tight on the default
+r7i.16xlarge (496 GiB usable): 23-year builds peak at 314–378 GiB in
+`prepare_comp_sf`, and full history carries roughly 30% more daily rows. The
+first full-history run's `run_logs/resource_metrics.csv` gives the real peak.
+
+To reload the research tables from that build, add `DB_REPLACE=1`
+(`jkp build --db-replace`, in place of `--db-update`; same `RESEARCH_UPDATE`
+target). After the outputs are written, each of the eight tables is emptied
+with `TRUNCATE`, which keeps its column types, key and indexes, and reloaded
+from the CSVs. The upload refuses to start while the database is in FULL
+recovery, which would keep the whole reload in the transaction log on the
+volume shared with `research`; set it once with `ALTER DATABASE [research_test]
+SET RECOVERY SIMPLE`. The tables are empty or partial while it runs, and a
+failure stops it: rerun to start over. Dropping the nonclustered indexes
+beforehand makes the daily reload much faster.
+
 After the completion email:
 
 ```bash

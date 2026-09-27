@@ -17,8 +17,11 @@ RUN_PREFIX="s3://$BUCKET/@@RUN_TAG@@"
 COUNTRIES="@@COUNTRIES@@"
 WORKERS="@@WORKERS@@"
 START_DATE="@@START_DATE@@"
+FULL_HISTORY="@@FULL_HISTORY@@"
+PRODUCTION_YEARS="@@PRODUCTION_YEARS@@"
 KEEP_INTERIM="@@KEEP_INTERIM@@"
 DB_UPDATE="@@DB_UPDATE@@"
+DB_REPLACE="@@DB_REPLACE@@"
 PARAM="@@PARAM@@"
 PARAM_EPHEMERAL="@@PARAM_EPHEMERAL@@"
 MARKET="@@MARKET@@"
@@ -192,6 +195,23 @@ if [ "$DB_UPDATE" = "1" ]; then
 The production CSVs are still written and uploaded to S3 as before."
   fi
 fi
+# A replace takes the place of the incremental upload. No probe: an image
+# without --db-replace rejects the option at start-up, before any download.
+if [ "$DB_REPLACE" = "1" ]; then
+  DB_FLAG="--db-replace"
+fi
+
+# Do not silently fall back to the rolling source/export windows. An older
+# image will fail on these explicit CLI options before downloading data.
+HISTORY_ARGS=()
+if [ "$FULL_HISTORY" = "1" ]; then
+  HISTORY_ARGS+=(--full-history)
+elif [ -n "$START_DATE" ]; then
+  HISTORY_ARGS+=(--start-date "$START_DATE")
+fi
+if [ -n "$PRODUCTION_YEARS" ]; then
+  HISTORY_ARGS+=(--production-years "$PRODUCTION_YEARS")
+fi
 
 START_EPOCH=$(date -u +%s)
 date -u -d "@$START_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" > /mnt/jkp-data/STARTED_AT
@@ -206,7 +226,7 @@ docker run --name jkp-run \
   --compustat-source xpressfeed \
   --bypass-crsp \
   --persistent-connection \
-  ${START_DATE:+--start-date $START_DATE} \
+  "${HISTORY_ARGS[@]}" \
   --end-date @@END_DATE@@ \
   --production \
   ${WORKERS:+--daily-download-workers $WORKERS} \

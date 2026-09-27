@@ -92,7 +92,7 @@ jobs:
           docker pull "$IMAGE"
           docker run --rm "$IMAGE" --version
           HELP="$(docker run --rm "$IMAGE" build --help)"
-          for flag in --keep-interim --full-history --production-years --daily-download-workers; do
+          for flag in --keep-interim --full-history --production-years --daily-download-workers --db-replace; do
             # Rich wraps and truncates long option names in the help panel, so match
             # a prefix rather than the whole flag.
             printf '%s' "$HELP" | grep -q -- "${flag:0:14}" \
