@@ -1,13 +1,15 @@
-"""Tests for the incremental research-database upload (dataupdate module)."""
+"""Tests for the research-database upload (dataupdate module)."""
 
 from __future__ import annotations
 
 import re
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import polars as pl
+import pyodbc
 import pytest
 
 from jkp.data.database_sources import get_research_update_connection_info
@@ -19,11 +21,13 @@ from jkp.data.dataupdate import (
     STANDALONE_TABLE_SPECS,
     DataUpdateError,
     _insert_rows,
+    _replace_table,
     _update_characteristics_production,
     _update_daily_returns_production,
     _update_return_cutoffs_daily,
     _update_standalone_table,
     _validate_identifier,
+    replace_research_db,
     update_research_db,
 )
 
@@ -38,10 +42,11 @@ FAKE_URL = "mssql+pyodbc://user:secret_password@dbhost.test/research_test?driver
 
 
 class _FakeResult:
-    def __init__(self, *, rows=None, scalar=None, first=None, rowcount=0):
+    def __init__(self, *, rows=None, scalar=None, first=None, one=None, rowcount=0):
         self._rows = rows or []
         self._scalar = scalar
         self._first = first
+        self._one = one
         self.rowcount = rowcount
 
     def fetchall(self):
@@ -53,13 +58,39 @@ class _FakeResult:
     def first(self):
         return self._first
 
+    def one(self):
+        return self._one
+
 
 _TABLE_IN_SQL = re.compile(r"\bdbo\.(\w+)")
+
+
+class FakeCursor:
+    """pyodbc cursor stand-in: records the declared sizes and the inserted rows."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.fast_executemany = False
+
+    def setinputsizes(self, sizes):
+        self.engine.input_sizes.append(sizes)
+
+    def executemany(self, sql, rows):
+        table = _TABLE_IN_SQL.search(sql).group(1)
+        if table in self.engine.fail_insert_tables:
+            raise RuntimeError(f"simulated insert failure on {table}")
+        assert self.fast_executemany
+        columns = re.findall(r"\[(\w+)\]", sql.split(" VALUES ")[0])
+        self.engine.inserts.append((sql, [dict(zip(columns, row, strict=True)) for row in rows]))
+
+    def close(self):
+        pass
 
 
 class FakeConnection:
     def __init__(self, engine):
         self.engine = engine
+        self.connection = SimpleNamespace(cursor=lambda: FakeCursor(engine))
 
     def execute(self, statement, parameters=None):
         sql = str(statement)
@@ -68,6 +99,8 @@ class FakeConnection:
         if "INFORMATION_SCHEMA" in sql:
             rows = list(self.engine.columns.get(parameters["table"], {}).items())
             return _FakeResult(rows=rows)
+        if "sys.databases" in sql:
+            return _FakeResult(one=self.engine.database)
         if "MAX([month])" in sql:
             return _FakeResult(first=self.engine.period_row)
         if "SELECT MAX(" in sql:
@@ -79,10 +112,8 @@ class FakeConnection:
         if sql.startswith("DELETE"):
             self.engine.deletes.append((sql, parameters))
             return _FakeResult(rowcount=self.engine.delete_rowcount)
-        if sql.startswith("INSERT"):
-            if table in self.engine.fail_insert_tables:
-                raise RuntimeError(f"simulated insert failure on {table}")
-            self.engine.inserts.append((sql, parameters))
+        if sql.startswith("TRUNCATE"):
+            self.engine.truncates.append(table)
             return _FakeResult()
         raise AssertionError(f"unexpected SQL in test: {sql}")
 
@@ -126,9 +157,13 @@ class FakeEngine:
         self.period_row = period_row
         self.fail_insert_tables = fail_insert_tables
         self.delete_rowcount = 1
+        # (database name, recovery model) a replace checks before truncating.
+        self.database = ("research_test", "SIMPLE")
         self.executed: list[tuple[str, object]] = []
         self.deletes: list[tuple[str, object]] = []
-        self.inserts: list[tuple[str, object]] = []
+        self.truncates: list[str] = []
+        self.inserts: list[tuple[str, list[dict]]] = []
+        self.input_sizes: list[list] = []
         self.transactions: list[str] = []
         self.disposed = False
 
@@ -274,7 +309,7 @@ def test_standalone_update_empty_table_raises_bootstrap_error(tmp_path):
     _write_market_returns_csv(csv_path, ["2026-05-31"])
     engine = FakeEngine(_MARKET_RETURNS_COLUMNS, {"market_returns": None})
 
-    with pytest.raises(RuntimeError, match="empty.*full_upload"):
+    with pytest.raises(RuntimeError, match="empty.*--db-replace"):
         _update_standalone_table(engine, STANDALONE_TABLE_SPECS[0], csv_path)
 
     assert engine.deletes == []
@@ -362,7 +397,7 @@ def test_characteristics_empty_table_raises_bootstrap_error(tmp_path):
     _write_monthly_csv(csv_path, [20260531])
     engine = FakeEngine(_CHARACTERISTICS_COLUMNS, {}, has_rows=False)
 
-    with pytest.raises(RuntimeError, match="empty.*full_upload"):
+    with pytest.raises(RuntimeError, match="empty.*--db-replace"):
         _update_characteristics_production(engine, csv_path, [])
 
     assert engine.deletes == []
@@ -479,6 +514,57 @@ def test_insert_batches_rows_in_chunks(tmp_path):
     assert chunk_sizes == [INSERT_CHUNK_ROWS, INSERT_CHUNK_ROWS, 1]
 
 
+@pytest.mark.unit
+def test_insert_declares_every_parameter_type_and_casts_to_the_table_types():
+    df = pl.DataFrame(
+        {
+            "iid": [1, 2],  # inferred as integers from "01"-style CSV values
+            "conm": ["Société Générale", None],
+            "eom": [date(2026, 5, 31)] * 2,
+            "eom_text": [date(2026, 5, 31)] * 2,
+            "ret": [0.5, float("nan")],
+            "n": [3, 4],
+            "excntry": ["GBR", "GBR"],
+        }
+    )
+    db_columns = {
+        "iid": "varchar",
+        "conm": "varchar",
+        "eom": "date",
+        "eom_text": "varchar",
+        "ret": "float",
+        "n": "int",
+        "excntry": "nvarchar",
+    }
+    engine = FakeEngine({})
+
+    _insert_rows(FakeConnection(engine), CHARACTERISTICS_TABLE, df, db_columns)
+
+    assert engine.input_sizes == [
+        [
+            (pyodbc.SQL_VARCHAR, 1, 0),
+            (pyodbc.SQL_VARCHAR, len("Société Générale".encode()), 0),
+            (pyodbc.SQL_TYPE_DATE, 0, 0),
+            (pyodbc.SQL_VARCHAR, 10, 0),
+            (pyodbc.SQL_DOUBLE, 0, 0),
+            (pyodbc.SQL_INTEGER, 0, 0),
+            (pyodbc.SQL_WVARCHAR, 3, 0),
+        ]
+    ]
+    first, second = _inserted_rows(engine)
+    assert first == {
+        "iid": "1",
+        "conm": "Société Générale",
+        "eom": date(2026, 5, 31),
+        "eom_text": "2026-05-31",
+        "ret": 0.5,
+        "n": 3,
+        "excntry": "GBR",
+    }
+    assert second["ret"] is None
+    assert second["conm"] is None
+
+
 # ---------------------------------------------------------------------------
 # Orchestration: isolation, rollback, target announcement
 # ---------------------------------------------------------------------------
@@ -590,6 +676,127 @@ def test_missing_production_dir_raises_before_any_connection(test_paths):
 
 
 # ---------------------------------------------------------------------------
+# Full replace
+# ---------------------------------------------------------------------------
+
+
+def _row_counts(engine: FakeEngine) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for sql, rows in engine.inserts:
+        table = _TABLE_IN_SQL.search(sql).group(1)
+        counts[table] = counts.get(table, 0) + len(rows)
+    return counts
+
+
+@pytest.mark.unit
+def test_replace_truncates_every_table_once_and_loads_every_row(test_paths):
+    _write_all_production_fixtures(test_paths.production_dir)
+    engine = _full_fake_engine()
+
+    with patch("jkp.data.dataupdate.sa.create_engine", return_value=engine):
+        replace_research_db(test_paths, connection_url=FAKE_URL)
+
+    tables = [spec.table for spec in STANDALONE_TABLE_SPECS] + [
+        RETURN_CUTOFFS_DAILY_TABLE,
+        CHARACTERISTICS_TABLE,
+        DAILY_RETURNS_TABLE,
+    ]
+    assert engine.truncates == tables
+    assert engine.deletes == []
+    # Every CSV row, including those an incremental update would leave alone.
+    assert _row_counts(engine) == dict.fromkeys(tables, 2)
+    assert "rollback" not in engine.transactions
+    assert engine.disposed
+
+
+@pytest.mark.unit
+def test_replace_loads_characteristics_of_all_countries_in_key_order(test_paths):
+    _write_all_production_fixtures(test_paths.production_dir)
+    for country, ids in (("USA", ["b", "d"]), ("GBR", ["c", "a"])):
+        pl.DataFrame(
+            {
+                "excntry": [country] * 2,
+                "eom": [20260531, 20260630],
+                "date": [20260531, 20260630],
+                "id": ids,
+            }
+        ).write_csv(test_paths.production_dir / "monthly" / f"{country.lower()}.csv")
+    engine = _full_fake_engine()
+
+    with patch("jkp.data.dataupdate.sa.create_engine", return_value=engine):
+        replace_research_db(test_paths, connection_url=FAKE_URL)
+
+    loaded = [
+        (row["id"], row["date"])
+        for sql, rows in engine.inserts
+        if CHARACTERISTICS_TABLE in sql
+        for row in rows
+    ]
+    assert loaded == [
+        ("a", date(2026, 6, 30)),
+        ("b", date(2026, 5, 31)),
+        ("c", date(2026, 5, 31)),
+        ("d", date(2026, 6, 30)),
+    ]
+
+
+@pytest.mark.unit
+def test_replace_refuses_full_recovery(test_paths):
+    _write_all_production_fixtures(test_paths.production_dir)
+    engine = _full_fake_engine()
+    engine.database = ("research_test", "FULL")
+
+    with (
+        patch("jkp.data.dataupdate.sa.create_engine", return_value=engine),
+        pytest.raises(DataUpdateError, match=r"SET RECOVERY SIMPLE"),
+    ):
+        replace_research_db(test_paths, connection_url=FAKE_URL)
+
+    assert engine.truncates == []
+    assert engine.inserts == []
+    assert engine.disposed
+
+
+@pytest.mark.unit
+def test_replace_refuses_missing_file_before_connecting(test_paths):
+    _write_all_production_fixtures(test_paths.production_dir)
+    (test_paths.production_dir / "nyse_cutoffs.csv").unlink()
+
+    with (
+        patch("jkp.data.dataupdate.sa.create_engine") as create_engine,
+        pytest.raises(DataUpdateError, match="nyse_cutoffs.csv"),
+    ):
+        replace_research_db(test_paths, connection_url=FAKE_URL)
+
+    create_engine.assert_not_called()
+
+
+@pytest.mark.unit
+def test_replace_table_commits_each_chunk_after_one_truncate():
+    total = 2 * INSERT_CHUNK_ROWS + 1
+    frame = pl.DataFrame({"eom": [date(2026, 5, 31)] * total, "mkt_vw_exc": [0.01] * total})
+    engine = FakeEngine(_MARKET_RETURNS_COLUMNS)
+
+    _replace_table(engine, "market_returns", [frame])
+
+    assert engine.truncates == ["market_returns"]
+    assert [len(rows) for _sql, rows in engine.inserts] == [INSERT_CHUNK_ROWS, INSERT_CHUNK_ROWS, 1]
+    assert engine.transactions == ["commit"] * 4  # the TRUNCATE, then one per chunk
+
+
+@pytest.mark.unit
+def test_replace_table_checks_columns_before_truncating():
+    frame = pl.DataFrame({"eom": [date(2026, 5, 31)], "mkt_vw_exc": [0.01]})
+    engine = FakeEngine({"market_returns": {"eom": "date"}})
+
+    with pytest.raises(RuntimeError, match=r"not present in dbo\.market_returns"):
+        _replace_table(engine, "market_returns", [frame])
+
+    assert engine.truncates == []
+    assert engine.inserts == []
+
+
+# ---------------------------------------------------------------------------
 # Pipeline wiring
 # ---------------------------------------------------------------------------
 
@@ -635,5 +842,46 @@ def test_run_pipeline_db_update_requires_production_output(tmp_path):
         pytest.raises(ValueError, match="production_output is off"),
     ):
         run_pipeline(output_dir=tmp_path, bypass_crsp=True, db_update=True, production_output=False)
+
+    getter.assert_not_called()
+
+
+@pytest.mark.unit
+def test_run_pipeline_db_replace_resolves_url_before_running(tmp_path):
+    from jkp.data.main import run_pipeline
+
+    with (
+        patch("jkp.data.main.get_research_update_connection_info", return_value=FAKE_URL) as getter,
+        patch("jkp.data.main.get_xpressfeed_connection_info", return_value="postgresql://rds"),
+        patch("jkp.data.main.setup_folder_structure", side_effect=RuntimeError("stop")),
+        pytest.raises(RuntimeError, match="stop"),
+    ):
+        run_pipeline(
+            output_dir=tmp_path,
+            bypass_crsp=True,
+            production_output=True,
+            production_years=0,
+            db_replace=True,
+        )
+
+    getter.assert_called_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"db_replace": True, "production_years": 3}, "--production-years 0"),
+        ({"db_replace": True, "production_years": 0, "db_update": True}, "only one"),
+    ],
+)
+def test_run_pipeline_db_replace_rejects_partial_csvs_and_both_modes(tmp_path, kwargs, message):
+    from jkp.data.main import run_pipeline
+
+    with (
+        patch("jkp.data.main.get_research_update_connection_info") as getter,
+        pytest.raises(ValueError, match=message),
+    ):
+        run_pipeline(output_dir=tmp_path, bypass_crsp=True, production_output=True, **kwargs)
 
     getter.assert_not_called()

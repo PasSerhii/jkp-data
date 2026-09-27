@@ -1,12 +1,12 @@
-"""Incremental upload of the production CSVs to the research MSSQL database.
+"""Upload of the production CSVs to the research MSSQL database.
 
 Replaces the legacy sasWrds uploader (AlphaJobs/sasWrds) for the Python
 pipeline, keeping its business semantics: for each table, the rows at or after
 the table's current maximum date are deleted and re-inserted from the CSVs
 inside one transaction per element, so the last stored period absorbs upstream
-revisions and later periods are appended. Incremental only -- an empty target
-table is an error, not a bootstrap; seed it once with the legacy sasWrds
-full_upload before pointing this phase at it.
+revisions and later periods are appended. An empty target table is an error for
+this incremental update, not a bootstrap. ``replace_research_db`` is the full
+reload instead: it empties every table and loads it from a full-history build.
 
 The target database is chosen solely by the connection URL (resolved from the
 ``RESEARCH_UPDATE`` environment variable by ``database_sources``).
@@ -22,12 +22,13 @@ refreshed when the CSV's latest year/month period equals the database's.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+import pyodbc
 import sqlalchemy as sa
 
 from .aux_functions import measure_time
@@ -48,6 +49,25 @@ RETURN_CUTOFFS_DAILY_TABLE = "return_cutoffs_daily"
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CHARACTER_DB_TYPES = frozenset({"char", "nchar", "varchar", "nvarchar"})
+# Polars type a frame column is cast to before it goes into a table column of
+# the given type. Dates are left alone: the readers already parse them.
+_POLARS_TYPES: dict[str, type[pl.DataType]] = {
+    "float": pl.Float64,
+    "bigint": pl.Int64,
+    "int": pl.Int32,
+    **dict.fromkeys(_CHARACTER_DB_TYPES, pl.String),
+}
+# ODBC type each parameter is declared as (see _insert_rows).
+_ODBC_TYPES = {
+    "float": pyodbc.SQL_DOUBLE,
+    "bigint": pyodbc.SQL_BIGINT,
+    "int": pyodbc.SQL_INTEGER,
+    "date": pyodbc.SQL_TYPE_DATE,
+    "char": pyodbc.SQL_VARCHAR,
+    "varchar": pyodbc.SQL_VARCHAR,
+    "nchar": pyodbc.SQL_WVARCHAR,
+    "nvarchar": pyodbc.SQL_WVARCHAR,
+}
 
 
 class DataUpdateError(RuntimeError):
@@ -189,33 +209,71 @@ def _bind_value_for(column_type: str, value: date) -> date | str:
 
 
 def _prepare_for_insert(df: pl.DataFrame, db_columns: dict[str, str]) -> pl.DataFrame:
-    """Adapt the frame's values to the table's storage types.
+    """Cast every column to the storage type of its table column.
 
-    Date columns whose database column is character-typed become ISO strings
-    (replicating sasWrds's ``eom.astype(str)``); float NaN becomes null so it
-    lands as SQL NULL instead of failing the bind.
+    Numeric and character columns take the table's own type -- an ``iid`` the
+    CSV reader inferred as the integer 1 becomes "1", as the driver converted it
+    before -- and a date bound for a character column becomes its ISO string
+    (sasWrds's ``eom.astype(str)``). Float NaN becomes null so it lands as SQL
+    NULL instead of failing the bind.
     """
     casts = []
     for column, dtype in df.schema.items():
-        if dtype == pl.Date and db_columns.get(column) in _CHARACTER_DB_TYPES:
-            casts.append(pl.col(column).dt.strftime("%Y-%m-%d"))
-        elif dtype in (pl.Float32, pl.Float64):
-            casts.append(pl.col(column).fill_nan(None))
-    return df.with_columns(casts) if casts else df
+        expr = pl.col(column)
+        if dtype in (pl.Float32, pl.Float64):
+            expr = expr.fill_nan(None)
+        target = _POLARS_TYPES.get(db_columns.get(column, ""))
+        if target is not None and dtype != target:
+            expr = expr.cast(target)
+        casts.append(expr)
+    return df.with_columns(casts)
+
+
+def _input_sizes(df: pl.DataFrame, db_columns: dict[str, str]) -> list[tuple[int, int, int] | None]:
+    """The (ODBC type, size, decimal digits) each column's parameter is declared with.
+
+    Character columns are sized to the longest value in the frame, which also
+    binds ``varchar(max)`` as an ordinary array parameter. A type without an
+    entry stays None and pyodbc describes it itself.
+    """
+    sizes: list[tuple[int, int, int] | None] = []
+    for column in df.columns:
+        db_type = db_columns.get(column, "")
+        odbc_type = _ODBC_TYPES.get(db_type)
+        if odbc_type is None:
+            sizes.append(None)
+        elif db_type in _CHARACTER_DB_TYPES:
+            longest = df[column].str.len_bytes().max()
+            sizes.append((odbc_type, max(1, longest or 0), 0))
+        else:
+            sizes.append((odbc_type, 0, 0))
+    return sizes
 
 
 def _insert_rows(
     conn: sa.Connection, table: str, df: pl.DataFrame, db_columns: dict[str, str]
 ) -> int:
-    """Append every row of ``df`` to ``dbo.<table>`` in bounded executemany chunks."""
+    """Append every row of ``df`` to ``dbo.<table>`` in bounded executemany chunks.
+
+    Uses the connection's pyodbc cursor so every parameter's type is declared
+    up front. Left to work the types out itself, fast_executemany drops to about
+    one round trip per row on the wide, sparse characteristics rows: measured at
+    ~50 ms per row over a 62 ms link, against 0.4 ms with the types declared.
+    """
     columns = [_validate_identifier(column) for column in df.columns]
-    statement = sa.text(
+    statement = (
         f"INSERT INTO {_qualified(table)} ({', '.join(f'[{column}]' for column in columns)}) "
-        f"VALUES ({', '.join(f':{column}' for column in columns)})"
+        f"VALUES ({', '.join('?' for _ in columns)})"
     )
     prepared = _prepare_for_insert(df, db_columns)
-    for chunk in prepared.iter_slices(INSERT_CHUNK_ROWS):
-        conn.execute(statement, chunk.to_dicts())
+    cursor = conn.connection.cursor()
+    try:
+        cursor.fast_executemany = True
+        for chunk in prepared.iter_slices(INSERT_CHUNK_ROWS):
+            cursor.setinputsizes(_input_sizes(chunk, db_columns))
+            cursor.executemany(statement, chunk.rows())
+    finally:
+        cursor.close()
     return prepared.height
 
 
@@ -271,7 +329,8 @@ def _assert_overlap(element: str, cutoff: date, csv_dates: pl.Series) -> None:
 def _bootstrap_error(table: str) -> RuntimeError:
     return RuntimeError(
         f"table {SCHEMA}.{table} is empty; the incremental update cannot bootstrap it. "
-        "Seed it once with the legacy sasWrds full_upload, then re-run."
+        "Load it once from a full-history build (--production-years 0 --db-replace), "
+        "then re-run."
     )
 
 
@@ -487,7 +546,7 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
             errors.append(f"{element}: {exc!r}")
             _log(f"FAILED {element}: {exc!r}")
 
-    engine = sa.create_engine(connection_url, fast_executemany=True, connect_args={"timeout": 10})
+    engine = sa.create_engine(connection_url, connect_args={"timeout": 10})
     try:
         for spec in STANDALONE_TABLE_SPECS:
             csv_path = paths.production_dir / spec.csv_name
@@ -524,3 +583,111 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
             f"database update finished with {len(errors)} failed element(s):\n" + "\n".join(errors)
         )
     _log("Database update completed successfully")
+
+
+def _check_recovery_model(engine: sa.Engine) -> None:
+    """Refuse a replace while the target database is in FULL recovery.
+
+    FULL recovery (research_test comes back that way from every restore of
+    research) keeps the whole reload in the transaction log, which would fill the
+    volume the databases share.
+    """
+    with engine.connect() as conn:
+        name, recovery = conn.execute(
+            sa.text(
+                "SELECT name, recovery_model_desc FROM sys.databases WHERE database_id = DB_ID()"
+            )
+        ).one()
+    if recovery == "FULL":
+        raise DataUpdateError(
+            f"{name} uses FULL recovery, so the reload would pile up in its transaction log. "
+            f"Run ALTER DATABASE [{name}] SET RECOVERY SIMPLE first; nothing was changed"
+        )
+
+
+def _replace_table(engine: sa.Engine, table: str, frames: Iterable[pl.DataFrame]) -> None:
+    """Empty ``dbo.<table>`` and insert ``frames`` into it, committing chunk by chunk.
+
+    TRUNCATE keeps the table's definition -- column types, key and indexes -- so
+    the rows land in exactly the existing format. The first frame is read and
+    checked before the TRUNCATE, so a file the table cannot take fails with the
+    table untouched. One transaction per chunk keeps the log small.
+    """
+    with engine.connect() as conn:
+        db_columns = _table_columns(conn, table)
+    inserted = 0
+    for number, frame in enumerate(frames):
+        _check_columns(table, frame.columns, db_columns)
+        if number == 0:
+            with engine.begin() as conn:
+                conn.execute(sa.text(f"TRUNCATE TABLE {_qualified(table)}"))
+        for chunk in frame.iter_slices(INSERT_CHUNK_ROWS):
+            with engine.begin() as conn:
+                inserted += _insert_rows(conn, table, chunk, db_columns)
+            if inserted % 1_000_000 < chunk.height:  # crossed another million rows
+                _log(f"{SCHEMA}.{table}: {inserted} row(s) loaded")
+    _log(f"{SCHEMA}.{table}: replaced, {inserted} row(s)")
+
+
+def _sorted_characteristics(engine: sa.Engine, monthly: list[Path]) -> pl.DataFrame:
+    """Every country's monthly rows in one frame, in the table's key order (id, date).
+
+    Ids interleave across countries, so a country-by-country load would insert
+    each later country between rows already stored and split pages throughout
+    the clustered index; loading in key order appends instead. Each file is cast
+    to the table's types first, so the types inferred per file agree. Holds the
+    whole monthly history in memory (~100 GB for full history): a build-host job.
+    """
+    with engine.connect() as conn:
+        db_columns = _table_columns(conn, CHARACTERISTICS_TABLE)
+    frames = [_prepare_for_insert(_country_frame(path, "eom")[0], db_columns) for path in monthly]
+    return pl.concat(frames, how="diagonal").sort("id", "date")
+
+
+@measure_time
+def replace_research_db(paths: DataPaths, *, connection_url: str) -> None:
+    """Replace the contents of the research tables with the production CSVs.
+
+    Description:
+        The full-reload counterpart of update_research_db, for loading a
+        full-history build (--production-years 0). Each table is emptied with
+        TRUNCATE, which keeps its definition, and reloaded from the CSVs, so the
+        rows land in exactly the existing format. The first failure stops the
+        run; rerunning starts every table over.
+    Steps:
+        1) Before anything is changed, require every production file and a
+           recovery model other than FULL.
+        2) Replace the cross-country tables, return_cutoffs_daily, then
+           characteristicsproduction (all countries at once, in key order) and
+           dailyreturnsproduction (country by country, each in key order).
+    Output:
+        The eight tables in the database named by ``connection_url`` hold
+        exactly the rows of the CSVs.
+    """
+    url = sa.engine.make_url(connection_url)
+    _log(f"Database replace target: host={url.host} database={url.database}")
+    monthly, daily, errors = _preflight_production_files(paths)
+    if errors:
+        raise DataUpdateError("refusing to replace:\n" + "\n".join(errors))
+    production_dir = paths.production_dir
+    engine = sa.create_engine(connection_url, connect_args={"timeout": 10})
+    try:
+        _check_recovery_model(engine)
+        for spec in STANDALONE_TABLE_SPECS:
+            frame = _read_production_csv(
+                production_dir / spec.csv_name, iso_date_columns=(spec.date_column,)
+            ).drop(spec.drop_columns, strict=False)
+            _replace_table(engine, spec.table, [frame])
+        cutoffs_daily = _read_production_csv(production_dir / "return_cutoffs_daily.csv")
+        _replace_table(
+            engine, RETURN_CUTOFFS_DAILY_TABLE, [cutoffs_daily.drop("eom", strict=False)]
+        )
+        _replace_table(engine, CHARACTERISTICS_TABLE, [_sorted_characteristics(engine, monthly)])
+        _replace_table(
+            engine,
+            DAILY_RETURNS_TABLE,
+            (_country_frame(path, "date")[0].sort("id", "date") for path in daily),
+        )
+    finally:
+        engine.dispose()
+    _log("Database replace completed successfully")

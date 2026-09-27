@@ -154,6 +154,13 @@ def build(
         "(incremental delete-and-insert; target comes from the RESEARCH_UPDATE "
         "environment variable). Requires production output. Default off.",
     ),
+    db_replace: bool = typer.Option(
+        False,
+        "--db-replace",
+        help="After the run, empty the research tables and reload them from the production "
+        "CSVs instead of the incremental update; the table definitions are kept. Same "
+        "RESEARCH_UPDATE target. Requires --production-years 0.",
+    ),
 ) -> None:
     """Run the full data generation pipeline."""
     from .config import (
@@ -189,6 +196,7 @@ def build(
             PRODUCTION_OUTPUT_YEARS if production_years is None else production_years
         ),
         db_update=db_update,
+        db_replace=db_replace,
     )
 
 

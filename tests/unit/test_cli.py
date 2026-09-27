@@ -111,6 +111,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -118,6 +119,13 @@ class TestBuildCommand:
         result = runner.invoke(app, ["build", str(tmp_path), "--db-update"])
         assert result.exit_code == 0
         assert mock_run_pipeline.call_args.kwargs["db_update"] is True
+
+    @patch("jkp.data.main.run_pipeline")
+    def test_build_db_replace_flag_forwarded(self, mock_run_pipeline, tmp_path):
+        result = runner.invoke(app, ["build", str(tmp_path), "--db-replace"])
+        assert result.exit_code == 0
+        assert mock_run_pipeline.call_args.kwargs["db_replace"] is True
+        assert mock_run_pipeline.call_args.kwargs["db_update"] is False
 
     @patch("jkp.data.main.run_pipeline")
     def test_build_persistent_connection(self, mock_run_pipeline, tmp_path):
@@ -138,6 +146,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -159,6 +168,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -180,6 +190,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -201,6 +212,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -222,6 +234,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")
@@ -253,6 +266,7 @@ class TestBuildCommand:
             full_history=False,
             production_years=PRODUCTION_OUTPUT_YEARS,
             db_update=False,
+            db_replace=False,
         )
 
     @patch("jkp.data.main.run_pipeline")

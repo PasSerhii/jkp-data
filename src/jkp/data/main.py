@@ -72,7 +72,7 @@ from .database_sources import (
     get_research_update_connection_info,
     get_xpressfeed_connection_info,
 )
-from .dataupdate import update_research_db
+from .dataupdate import replace_research_db, update_research_db
 from .paths import DataPaths
 from .production import export_production
 from .runtime_monitor import get_active_monitor, monitor_pipeline
@@ -207,6 +207,7 @@ def run_pipeline(
     full_history: bool = False,
     production_years: int = PRODUCTION_OUTPUT_YEARS,
     db_update: bool = False,
+    db_replace: bool = False,
 ) -> None:
     """Run the full JKP data generation pipeline.
 
@@ -215,6 +216,9 @@ def run_pipeline(
     the SAS ``bypass_crsp=1`` path. XpressFeed RDS is the default Compustat
     source and requires this mode because it does not contain CRSP. Select
     ``compustat_source="wrds"`` for historical comparison runs.
+
+    ``db_update`` uploads the production CSVs incrementally; ``db_replace``
+    instead empties the research tables and reloads them from the CSVs.
     """
     paths = DataPaths(base_dir=output_dir.resolve())
     source = CompustatSource(compustat_source)
@@ -240,14 +244,23 @@ def run_pipeline(
             "The XpressFeed RDS contains Compustat and Fama-French data but not CRSP. "
             "Use --bypass-crsp, or select --compustat-source wrds for a CRSP build."
         )
-    if db_update and not production_output:
+    if db_update and db_replace:
+        raise ValueError("db_update and db_replace are two modes of one upload; pass only one.")
+    if (db_update or db_replace) and not production_output:
         raise ValueError(
-            "db_update uploads the production CSVs, but production_output is off. "
-            "Pass --production with --db-update."
+            "The database upload reads the production CSVs, but production_output is off. "
+            "Pass --production with --db-update or --db-replace."
+        )
+    # The replace empties every table first, so CSVs cut to a few years would
+    # leave the database holding only those years.
+    if db_replace and production_years != 0:
+        raise ValueError(
+            f"db_replace reloads the tables from the production CSVs, which would hold "
+            f"only {production_years} years; pass --production-years 0."
         )
     # Resolved before any download work so a missing RESEARCH_UPDATE fails the
     # run at minute 0, not after hours of pipeline time.
-    research_update_url = get_research_update_connection_info() if db_update else None
+    research_update_url = get_research_update_connection_info() if db_update or db_replace else None
 
     if source is CompustatSource.xpressfeed:
         source_connection_info = get_xpressfeed_connection_info()
@@ -280,6 +293,7 @@ def run_pipeline(
         source_window=source_window,
         production_years=production_years,
         db_update=db_update,
+        db_replace=db_replace,
     )
     # The published window cannot exceed the window the data was built from; the
     # CSVs would silently stop at the source bound instead of the requested span.
@@ -485,7 +499,10 @@ def run_pipeline(
     if production_output:
         export_production(paths, end_date=effective_end_date, production_years=production_years)
     save_full_files_and_cleanup(paths, clear_interim=not keep_interim)
-    if db_update:
+    if db_update or db_replace:
         monitor.set_phase("database_update")
         assert research_update_url is not None
-        update_research_db(paths, connection_url=research_update_url)
+        if db_replace:
+            replace_research_db(paths, connection_url=research_update_url)
+        else:
+            update_research_db(paths, connection_url=research_update_url)
