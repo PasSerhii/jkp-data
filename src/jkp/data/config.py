@@ -75,11 +75,13 @@ MAX_DAILY_COMPUSTAT_DOWNLOAD_WORKERS = 8
 # Independent rolling-window calculations executed concurrently by
 # `roll_apply_daily`. The 19 (window, variable) combinations are independent and
 # each writes its own parquet, but on the 2026-07-26 run they were issued
-# serially at a mean of 22.7 of 128 cores. A single call peaked at ~48 GiB of
-# real RAM with ~445 GiB free, so a small fan-out is safe; keep this modest
-# because each worker holds its own Polars collect buffers. Set to 1 to restore
-# fully sequential execution.
-ROLLING_DAILY_WORKERS = 4
+# serially at a mean of 22.7 of 128 cores. Keep this modest: each worker holds
+# its own Polars collect buffers, and the peak depends on which jobs overlap.
+# With 4, the same 23-year window peaked at 103 GiB on 2026-09-01 but at 440 GiB
+# on 2026-09-24, when four 252-day jobs coincided -- 56 GiB short of the 496 GiB
+# on r7i.16xlarge, and full history carries ~30% more daily rows. Set to 1 to
+# restore fully sequential execution.
+ROLLING_DAILY_WORKERS = 2
 
 # CRSP MSF / DSF row filters: 1 keeps the row, 0 drops it.
 MAIN_FILTERS = {
