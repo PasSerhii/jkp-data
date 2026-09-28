@@ -297,6 +297,7 @@ def test_secm_return_index_uses_production_trfm_coalesce(test_paths, monkeypatch
         {
             "gvkey": pl.Series([], dtype=pl.String),
             "ddate": pl.Series([], dtype=pl.Date),
+            "datadate": pl.Series([], dtype=pl.Date),
             "csho_fund": pl.Series([], dtype=pl.Float64),
             "ajex_fund": pl.Series([], dtype=pl.Float64),
         }

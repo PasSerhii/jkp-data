@@ -3,6 +3,21 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 28-09-2026
+__Changes__:
+- Fixed inflated market caps for North American securities without their own Compustat share count, mostly before April 1998.
+  - The fallback scaled the company's reported shares by the company's adjustment factor. That factor follows the company's reference share class.
+  - For Berkshire Hathaway class A it is on the class B basis (1,500). Its market cap was 1,500x too large from 1968 to March 1998, 10–90% of the US value-weighted market.
+  - The fallback now uses the security's own adjustment factor at the report date, or the company factor when the security has no row that month.
+  - Checked against the next reported share count on 673k NYSE/AMEX/NASDAQ fallback months: 2,705 months move closer, 94 further. The 94 are mostly two-class companies, where a company-wide count cannot fit either class.
+  - Affects pre-1998 `me` and everything built on it: US market returns, `mktrf`, market betas and other market-model characteristics, factor portfolios. Values since 2003 are essentially unchanged.
+- Fixed monthly returns in months where the merged Compustat monthly file switches between SECM and SECD rows.
+  - The two files' total-return factors are cumulative on different bases. SECD's is empty on its first day (1983-12-30) for 97% of securities, so a cross-file ratio is not a return.
+  - 61% of US and Canadian securities had a wrong December 1983 return (median -13.9% instead of -1.5%). The US value-weighted market showed -20%; Ken French shows -1.8%.
+  - Switch months now use SECM prices at both ends, and are missing when SECM lacks either month.
+  - This also corrects about 7,800 later months where SECD has a gap and SECM fills in, mostly in the 1990s.
+- Both defects come from the production SAS, so the SAS-era history in the research database carries them too.
+
 ## 23-09-2026
 __Changes__:
 - Added a missing-SIC fallback from native dated Compustat industry history, after the existing Compustat/CRSP classification choices. Downloads use WRDS `comp.co_industry` plus `comp.g_co_industry`, or XpressFeed `public.co_industry`, keeping the last industry row before the rolling input window. Existing populated SIC and all NAICS/GICS values remain unchanged; FF49 is derived from the recovered SIC. The latest industry-bearing row wins, with NA-first and consolidated-first same-date priority. A newer partial classification or conflicting same-priority SIC values can leave SIC unresolved rather than carrying an older code through that update. Candidate dates and package provenance are saved in `interim/sic_history_fallback.parquet`. Recovery runs now require `raw/raw_tables/comp_industry_history.parquet`; an old raw cache needs this new download before reuse.

@@ -27,6 +27,7 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
+from .compustat_fixes import correct_source_switch_returns, register_security_ajex_at_report
 from .config import (
     COLLECT_CHUNK_SIZE,
     END_DATE,
@@ -2930,6 +2931,7 @@ def gen_comp_dsf(paths: DataPaths):
         history_path=history_path,
     )
 
+    register_security_ajex_at_report(con, paths)
     con.raw_sql(f"""
     CREATE VIEW __firm_shares2 AS
         SELECT * FROM read_parquet('{(paths.interim_dir / "__firm_shares2.parquet").as_posix()}');
@@ -2981,11 +2983,13 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrd / 1.6
             ELSE a.cshtrd
         END AS DECIMAL(28, 8)) AS cshtrd,
-        COALESCE(a.cshoc / 1e6, b.csho_fund * b.ajex_fund / a.ajexdi) AS cshoc,
+        COALESCE(a.cshoc / 1e6, b.csho_fund * COALESCE(r.ajex_sec, b.ajex_fund) / a.ajexdi) AS cshoc,
         (a.prccd / a.ajexdi * COALESCE(a.trfd, 1)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
     LEFT JOIN __firm_shares2 AS b
-    ON a.gvkey = b.gvkey AND a.datadate = b.ddate;
+    ON a.gvkey = b.gvkey AND a.datadate = b.ddate
+    LEFT JOIN __sec_ajex_rep AS r
+    ON r.gvkey = a.gvkey AND r.iid = a.iid AND r.rep_eom = last_day(b.datadate);
 
     CREATE VIEW __comp_dsf1 AS
     SELECT *
@@ -3140,6 +3144,7 @@ def gen_secm_data(paths: DataPaths):
         overwrite=True,
     )
     con.create_table("fx", con.read_parquet(paths.interim_dir / "fx_data.parquet"), overwrite=True)
+    register_security_ajex_at_report(con, paths)
 
     con.raw_sql("""
         DROP TABLE IF EXISTS __comp_secm2;
@@ -3153,7 +3158,7 @@ def gen_secm_data(paths: DataPaths):
             a.prchm        AS prc_high_local,
             a.prclm        AS prc_low_local,
             a.ajexm        AS ajexdi,
-            coalesce(a.cshom/1e6, a.csfsm/1e3, a.cshoq, b.csho_fund * b.ajex_fund / a.ajexm) AS cshoc,
+            coalesce(a.cshom/1e6, a.csfsm/1e3, a.cshoq, b.csho_fund * COALESCE(r.ajex_sec, b.ajex_fund) / a.ajexm) AS cshoc,
             CASE
             WHEN a.exchg = 14 AND a.datadate <  DATE '2001-02-01' THEN a.cshtrm/2
             WHEN a.exchg = 14 AND a.datadate <= DATE '2001-12-31' THEN a.cshtrm/1.8
@@ -3167,6 +3172,8 @@ def gen_secm_data(paths: DataPaths):
         FROM comp_secm AS a
         LEFT JOIN __firm_shares2 AS b
             ON a.gvkey    = b.gvkey  AND a.datadate = b.ddate
+        LEFT JOIN __sec_ajex_rep AS r
+            ON r.gvkey = a.gvkey AND r.iid = a.iid AND r.rep_eom = last_day(b.datadate)
         LEFT JOIN fx AS c
             ON a.curcdm   = c.curcdd AND a.datadate = c.date
         LEFT JOIN fx AS d
@@ -3537,6 +3544,7 @@ def gen_returns_df(paths: DataPaths, freq):
             lagged_iid=col("iid").shift(1).over(["gvkey", "iid"]),
             lagged_curcdd=col("curcdd").shift(1).over(["gvkey", "iid"]),
         )
+        .pipe(correct_source_switch_returns, paths, freq)
         .with_columns(
             ret_local=pl.when(
                 (col("iid") == col("lagged_iid")) & (col("curcdd") != col("lagged_curcdd"))

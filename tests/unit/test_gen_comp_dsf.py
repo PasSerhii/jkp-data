@@ -42,6 +42,7 @@ def _write_shared_inputs(test_paths, monkeypatch) -> None:
         {
             "gvkey": pl.Series([], dtype=pl.String),
             "ddate": pl.Series([], dtype=pl.Date),
+            "datadate": pl.Series([], dtype=pl.Date),
             "csho_fund": pl.Series([], dtype=pl.Float64),
             "ajex_fund": pl.Series([], dtype=pl.Float64),
         }
