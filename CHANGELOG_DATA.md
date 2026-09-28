@@ -3,6 +3,19 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 29-09-2026
+__Changes__:
+- Fixed inflated company market equity (`me_company`) for US companies with preferred stock, warrants or units listed on NYSE, AMEX or NASDAQ.
+  - Without CRSP, a US stock's `me_company` is the sum over the company's listings on these exchanges on the same date. That sum also counted non-common issues.
+  - Most warrants and some preferreds have no Compustat share count of their own, so they carried the company's full common share count. In August 2026, Occidental's warrants added $38bn to a $60bn company.
+  - Only common issues are now summed, as in the CRSP company aggregate this rule replaces.
+  - Since 2003, 1.4–6.5% of US stocks a year had `me_company` more than 10% too high (1,408 companies), among them JPMorgan, Bank of America, Wells Fargo, Citigroup, AIG, GM, Ford, Fannie Mae and Freddie Mac, and many REITs with preferred series.
+  - Affects `me_company`, `market_value_ils` and everything scaled by company market equity or enterprise value: `be_me` and the other `*_me` and `*_mev` ratios, `ival_me`, `eq_dur`, `aliq_mat`, `enterprise_value`, the Altman z-score and the KZ index. It also moves the US HML factor (about 0.2–0.3 percentage points of monthly tracking difference since 2000; −1.5 pp in December 2008) and the characteristics built on FF3 regressions.
+  - Security-level `me`, portfolio weights, market returns and other countries are unchanged.
+  - Carnival's plc ADR, part of its dual listing, no longer counts toward Carnival's `me_company` (a median 26% lower).
+  - Inherited from the production SAS, so the research database carries the same values.
+  - Not fixed: before 1998, two-class companies whose classes both carry the company-wide share count are still counted about twice (132 companies, almost all before 2003).
+
 ## 28-09-2026
 __Changes__:
 - Fixed inflated market caps for North American securities without their own Compustat share count, mostly before April 1998.

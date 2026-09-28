@@ -4046,8 +4046,9 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
         2) Create monthly world table: normalize CRSP/Comp → UNION ALL → LEAD(ret_exc).
         3) Derive obs_main: prefer CRSP when multiple observations per (gvkey, iid, eom).
         4) In CRSP-bypass mode, recompute me_company for USA main-exchange rows as the
-           (gvkey, date) sum over all USA main-exchange listings, pre-dedup (production
-           SAS update); every other row keeps its incoming me_company.
+           (gvkey, date) sum over the USA main-exchange common listings, pre-dedup
+           (production SAS update, restricted to common issues); every other row keeps
+           its incoming me_company.
         5) Write __msf_world.parquet with deterministic dedup (primary_sec preferred
            on tie via ROW_NUMBER).
         6) Write world_dsf.parquet: normalize daily → UNION ALL → join obs_main → dedup.
@@ -4251,15 +4252,18 @@ def combine_crsp_comp_sf(paths: DataPaths, bypass_crsp: bool = False) -> None:
         """)
 
         # In CRSP-bypass mode the production SAS recomputes me_company for USA
-        # main-exchange rows as the (gvkey, date) sum over all USA main-exchange
-        # listings — share classes and preferred issues alike, with no
-        # tpci/common filter — computed on the pre-dedup panel; every other row
-        # keeps its issue me. With CRSP present the original SAS has no such
-        # update: CRSP rows carry the permco aggregate, Compustat rows keep me.
+        # main-exchange rows as the (gvkey, date) sum over the company's USA
+        # main-exchange listings, computed on the pre-dedup panel; every other row
+        # keeps its issue me. Only common issues enter the sum, as in the CRSP
+        # permco aggregate it replaces: the SAS also added preferred stock,
+        # warrants and units, most of which carry the company's full common share
+        # count (Occidental's warrants: $38bn on a $60bn company in Aug-2026).
+        # With CRSP present the original SAS has no such update: CRSP rows carry
+        # the permco aggregate, Compustat rows keep me.
         me_company_expr = (
             "CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
             "THEN COALESCE(SUM(CASE WHEN a.excntry = 'USA' AND a.exch_main = 1 "
-            "THEN a.me END) OVER (PARTITION BY a.gvkey, a.date), a.me) "
+            "AND a.common = 1 THEN a.me END) OVER (PARTITION BY a.gvkey, a.date), a.me) "
             "ELSE a.me_company END"
             if bypass_crsp
             else "a.me_company"

@@ -1414,20 +1414,21 @@ class TestEdgeCases:
         comp_rows = msf.filter(pl.col("source_crsp") == 0)
         assert comp_rows.filter((pl.col("me_company") - pl.col("me")).abs() > 1e-12).is_empty()
 
-    def test_bypass_me_company_sums_usa_main_exchange_listings(self, tmp_path: Path) -> None:
-        """CRSP-bypass mirrors the production SAS company-ME update.
+    def test_bypass_me_company_sums_usa_main_exchange_common_listings(self, tmp_path: Path) -> None:
+        """CRSP-bypass follows the production SAS company-ME update, common issues only.
 
-        USA main-exchange listings carry the (gvkey, date) sum of me across all
-        USA main-exchange listings of the company (no tpci/common filter); a
-        null-me listing in that group inherits the group sum; USA off-main and
-        non-USA listings keep their issue me.
+        USA main-exchange listings carry the (gvkey, date) sum of me across the
+        company's USA main-exchange common listings; a preferred issue and a
+        warrant on the same exchange stay out of the sum (the SAS added them) and
+        carry the company sum themselves; a null-me listing in that group inherits
+        the group sum; USA off-main and non-USA listings keep their issue me.
         """
         interim = _make_test_layout(tmp_path)
         _make_comp_msf(interim, n_gvkeys=1)
         _make_comp_dsf(interim, n_gvkeys=1)
 
         base = pl.read_parquet(interim / "comp_msf.parquet").with_columns(
-            excntry=pl.lit("USA"), exch_main=pl.lit(1, dtype=pl.Int64)
+            excntry=pl.lit("USA"), exch_main=pl.lit(1, dtype=pl.Int64), tpci=pl.lit("0")
         )
         pl.concat(
             [
@@ -1438,18 +1439,19 @@ class TestEdgeCases:
                     iid=pl.lit("04"), me=pl.lit(5.0), exch_main=pl.lit(0, dtype=pl.Int64)
                 ),
                 base.with_columns(iid=pl.lit("05"), me=pl.lit(7.0), excntry=pl.lit("GBR")),
+                base.with_columns(iid=pl.lit("06"), me=pl.lit(100.0), tpci=pl.lit("1")),
+                base.with_columns(iid=pl.lit("07"), me=pl.lit(50.0), tpci=pl.lit("2")),
             ]
         ).write_parquet(interim / "comp_msf.parquet")
 
         msf, _ = _duckdb_combine_crsp_comp_sf(interim, bypass_crsp=True)
-        assert msf.height == 5 * len(_MONTHLY_DATES)
+        assert msf.height == 7 * len(_MONTHLY_DATES)
         by_iid = {
             iid: msf.filter(pl.col("iid") == iid)["me_company"].to_list()
-            for iid in ["01", "02", "03", "04", "05"]
+            for iid in ["01", "02", "03", "04", "05", "06", "07"]
         }
-        assert all(v == 40.0 for v in by_iid["01"])
-        assert all(v == 40.0 for v in by_iid["02"])
-        assert all(v == 40.0 for v in by_iid["03"])
+        for iid in ["01", "02", "03", "06", "07"]:
+            assert all(v == 40.0 for v in by_iid[iid]), iid  # was 190 with the SAS rule
         assert all(v == 5.0 for v in by_iid["04"])
         assert all(v == 7.0 for v in by_iid["05"])
 
