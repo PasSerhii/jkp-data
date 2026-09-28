@@ -2931,7 +2931,7 @@ def gen_comp_dsf(paths: DataPaths):
         history_path=history_path,
     )
 
-    register_security_ajex_at_report(con, paths)
+    register_security_ajex_at_report(con, paths, daily=True)
     con.raw_sql(f"""
     CREATE VIEW __firm_shares2 AS
         SELECT * FROM read_parquet('{(paths.interim_dir / "__firm_shares2.parquet").as_posix()}');
@@ -2983,13 +2983,17 @@ def gen_comp_dsf(paths: DataPaths):
             WHEN a.exchg = 14 AND a.datadate <= DATE '2003-12-31' THEN a.cshtrd / 1.6
             ELSE a.cshtrd
         END AS DECIMAL(28, 8)) AS cshtrd,
-        COALESCE(a.cshoc / 1e6, b.csho_fund * COALESCE(r.ajex_sec, b.ajex_fund) / a.ajexdi) AS cshoc,
+        COALESCE(a.cshoc / 1e6, b.csho_fund * COALESCE(r.ajex_sec / rt.ajex_sec * d.ajex_eom, b.ajex_fund) / a.ajexdi) AS cshoc,
         (a.prccd / a.ajexdi * COALESCE(a.trfd, 1)) AS ri_local, a.curcddv, a.div, a.divd, a.divsp
     FROM comp_secd AS a
     LEFT JOIN __firm_shares2 AS b
     ON a.gvkey = b.gvkey AND a.datadate = b.ddate
     LEFT JOIN __sec_ajex_rep AS r
-    ON r.gvkey = a.gvkey AND r.iid = a.iid AND r.rep_eom = last_day(b.datadate);
+    ON r.gvkey = a.gvkey AND r.iid = a.iid AND r.rep_eom = last_day(b.datadate)
+    LEFT JOIN __sec_ajex_rep AS rt
+    ON rt.gvkey = a.gvkey AND rt.iid = a.iid AND rt.rep_eom = last_day(a.datadate)
+    LEFT JOIN __secd_ajex_eom AS d
+    ON d.gvkey = a.gvkey AND d.iid = a.iid AND d.eom = last_day(a.datadate);
 
     CREATE VIEW __comp_dsf1 AS
     SELECT *

@@ -99,9 +99,20 @@ def test_secm_fallback_uses_security_adjustment_factor(test_paths, monkeypatch) 
     assert got["003000"] == pytest.approx(15.0)
 
 
-def test_secd_fallback_uses_security_adjustment_factor(test_paths, monkeypatch) -> None:
-    """The daily fallback (SECD rows without cshoc) scales with the security's own factor too."""
-    days = [date(1986, 1, 2) + timedelta(days=i) for i in range(3)]
+JAN86 = date(1986, 1, 31)
+
+
+def _run_daily_fallback(
+    test_paths,
+    monkeypatch,
+    days: list[date],
+    ajexdi: list[float],
+    secm: list[tuple[date, float]],
+    company: tuple[float, float] = (1.147, 1500.0),
+) -> list[float]:
+    """One security without its own daily share count (SECD rows on ``days`` with ``ajexdi``, SECM
+    month-end factors ``secm``); the company reports ``company`` = (shares, company factor) at
+    REPORT. Returns the daily cshoc that gen_comp_dsf infers."""
     n = len(days)
     daily = {
         "gvkey": ["002176"] * n,
@@ -111,11 +122,11 @@ def test_secd_fallback_uses_security_adjustment_factor(test_paths, monkeypatch) 
         "exchg": [11] * n,
         "prcstd": [4] * n,
         "curcdd": ["USD"] * n,
-        "prccd": [2440.0, 2450.0, 2460.0],
-        "ajexdi": [1.0] * n,
-        "prchd": [2450.0] * n,
-        "prcld": [2430.0] * n,
-        "prcod": [2440.0] * n,
+        "prccd": [100.0] * n,
+        "ajexdi": ajexdi,
+        "prchd": [101.0] * n,
+        "prcld": [99.0] * n,
+        "prcod": [100.0] * n,
         "cshtrd": [100.0] * n,
         "cshoc": pl.Series([None] * n, dtype=pl.Float64),
         "trfd": pl.Series([None] * n, dtype=pl.Float64),
@@ -130,25 +141,75 @@ def test_secd_fallback_uses_security_adjustment_factor(test_paths, monkeypatch) 
             **daily,
             "gvkey": ["200000"] * n,
             "exchg": [104] * n,
+            "ajexdi": [1.0] * n,
             "cshoc": [1e6] * n,
             "qunit": [1.0] * n,
         }
     ).write_parquet(test_paths.raw_tables_dir / "comp_g_secd.parquet")
-    _secm_rows("002176", [REPORT], [2430.0], [1.0]).write_parquet(
-        test_paths.raw_tables_dir / "comp_secm.parquet"
-    )
-    _firm_shares([("002176", 1.147, 1500.0)], days).write_parquet(
+    _secm_rows(
+        "002176", [d for d, _ in secm], [100.0] * len(secm), [f for _, f in secm]
+    ).write_parquet(test_paths.raw_tables_dir / "comp_secm.parquet")
+    _firm_shares([("002176", *company)], days).write_parquet(
         test_paths.interim_dir / "__firm_shares2.parquet"
     )
     _usd_fx(monkeypatch, days)
 
     aux.gen_comp_dsf(test_paths)
 
-    na = pl.read_parquet(test_paths.interim_dir / "__comp_dsf.parquet").filter(
-        pl.col("gvkey") == "002176"
+    na = (
+        pl.read_parquet(test_paths.interim_dir / "__comp_dsf.parquet")
+        .filter(pl.col("gvkey") == "002176")
+        .sort("datadate")
     )
     assert na.height == n
-    assert na["cshoc"].to_list() == pytest.approx([1.147] * n)  # was 1,720.5
+    return na["cshoc"].to_list()
+
+
+def test_secd_fallback_uses_security_adjustment_factor(test_paths, monkeypatch) -> None:
+    """The daily fallback (SECD rows without cshoc) scales with the security's own factor too."""
+    days = [REPORT] + [date(1986, 1, 2) + timedelta(days=i) for i in range(3)]
+    cshoc = _run_daily_fallback(
+        test_paths, monkeypatch, days, [1.0] * 4, [(REPORT, 1.0), (JAN86, 1.0)]
+    )
+
+    assert cshoc == pytest.approx([1.147] * 4)  # was 1,720.5
+
+
+def test_secd_fallback_never_divides_a_secm_factor_by_a_secd_one(test_paths, monkeypatch) -> None:
+    """GalaGen 1998: SECM carried ajexm 1.001 while SECD's ajexdi was 0.000001. Dividing a SECM
+    factor by a SECD one made its market cap a million times too large ($9 trillion)."""
+    days = [REPORT] + [date(1986, 1, 2) + timedelta(days=i) for i in range(3)]
+    cshoc = _run_daily_fallback(
+        test_paths, monkeypatch, days, [0.000001] * 4, [(REPORT, 1.001), (JAN86, 1.001)]
+    )
+
+    assert cshoc == pytest.approx([1.147] * 4)
+
+
+def test_secd_fallback_does_not_need_secd_in_the_report_month(test_paths, monkeypatch) -> None:
+    """Berkshire had no SECD rows from 1985 to 1987; taking the report-month factor from SECD would
+    fall back to the company factor there and bring the 1,500x back. SECM covers every month."""
+    days = [date(1986, 1, 2) + timedelta(days=i) for i in range(3)]
+    cshoc = _run_daily_fallback(
+        test_paths, monkeypatch, days, [1.0] * 3, [(REPORT, 1.0), (JAN86, 1.0)]
+    )
+
+    assert cshoc == pytest.approx([1.147] * 3)
+
+
+def test_secd_fallback_follows_a_split_within_the_month(test_paths, monkeypatch) -> None:
+    """A 2:1 split on 15 Jan 1986: days before it keep the pre-split count, days after double it."""
+    days = [REPORT, date(1986, 1, 2), date(1986, 1, 20), JAN86]
+    cshoc = _run_daily_fallback(
+        test_paths,
+        monkeypatch,
+        days,
+        [2.0, 2.0, 1.0, 1.0],
+        [(REPORT, 2.0), (JAN86, 1.0)],
+        company=(1.0, 2.0),
+    )
+
+    assert cshoc == pytest.approx([1.0, 1.0, 2.0, 2.0])
 
 
 # --- monthly returns across a SECM/SECD switch -------------------------------------------------

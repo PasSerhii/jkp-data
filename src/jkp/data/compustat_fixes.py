@@ -26,32 +26,39 @@ if TYPE_CHECKING:
     from ibis.backends.duckdb import Backend
 
 SECURITY_AJEX_VIEW = "__sec_ajex_rep"
+DAILY_AJEX_EOM_VIEW = "__secd_ajex_eom"
 
 
-def register_security_ajex_at_report(con: Backend, paths: DataPaths) -> None:
+def register_security_ajex_at_report(
+    con: Backend, paths: DataPaths, *, daily: bool = False
+) -> None:
     """
     Description:
-        Register a DuckDB view with each North American security's own cumulative
-        adjustment factor (SECM ``ajexm``) by month-end, for the firm-shares fallback.
+        Register DuckDB views with each North American security's own cumulative
+        adjustment factor, for the firm-shares fallback.
     Steps:
-        1) Read the downloaded comp.secm and keep rows with a positive ``ajexm``.
-        2) Keep one row per {gvkey, iid, month-end}, the latest ``datadate``.
-        3) Without a comp.secm download, register an empty view so the fallback keeps
-           the company factor.
+        1) ``__sec_ajex_rep``: SECM ``ajexm`` per {gvkey, iid, month-end} (latest
+           ``datadate``, positive factors). Without a comp.secm download it is empty, so
+           the fallback keeps the company factor.
+        2) With ``daily=True`` also ``__secd_ajex_eom``: SECD ``ajexdi`` on each month's
+           last trading day, from the ``comp_secd_current`` view already on ``con``.
     Output:
-        DuckDB view ``__sec_ajex_rep`` with {gvkey, iid, rep_eom, ajex_sec}.
+        ``__sec_ajex_rep`` {gvkey, iid, rep_eom, ajex_sec}; with ``daily=True`` also
+        ``__secd_ajex_eom`` {gvkey, iid, eom, ajex_eom}.
     Note:
-        When a security's own share count is missing, SECD/SECM infer it as
-        ``csho_fund * ajex_fund / ajex(t)`` from the company's last report. ``ajex_fund``
-        follows the company's reference share class, so for Berkshire class A it is on the
-        class B basis (1,500) while the class A factor is 1: the inferred count was
-        1,500x too large until SECD began reporting class A shares in April 1998.
-        Using the security's own factor at the report date, ``csho_fund * ajex_sec /
-        ajex(t)``, only adjusts for this security's splits between the report and ``t``.
-        Validated against the security's next reported share count on 673k fallback months
-        of NYSE/AMEX/NASDAQ common stock: 2,705 months move closer to it, 94 move further
-        away (mostly two-class companies, where a company-wide count cannot be right for
-        either class).
+        When a security's own share count is missing, SECD/SECM infer it from the
+        company's last report as ``csho_fund * ajex_fund / ajex(t)``. ``ajex_fund`` follows
+        the company's reference share class, so for Berkshire class A it is on the class B
+        basis (1,500) while the class A factor is 1: the inferred count was 1,500x too large
+        until SECD began reporting class A shares in April 1998. The fallback now adjusts
+        with the security's own SECM factors, ``ajexm(report month) / ajexm(month of t)``.
+        On the daily file that ratio is carried to the day with SECD's own step
+        ``ajexdi(month-end) / ajexdi(t)``: a factor from one file is never divided by one
+        from the other, because SECM and SECD can carry a security on different scales
+        (GalaGen 1998: ajexm 1.001, ajexdi 0.000001, which made its market cap $9 trillion),
+        and SECD can miss the report month (Berkshire had no SECD rows in 1986).
+        Checked on 1.17M fallback months against the next reported share count and on
+        the US value-weighted market against Ken French (0.996-0.999 in every decade).
     """
     source = paths.raw_table_source("comp.secm")
     if isinstance(source, Path) and not source.exists():
@@ -61,17 +68,26 @@ def register_security_ajex_at_report(con: Backend, paths: DataPaths) -> None:
                    NULL::DATE AS rep_eom, NULL::DOUBLE AS ajex_sec
             WHERE FALSE;
         """)
-        return
-    sql_source = str(source).replace("\\", "/").replace("'", "''")
-    con.raw_sql(f"""
-    CREATE OR REPLACE VIEW {SECURITY_AJEX_VIEW} AS
-        SELECT gvkey, iid, last_day(datadate) AS rep_eom, CAST(ajexm AS DOUBLE) AS ajex_sec
-        FROM read_parquet('{sql_source}')
-        WHERE ajexm > 0
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY gvkey, iid, last_day(datadate) ORDER BY datadate DESC
-        ) = 1;
-    """)
+    else:
+        sql_source = str(source).replace("\\", "/").replace("'", "''")
+        con.raw_sql(f"""
+        CREATE OR REPLACE VIEW {SECURITY_AJEX_VIEW} AS
+            SELECT gvkey, iid, last_day(datadate) AS rep_eom, CAST(ajexm AS DOUBLE) AS ajex_sec
+            FROM read_parquet('{sql_source}')
+            WHERE ajexm > 0
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY gvkey, iid, last_day(datadate) ORDER BY datadate DESC
+            ) = 1;
+        """)
+    if daily:
+        con.raw_sql(f"""
+        CREATE OR REPLACE VIEW {DAILY_AJEX_EOM_VIEW} AS
+            SELECT gvkey, iid, last_day(datadate) AS eom,
+                   arg_max(CAST(ajexdi AS DOUBLE), datadate) AS ajex_eom
+            FROM comp_secd_current
+            WHERE ajexdi > 0
+            GROUP BY gvkey, iid, last_day(datadate);
+        """)
 
 
 def correct_source_switch_returns(frame: pl.LazyFrame, paths: DataPaths, freq: str) -> pl.LazyFrame:
