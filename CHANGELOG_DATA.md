@@ -14,8 +14,12 @@ __Changes__:
 - Fixed monthly returns in months where the merged Compustat monthly file switches between SECM and SECD rows.
   - The two files' total-return factors are cumulative on different bases. SECD's is empty on its first day (1983-12-30) for 97% of securities, so a cross-file ratio is not a return.
   - 61% of US and Canadian securities had a wrong December 1983 return (median -13.9% instead of -1.5%). The US value-weighted market showed -20%; Ken French shows -1.8%.
-  - Switch months now use SECM prices at both ends, and are missing when SECM lacks either month.
+  - Switch months now use SECM prices at both ends. When SECM lacks either month, the return computed across the two files is kept.
   - This also corrects about 7,800 later months where SECD has a gap and SECM fills in, mostly in the 1990s.
+  - About 400 monthly rows of delisted North American securities (1982–2017, mostly 1982–1993) disappear from `world_ret_monthly`, and 52 from the characteristics.
+    - These are stale months after trading had stopped, where the monthly file repeats the last price.
+    - They used to survive only because the cross-file ratio gave them fake returns (Masonite May-1984 +717%, Shaklee May-1989 +212%).
+    - They now show a zero return, so the existing delisting rule ends these securities at their last real price change, as it does for all others.
 - Both defects come from the production SAS, so the SAS-era history in the research database carries them too.
 
 ## 23-09-2026
