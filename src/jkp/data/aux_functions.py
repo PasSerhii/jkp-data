@@ -5393,26 +5393,9 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
     datafmt_val = "HIST_STD" if mode == 1 else "STD"
     popsrc_val = "I" if mode == 1 else "D"
     accounting_start = pl.datetime(1949, 12, 31) if start_date is None else pl.lit(start_date)
-    raw = pl.scan_parquet(filename)
-    schema_names = set(raw.collect_schema().names())
-    publication_fields = [
-        name for name in ("pdate", "fdate", "pdateq", "fdateq", "rdq") if name in schema_names
-    ]
-    # Earliest marker, not latest: `pdate`/`rdq` record when preliminary results
-    # were released and `fdate` when the final filing landed, typically weeks
-    # later. Taking the maximum would withhold a statement that was already
-    # public — Driven Brands FY2025 was released 2026-05-19 but finalized
-    # 2026-06-03, which pushed it out of the May panel that the production SAS
-    # (a plain four-month lag) includes. Minimum keeps the guard doing only its
-    # intended job: blocking rows whose data did not exist yet, such as Akanda
-    # FY2025, which has no `pdate` at all and a `fdate` of 2026-07-01.
-    availability_date = (
-        pl.min_horizontal([col(name).cast(pl.Date) for name in publication_fields])
-        if publication_fields
-        else pl.lit(None, dtype=pl.Date)
-    )
     df = (
-        raw.with_row_index("n")
+        pl.scan_parquet(filename)
+        .with_row_index("n")
         .filter(
             c1
             & (col("datafmt") == datafmt_val)
@@ -5420,7 +5403,7 @@ def load_raw_fund_table_and_filter(filename, start_date, source_str, mode):
             & (col("consol") == "C")
             & (col("datadate") >= accounting_start)
         )
-        .with_columns(source=pl.lit(source_str), availability_date=availability_date)
+        .with_columns(source=pl.lit(source_str))
     )
     return df
 
@@ -5683,16 +5666,7 @@ def standardized_accounting_data(
                 ni=(col("ib") + pl.coalesce("xi", 0) + pl.coalesce("do", 0)).cast(pl.Float64)
             )
             .select(
-                [
-                    "gvkey",
-                    "datadate",
-                    "availability_date",
-                    "n",
-                    "indfmt",
-                    "curcd",
-                    "source",
-                    "ni",
-                ]
+                ["gvkey", "datadate", "n", "indfmt", "curcd", "source", "ni"]
                 + [fl_none().alias(i) for i in ["gp", "pstkrv", "pstkl", "itcb", "xad", "txbcof"]]
                 + query_vars
             )
@@ -5727,7 +5701,6 @@ def standardized_accounting_data(
                 [
                     "gvkey",
                     "datadate",
-                    "availability_date",
                     "n",
                     "indfmt",
                     "fyr",
@@ -5764,7 +5737,7 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_funda.parquet", start_date, "NA", 2
         )
         __funda = funda.select(
-            ["gvkey", "datadate", "availability_date", "n", "curcd", "source"]
+            ["gvkey", "datadate", "n", "curcd", "source"]
             + [fl_none().alias(i) for i in ["wcapt", "ltdch", "purtshr"]]
             + query_vars
         )
@@ -5783,17 +5756,7 @@ def standardized_accounting_data(
             paths.raw_tables_dir / "comp_fundq.parquet", start_date, "NA", 2
         )
         __fundq = fundq.select(
-            [
-                "gvkey",
-                "datadate",
-                "availability_date",
-                "n",
-                "fyr",
-                "fyearq",
-                "fqtr",
-                "curcdq",
-                "source",
-            ]
+            ["gvkey", "datadate", "n", "fyr", "fyearq", "fqtr", "curcdq", "source"]
             + [
                 fl_none().alias(i)
                 for i in ["dvtq", "gpq", "dvty", "gpy", "ltdchy", "purtshry", "wcapty"]
@@ -7790,18 +7753,6 @@ def add_profit_scaled_by_lagged_vars(df):
     return df
 
 
-def accounting_public_start(lag_to_pub: int) -> pl.Expr:
-    """Earliest month-end when an accounting observation may enter the panel."""
-    lagged_start = col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end()
-    reported_start = col("availability_date").dt.month_end()
-    return (
-        pl.when(reported_start.is_not_null() & (reported_start > lagged_start))
-        .then(reported_start)
-        .otherwise(lagged_start)
-        .alias("start_date")
-    )
-
-
 def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_pub, max_lag):
     """
     Description:
@@ -7810,10 +7761,8 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
     Steps:
         1) Run persistence job over input parquet (N=5 yrs, min=5) → 'ni_ar_res.parquet'.
         2) Join on (gvkey,curcd,datadate); keep rows with data_available=1.
-        3) Set start_date to the later of the normal publication lag and the
-           actual pdate/fdate/rdq month; end_date = min(earliest start among all
-           later records −1mo, datadate+max_lag). Records fully superseded by a
-           fresher, earlier-available report (end < start) are dropped.
+        3) Set start_date = datadate + lag_to_pub months; end_date = min(next_start−1mo, datadate+max_lag).
+           Records with end < start (two in the same month) are dropped, as SAS %expand does.
         4) Expand monthly between start/end to 'public_date'.
 
     Output:
@@ -7825,17 +7774,9 @@ def add_earnings_persistence_and_expand(paths: DataPaths, df, data_path, lag_to_
         df.join(earnings_pers, on=["gvkey", "curcd", "datadate"], how="left")
         .filter(col("data_available") == 1)
         .sort(["gvkey", "datadate"])
-        .with_columns(accounting_public_start(lag_to_pub))
+        .with_columns(start_date=col("datadate").dt.offset_by(f"{lag_to_pub}mo").dt.month_end())
         .sort(["gvkey", "datadate"])
-        # Availability-based starts are not monotone in datadate: a fiscal period
-        # can be published after a later period's report. A record is therefore
-        # superseded by the earliest start among ALL later records, not just the
-        # next row's, or a stale record would cover months where fresher data was
-        # already public (the SAS original used shift(-1), which is safe only for
-        # its plain datadate+lag starts).
-        .with_columns(
-            next_start_date=col("start_date").cum_min(reverse=True).shift(-1).over("gvkey")
-        )
+        .with_columns(next_start_date=col("start_date").shift(-1).over(["gvkey"]))
         .with_columns(
             end_date=pl.min_horizontal(
                 (col("next_start_date").dt.offset_by("-1mo").dt.month_end()),

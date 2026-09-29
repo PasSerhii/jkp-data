@@ -5,6 +5,11 @@ This repository ports the original SAS pipeline ([ReplicationCrisis](https://git
 
 ## 29-09-2026
 __Changes__:
+- Removed the accounting publication-date guard added on 26-07-2026. Statements again enter the panel 4 months after the period end and stay until the next statement or 18 months, as in the production SAS.
+  - The guard delayed a statement until its earliest `pdate`/`fdate`/`rdq`, and dropped it when that date was more than 18 months after the period end. For older records, especially Global ones, these fields are often S&P load or revision dates (Carnival's Global quarters for 2014–2016 all carry 28 October 2019).
+  - Python lacked accounting data that SAS has in 7.2% of non-North-American stock-months (12.4% in the 2000s), and for some US companies such as Carnival from mid-2015 to 2017. This data comes back.
+  - As in SAS, when history is rebuilt, a statement released more than 4 months after the period end is used from the 4-month mark. Monthly updates are unaffected, because statements not yet released are not in Compustat.
+  - Affects all accounting characteristics and the factor portfolios built on them.
 - Firm `age` no longer depends on how much history a run covers.
   - `age` counts months from the earlier of two dates: the company's first annual report or first monthly price (moved back to the previous year-end), and the security's first month in the run's own data.
   - A full-history run can start a North American security at its first daily price, which can be earlier than both. A 23-year run cannot see that month. For example, CEL-SCI in August 2026 is 512 months old in the full-history reload but 500 in a 23-year run (and in SAS).

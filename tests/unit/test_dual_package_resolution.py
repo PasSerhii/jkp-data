@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
-from jkp.data.aux_functions import accounting_public_start, resolve_dual_package_rows
+from jkp.data.aux_functions import resolve_dual_package_rows
 
 pytestmark = pytest.mark.unit
 
@@ -204,28 +204,19 @@ def test_quarterly_key_is_supported() -> None:
 
 def test_later_quarter_does_not_change_an_earlier_public_observation() -> None:
     """An August Q2 filing must not choose a different Q1 source for July."""
-    q1_metadata = {
-        "fyr": 12,
-        "datadate": date(2025, 3, 31),
-        "availability_date": date(2025, 5, 1),
-    }
+    q1_metadata = {"fyr": 12, "datadate": date(2025, 3, 31)}
     rows = [
         _qrow("001007", "GLOBAL", 2025, 1, atq=100.0, saley=10.0, **q1_metadata),
         _qrow("001007", "NA", 2025, 1, saley=20.0, **q1_metadata),
     ]
-    before = _resolve_q(rows).with_columns(accounting_public_start(4))
-    q2_metadata = {
-        "fyr": 12,
-        "datadate": date(2025, 6, 30),
-        "availability_date": date(2025, 8, 1),
-    }
+    before = _resolve_q(rows)
+    q2_metadata = {"fyr": 12, "datadate": date(2025, 6, 30)}
     rows += [
         _qrow("001007", "GLOBAL", 2025, 2, **q2_metadata),
         _qrow("001007", "NA", 2025, 2, atq=200.0, saley=40.0, capxy=2.0, **q2_metadata),
     ]
-    after = _resolve_q(rows).with_columns(accounting_public_start(4)).filter(pl.col("fqtr") == 1)
+    after = _resolve_q(rows).filter(pl.col("fqtr") == 1)
     assert_frame_equal(before, after)
-    assert after["start_date"].to_list() == [date(2025, 7, 31)]
     assert after["source"].to_list() == ["GLOBAL"]
 
 

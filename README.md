@@ -60,9 +60,8 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
    and cumulative completion percentages.
 
    Builds preserve the WRDS/SAS source cells exactly. Exchange
-   eligibility is resolved from `sec_history.EXCHG` for each observation date,
-   and accounting observations cannot enter a month before their reported
-   `pdate`/`fdate`/`rdq`. Each run writes `source_snapshot_manifest.json` with
+   eligibility is resolved from `sec_history.EXCHG` for each observation date.
+   Each run writes `source_snapshot_manifest.json` with
    the exact Fama-French input hash, date range, and latest risk-free rate so RF
    snapshot differences can be audited.
 
