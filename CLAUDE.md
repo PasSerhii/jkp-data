@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repo generates the Global Factor Data: 406 stock characteristics and their associated factor portfolios, based on "Is there a Replication Crisis in Finance?" by Jensen, Kelly, and Pedersen (Journal of Finance, 2023). It downloads data from WRDS (Wharton Research Data Services), computes characteristics from CRSP and Compustat sources, and constructs factor portfolios.
+This repo generates the Global Factor Data: 406 stock characteristics and their associated factor portfolios, based on "Is there a Replication Crisis in Finance?" by Jensen, Kelly, and Pedersen (Journal of Finance, 2023). By default it builds from Compustat on the XpressFeed RDS with CRSP bypassed (`config.BYPASS_CRSP`); WRDS (`comp.*`, and CRSP when not bypassed) remains available for regression runs. It computes the characteristics and constructs factor portfolios.
 
 ## Build & Run Commands
 
@@ -31,7 +31,7 @@ uv run pytest tests/unit/test_expressions.py::TestSumSas
 # Run tests with coverage
 uv run pytest
 
-# Run the full pipeline (requires WRDS credentials and ~450 GB RAM)
+# Run the full pipeline (requires the XpressFeed RDS URL in COMPUSTAT (.env) and ~450 GB RAM)
 jkp build data/                     # stock returns and firm characteristics
 jkp portfolio data/                 # factor returns (run after jkp build)
 
@@ -46,7 +46,7 @@ jkp connect --reset                 # reset stored credentials
 The pipeline has two entry points that run sequentially:
 
 **`src/jkp/data/main.py`** produces stock returns and firm characteristics:
-1. Download raw data from WRDS (CRSP, Compustat)
+1. Download raw Compustat data (XpressFeed RDS by default; WRDS `comp.*` and CRSP for regression runs)
 2. Prepare and merge data sources (augmented monthly stock file, market cap/trading info)
 3. Classify stocks by industry (Fama-French 49) and size (NYSE quintile cutoffs)
 4. Compute characteristics from accounting and market data
@@ -60,13 +60,16 @@ The pipeline has two entry points that run sequentially:
 - `src/jkp/data/main.py` — Pipeline orchestration; calls functions from `aux_functions` in sequence
 - `src/jkp/data/aux_functions.py` — Core library: all characteristic calculations, data transformations, and I/O utilities
 - `src/jkp/data/portfolio.py` — Standalone factor portfolio construction script
-- `src/jkp/data/wrds_credentials.py` — Keyring-based WRDS credential management
+- `src/jkp/data/compustat_fixes.py` — Fixes for two Compustat North America history defects inherited from the production SAS (share-count fallback factors, SECM/SECD switch-month returns), hooked into `aux_functions`
+- `src/jkp/data/dataupdate.py` — Upload of the production CSVs to the research MSSQL database: incremental (`jkp build --db-update`) or a full reload of every table (`jkp build --production-years 0 --db-replace`); target URL from the `RESEARCH_UPDATE` environment variable
+- `src/jkp/data/wrds_credentials.py` — WRDS credential resolution (env vars, system keyring, and the libpq `~/.pgpass` file)
+- `src/jkp/data/wrds_connection.py` — WRDS connection construction and verification (`gen_wrds_connection_info`, `verify_wrds_connection`), with password redaction on failure paths
 
 ### Data flow
 
-Raw WRDS data → `data/raw/` → intermediate processing in `data/interim/` → final outputs in `data/processed/` (subdirectories: `characteristics/`, `portfolios/`, `return_data/`, `accounting_data/`, `other_output/`).
+Raw source data → `data/raw/` → intermediate processing in `data/interim/` → final outputs in `data/processed/` (subdirectories: `characteristics/`, `portfolios/`, `return_data/`, `accounting_data/`, `other_output/`).
 
-Static reference data (`data/cluster_labels.csv`, `data/country_classification.xlsx`, `data/factor_details.xlsx`) is checked into the repo and used by the pipeline.
+Static reference data (`src/jkp/data/resources/cluster_labels.csv`, `src/jkp/data/resources/country_classification.xlsx`, `src/jkp/data/resources/factor_details.xlsx`) is packaged with the code and loaded via `_resource_path()` in `paths.py`, not read from the output directory.
 
 ## Code Conventions
 

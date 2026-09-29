@@ -23,6 +23,19 @@ class TestDataPaths:
         paths = DataPaths(base_dir=tmp_path)
         assert paths.raw_tables_dir == tmp_path / "raw" / "raw_tables"
 
+    def test_raw_table_source_defaults_to_single_file(self, tmp_path):
+        paths = DataPaths(base_dir=tmp_path)
+        assert paths.raw_table_source("comp.secd") == (
+            tmp_path / "raw" / "raw_tables" / "comp_secd.parquet"
+        )
+
+    def test_raw_table_source_uses_parts_glob_when_present(self, tmp_path):
+        paths = DataPaths(base_dir=tmp_path)
+        parts = paths.raw_tables_dir / "comp_secd_parts"
+        parts.mkdir(parents=True)
+
+        assert paths.raw_table_source("comp.secd") == str(parts / "part-*.parquet")
+
     def test_interim_dir(self, tmp_path):
         paths = DataPaths(base_dir=tmp_path)
         assert paths.interim_dir == tmp_path / "interim"

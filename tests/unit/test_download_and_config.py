@@ -33,6 +33,7 @@ from jkp.data.config import (
     REGIONAL_MONTHS_MIN,
     REGIONAL_STOCKS_MIN,
     ROLLING_DAILY_SPECS,
+    _previous_month_end,
 )
 
 # =============================================================================
@@ -55,6 +56,19 @@ class TestConfig:
             f"END_DATE ({END_DATE}) is not the last day of its month (expected day {last_day})"
         )
 
+    @pytest.mark.parametrize(
+        ("today", "expected"),
+        [
+            (date(2026, 7, 21), date(2026, 6, 30)),
+            (date(2026, 8, 1), date(2026, 7, 31)),
+            (date(2026, 3, 1), date(2026, 2, 28)),
+            (date(2024, 3, 1), date(2024, 2, 29)),
+            (date(2026, 1, 1), date(2025, 12, 31)),
+        ],
+    )
+    def test_previous_month_end(self, today, expected):
+        assert _previous_month_end(today) == expected
+
     def test_main_filters_is_dict(self):
         """MAIN_FILTERS should be a dict."""
         assert isinstance(MAIN_FILTERS, dict), (
@@ -73,18 +87,36 @@ class TestConfig:
         for k, v in MAIN_FILTERS.items():
             assert v == 1, f"MAIN_FILTERS['{k}'] should be 1, got {v}"
 
-    def test_accounting_start_date_is_polars_expr(self):
-        """ACCOUNTING_START_DATE should be a Polars expression (consumed inline)."""
-        assert isinstance(ACCOUNTING_START_DATE, pl.Expr), (
-            f"ACCOUNTING_START_DATE should be pl.Expr, got {type(ACCOUNTING_START_DATE)}"
+    def test_accounting_start_date_is_date(self):
+        """ACCOUNTING_START_DATE is the shared source/accounting lower bound."""
+        assert isinstance(ACCOUNTING_START_DATE, date), (
+            f"ACCOUNTING_START_DATE should be date, got {type(ACCOUNTING_START_DATE)}"
         )
 
     def test_accounting_start_date_value(self):
         """ACCOUNTING_START_DATE should evaluate to 1949-12-31."""
-        evaluated = pl.select(ACCOUNTING_START_DATE).item()
-        assert evaluated.date() == date(1949, 12, 31), (
-            f"ACCOUNTING_START_DATE should be 1949-12-31, got {evaluated}"
+        assert date(1949, 12, 31) == ACCOUNTING_START_DATE, (
+            f"ACCOUNTING_START_DATE should be 1949-12-31, got {ACCOUNTING_START_DATE}"
         )
+
+    def test_none_accounting_bound_falls_back_to_original_floor(self, tmp_path):
+        """A None override retains the original accounting-only 1949 floor."""
+        from jkp.data.aux_functions import load_raw_fund_table_and_filter
+
+        path = tmp_path / "funda.parquet"
+        pl.DataFrame(
+            {
+                "datadate": [date(1949, 12, 30), date(1949, 12, 31)],
+                "indfmt": ["INDL", "INDL"],
+                "datafmt": ["STD", "STD"],
+                "popsrc": ["D", "D"],
+                "consol": ["C", "C"],
+            }
+        ).write_parquet(path)
+
+        result = load_raw_fund_table_and_filter(path, None, "NA", 2).collect()
+
+        assert result["datadate"].to_list() == [date(1949, 12, 31)]
 
     def test_collect_chunk_size_is_positive_int(self):
         """COLLECT_CHUNK_SIZE must be a positive int (used as a slice step)."""
@@ -193,7 +225,7 @@ class TestRollingDailySpecs:
         assert isinstance(ROLLING_DAILY_SPECS, list) and ROLLING_DAILY_SPECS
 
     def test_suffixes_are_known(self):
-        """Every sfx must be in the set gen_aux_maps recognizes natively."""
+        """Every sfx must be in the set gen_aux_windows recognizes natively."""
         sfxs = [sfx for sfx, _, _ in ROLLING_DAILY_SPECS]
         unknown = set(sfxs) - self.KNOWN_SUFFIXES
         assert not unknown, f"Unknown suffixes: {sorted(unknown)}"
@@ -242,6 +274,7 @@ class TestDownloadWrdsTable:
         self,
         date_column: str | None = None,
         end_date: date | None = None,
+        table_name: str = "comp.funda",
     ) -> str:
         """Call download_wrds_table with a mock conn and return the executed SQL."""
         from jkp.data.aux_functions import download_wrds_table
@@ -250,12 +283,12 @@ class TestDownloadWrdsTable:
         download_wrds_table(
             conninfo="host=test",
             duckdb_conn=mock_conn,
-            table_name="comp.funda",
+            table_name=table_name,
             filename="out.parquet",
             date_column=date_column,
             end_date=end_date,
         )
-        return mock_conn.execute.call_args[0][0]
+        return "\n".join(str(c.args[0]) for c in mock_conn.execute.call_args_list if c.args)
 
     def test_no_date_filter_when_params_absent(self):
         """SQL should have no WHERE clause when date_column and end_date are None."""
@@ -318,6 +351,13 @@ class TestDownloadRawDataTables:
             patch("jkp.data.aux_functions.gen_wrds_connection_info", return_value="host=test"),
             patch("jkp.data.aux_functions.duckdb") as mock_duckdb,
             patch("jkp.data.aux_functions.download_wrds_table") as mock_download,
+            patch(
+                "jkp.data.aux_functions.download_wrds_daily_table_batched"
+            ) as mock_daily_download,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
         ):
             mock_conn = MagicMock()
             mock_duckdb.connect.return_value = mock_conn
@@ -330,7 +370,8 @@ class TestDownloadRawDataTables:
                 "pass",
                 end_date=date(2025, 12, 31),
             )
-            yield mock_download.call_args_list
+            all_calls = mock_download.call_args_list + mock_daily_download.call_args_list
+            yield all_calls
 
     def test_date_filtered_tables_get_date_column(self, captured_calls):
         """Tables with known date columns should receive the date_column kwarg."""
@@ -385,8 +426,47 @@ class TestDownloadRawDataTables:
         downloaded = {
             c.args[2] if len(c.args) > 2 else c.kwargs.get("table_name") for c in captured_calls
         }
-        expected_subset = {"comp.funda", "crsp.msf_v2", "crsp.dsf_v2", "comp.secd"}
+        expected_subset = {
+            "comp.funda",
+            "crsp.msf_v2",
+            "crsp.dsf_v2",
+            "comp.secd",
+        }
         assert expected_subset <= downloaded, f"Missing tables: {expected_subset - downloaded}"
+
+    def test_bypass_crsp_skips_crsp_tables(self, test_paths):
+        """CRSP downloads should be skipped in Compustat-only mode."""
+        with (
+            patch("jkp.data.aux_functions.gen_wrds_connection_info", return_value="host=test"),
+            patch("jkp.data.aux_functions.duckdb") as mock_duckdb,
+            patch("jkp.data.aux_functions.download_wrds_table") as mock_download,
+            patch(
+                "jkp.data.aux_functions.download_wrds_daily_table_batched"
+            ) as mock_daily_download,
+            patch(
+                "jkp.data.aux_functions.load_security_pairs",
+                return_value=[("001234", "01")],
+            ),
+        ):
+            mock_duckdb.connect.return_value = MagicMock()
+
+            from jkp.data.aux_functions import download_raw_data_tables
+
+            download_raw_data_tables(
+                test_paths,
+                "user",
+                "pass",
+                end_date=date(2025, 12, 31),
+                bypass_crsp=True,
+            )
+
+        downloaded = {
+            c.args[2] if len(c.args) > 2 else c.kwargs.get("table_name")
+            for c in mock_download.call_args_list + mock_daily_download.call_args_list
+        }
+        assert downloaded
+        assert not any(t.startswith("crsp.") for t in downloaded)
+        assert "comp.funda" in downloaded
 
 
 # =============================================================================
@@ -488,6 +568,109 @@ class TestSaveMainData:
         assert output["me_lag1"][0] is None or output["me_lag1"][0] != output["me_lag1"][0]
         assert output["me_lag1"][1] == pytest.approx(100.0)
         assert output["me_lag1"][2] == pytest.approx(200.0)
+
+
+class TestSaveMonthlyRet:
+    """Tests for the SAS-compatible monthly return output."""
+
+    def test_monthly_return_schema_matches_modified_sas(self, test_paths):
+        from jkp.data.aux_functions import save_monthly_ret
+
+        pl.DataFrame(
+            {
+                "excntry": ["USA"],
+                "id": [1],
+                "source_crsp": [0],
+                "eom": [date(2020, 1, 31)],
+                "me": [100.0],
+                "ret_exc": [0.01],
+                "ret": [0.02],
+                "ret_local": [0.03],
+                "ret_exc_wins": [0.011],
+            }
+        ).write_parquet(test_paths.interim_dir / "world_msf.parquet")
+
+        save_monthly_ret(test_paths)
+
+        expected = ["excntry", "id", "source_crsp", "eom", "ret_exc", "ret", "ret_local"]
+        parquet_out = pl.read_parquet(
+            test_paths.processed_dir / "return_data" / "world_ret_monthly.parquet"
+        )
+        assert parquet_out.columns == expected
+
+        csv_out = test_paths.production_dir / "world_ret_monthly.csv"
+        assert csv_out.exists()
+        assert [c.strip('"') for c in csv_out.read_text().splitlines()[0].split(",")] == expected
+
+    def test_monthly_return_uses_unfiltered_world_msf(self, test_paths):
+        """The SAS export takes scratch.world_msf with no screen: non-main
+        securities (ETFs, secondary listings, non-main exchanges) must be kept."""
+        from jkp.data.aux_functions import save_monthly_ret
+
+        base = {
+            "source_crsp": [0, 0, 0],
+            "eom": [date(2020, 1, 31)] * 3,
+            "ret_exc": [0.01, 0.02, 0.03],
+            "ret": [0.02, 0.03, 0.04],
+            "ret_local": [0.03, 0.04, 0.05],
+        }
+        unfiltered = pl.DataFrame(
+            {
+                "excntry": ["USA", "USA", "DEU"],
+                "id": [1, 2, 3],
+                # id 2 is an ETF (common=0), id 3 a non-main-exchange listing.
+                "primary_sec": [1, 1, 1],
+                "common": [1, 0, 1],
+                "obs_main": [1, 1, 1],
+                "exch_main": [1, 1, 0],
+                **base,
+            }
+        )
+        unfiltered.write_parquet(test_paths.interim_dir / "world_msf.parquet")
+        unfiltered.filter(
+            (pl.col("primary_sec") == 1)
+            & (pl.col("common") == 1)
+            & (pl.col("obs_main") == 1)
+            & (pl.col("exch_main") == 1)
+        ).write_parquet(test_paths.interim_dir / "world_msf_output.parquet")
+
+        save_monthly_ret(test_paths)
+
+        output = pl.read_parquet(
+            test_paths.processed_dir / "return_data" / "world_ret_monthly.parquet"
+        )
+        assert sorted(output["id"].to_list()) == [1, 2, 3]
+
+
+class TestSaveOutputFiles:
+    """Tests for the SAS-compatible small output CSVs."""
+
+    def test_writes_sas_output_csv_files(self, test_paths):
+        from jkp.data.aux_functions import save_output_files
+
+        sample = pl.DataFrame({"excntry": ["USA"], "date": [date(2020, 1, 31)], "ret": [0.01]})
+        for name in (
+            "market_returns",
+            "market_returns_daily",
+            "nyse_cutoffs",
+            "return_cutoffs",
+            "return_cutoffs_daily",
+            "ap_factors_monthly",
+            "ap_factors_daily",
+        ):
+            sample.write_parquet(test_paths.interim_dir / f"{name}.parquet")
+
+        save_output_files(test_paths)
+
+        for name in (
+            "market_returns_daily",
+            "market_returns",
+            "nyse_cutoffs",
+            "return_cutoffs",
+            "return_cutoffs_daily",
+        ):
+            assert (test_paths.production_dir / f"{name}.csv").exists()
+            assert (test_paths.processed_dir / "other_output" / f"{name}.parquet").exists()
 
 
 # =============================================================================

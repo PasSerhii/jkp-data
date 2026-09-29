@@ -115,3 +115,12 @@ aux_*.ddb
 # Rust plugin build artifacts
 jkp-plugin/target/
 jkp-plugin/Cargo.lock
+/docs/
+/.debug-output/
+/.env
+
+/report_codex_27-07-2026_run_analysis_artifacts/
+/report_codex_29-07-2026_run_analysis_artifacts/
+/report_codex_23-09-2026_sic_fix_artifacts/
+/report_codex_23-09-2026_sic_fix.md
+/scripts/validate_sic_history.py
