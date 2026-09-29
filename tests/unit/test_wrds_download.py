@@ -435,7 +435,10 @@ class TestReusableRawValidation:
             parts_dir.mkdir()
             for number in (1, 2):
                 (parts_dir / f"part-{number:06d}.parquet").write_bytes(b"data")
-        (paths.raw_tables_dir / "comp_age_anchor.parquet").write_bytes(b"data")
+        pl.DataFrame(
+            {"gvkey": ["001"], "iid": ["01"], "comp_dprc_first": [None]},
+            schema={"gvkey": pl.String, "iid": pl.String, "comp_dprc_first": pl.Date},
+        ).write_parquet(paths.raw_tables_dir / "comp_age_anchor.parquet")
         return paths
 
     def test_complete_daily_parts_are_reusable(self, tmp_path, monkeypatch):
@@ -465,3 +468,17 @@ class TestReusableRawValidation:
         )
         with pytest.raises(RuntimeError, match="missing or empty comp_industry_history.parquet"):
             aux.validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_old_raw_cache_without_first_daily_price_anchor_is_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        import polars as pl
+
+        from jkp.data.aux_functions import validate_reusable_raw_data
+
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        pl.DataFrame({"gvkey": ["001"], "comp_ret_first": [None]}).write_parquet(
+            paths.raw_tables_dir / "comp_age_anchor.parquet"
+        )
+        with pytest.raises(RuntimeError, match="predates the first-daily-price anchor"):
+            validate_reusable_raw_data(paths, bypass_crsp=True)

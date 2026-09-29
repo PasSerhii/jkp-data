@@ -5,6 +5,12 @@ This repository ports the original SAS pipeline ([ReplicationCrisis](https://git
 
 ## 29-09-2026
 __Changes__:
+- Firm `age` no longer depends on how much history a run covers.
+  - `age` counts months from the earlier of two dates: the company's first annual report or first monthly price (moved back to the previous year-end), and the security's first month in the run's own data.
+  - A full-history run can start a North American security at its first daily price, which can be earlier than both. A 23-year run cannot see that month. For example, CEL-SCI in August 2026 is 512 months old in the full-history reload but 500 in a 23-year run (and in SAS).
+  - The age anchor now also records each North American security's first daily price, so every run gives the full-history value.
+  - In 23-year runs, 205 of 28,480 US and Canadian securities change (54 active in August 2026), by up to 168 months. Full-history results are unchanged.
+  - A raw-data cache from before this change must re-download `comp_age_anchor`.
 - Fixed inflated company market equity (`me_company`) for US companies with preferred stock, warrants or units listed on NYSE, AMEX or NASDAQ.
   - Without CRSP, a US stock's `me_company` is the sum over the company's listings on these exchanges on the same date. That sum also counted non-common issues.
   - Most warrants and some preferreds have no Compustat share count of their own, so they carried the company's full common share count. In August 2026, Occidental's warrants added $38bn to a $60bn company.

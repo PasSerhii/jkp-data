@@ -1197,6 +1197,8 @@ def validate_reusable_raw_data(paths: DataPaths, *, bypass_crsp: bool) -> None:
     age_anchor = paths.raw_tables_dir / "comp_age_anchor.parquet"
     if not age_anchor.is_file() or age_anchor.stat().st_size == 0:
         problems.append(f"missing or empty {age_anchor.name}")
+    elif "comp_dprc_first" not in pl.read_parquet_schema(age_anchor):
+        problems.append(f"{age_anchor.name} predates the first-daily-price anchor; re-download it")
 
     con = duckdb.connect(":memory:")
     try:
@@ -1966,6 +1968,12 @@ def build_compustat_age_anchor_query(raw_schema: str) -> str:
     starts from the small security header and performs ``ORDER BY datadate
     LIMIT 1`` probes on each source's natural-key index.  It reproduces the
     years used by ``firm_age`` without scanning or downloading full history.
+
+    Company rows (``iid`` NULL) carry the first accounting and return dates.
+    Security rows carry ``comp_dprc_first``, the first daily price of a North
+    American security that the monthly panel would keep (price, currency,
+    prcstd 3/4/10): a full-history panel can start there, before the monthly
+    file, and ``firm_age`` needs it to give every run window the same age.
     """
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_schema):
         raise ValueError(f"Invalid raw PostgreSQL schema: {raw_schema!r}")
@@ -1984,9 +1992,16 @@ def build_compustat_age_anchor_query(raw_schema: str) -> str:
     national_first = ",\n             ".join(
         first_date(table) for table in ("sec_mth", "sec_mthprc", "sec_mthtrt")
     )
+    daily_first = (
+        f"(SELECT x.datadate FROM {schema}.{_pg_ident('sec_dprc')} x "
+        "WHERE x.gvkey=s.gvkey AND x.iid=s.iid AND x.prccd IS NOT NULL "
+        "AND x.curcdd IS NOT NULL AND x.prcstd IN (3, 4, 10) "
+        "ORDER BY x.datadate LIMIT 1)"
+    )
     return f"""
 WITH security_pairs AS MATERIALIZED (
   SELECT s.gvkey,
+         s.iid,
          CASE WHEN s.iid LIKE '%W' THEN
            LEAST(
              {global_first}
@@ -1995,7 +2010,8 @@ WITH security_pairs AS MATERIALIZED (
            LEAST(
              {national_first}
            )
-         END AS first_date
+         END AS first_date,
+         CASE WHEN s.iid LIKE '%W' THEN NULL ELSE {daily_first} END AS first_daily
   FROM {schema}.{_pg_ident("security")} s
   LEFT JOIN {schema}.{_pg_ident("company")} c ON c.gvkey=s.gvkey
   WHERE s.iid NOT LIKE '%W'
@@ -2014,11 +2030,17 @@ WITH security_pairs AS MATERIALIZED (
   GROUP BY gvkey
 )
 SELECT COALESCE(ret.gvkey, acc.gvkey)::varchar AS gvkey,
+       NULL::varchar AS iid,
        ret.comp_ret_first,
-       acc.comp_acc_first
+       acc.comp_acc_first,
+       NULL::date AS comp_dprc_first
 FROM ret
 FULL JOIN acc USING (gvkey)
-ORDER BY gvkey
+UNION ALL
+SELECT gvkey::varchar, iid::varchar, NULL::date, NULL::date, first_daily::date
+FROM security_pairs
+WHERE first_daily IS NOT NULL
+ORDER BY gvkey, iid NULLS FIRST
 """.strip()
 
 
@@ -8578,14 +8600,21 @@ def firm_age(paths: DataPaths, data_path, bypass_crsp: bool = False):
         1) Load the compact, unfiltered Compustat age anchor produced during download.
         2) When CRSP is enabled, get its earliest date per permco; bypass mode
            never reads a CRSP file.
-        3) Join earliest sources to each (id, eom); also get first observed eom per id.
+        3) Join earliest sources to each (id, eom): the company's first accounting and
+           return years, and the security's first daily price; also get first observed
+           eom per id.
         4) Age = months between eom and min(first_obs, first_alt). Write result.
 
     Output:
         'firm_age.parquet' with [id, eom, age].
+
+    Note:
+        The first daily price is taken as it is, not moved to the previous year-end:
+        it is where a full-history panel starts (first_alt), so a run over a shorter
+        window gets the same age as a full-history run.
     """
     con = ibis.duckdb.connect(threads=os.cpu_count())
-    data = con.read_parquet(data_path).select(["gvkey", "permco", "id", "eom"])
+    data = con.read_parquet(data_path).select(["gvkey", "permco", "id", "iid", "eom"])
     con.create_table("data", data.to_polars())
     con.create_table(
         "comp_age_anchor",
@@ -8617,11 +8646,13 @@ def firm_age(paths: DataPaths, data_path, bypass_crsp: bool = False):
                             END,
                             CASE WHEN c.comp_ret_first IS NULL THEN NULL ELSE
                               MAKE_DATE(YEAR(c.comp_ret_first) - 1, 12, 31)
-                            END
+                            END,
+                            d.comp_dprc_first
                         ) AS first_obs
                     FROM data AS a
                     LEFT JOIN crsp_age AS b ON a.permco = b.permco
-                    LEFT JOIN comp_age_anchor AS c ON a.gvkey = c.gvkey;
+                    LEFT JOIN comp_age_anchor AS c ON a.gvkey = c.gvkey AND c.iid IS NULL
+                    LEFT JOIN comp_age_anchor AS d ON a.gvkey = d.gvkey AND a.iid = d.iid;
 
                     CREATE TABLE age2 AS
                     SELECT  *, MIN(eom) OVER (PARTITION BY id) AS first_alt
