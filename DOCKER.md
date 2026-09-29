@@ -51,12 +51,14 @@ docker run --rm --name jkp-build `
   --compustat-source xpressfeed `
   --bypass-crsp `
   --persistent-connection `
-  --start-date 2000-01-01 `
   --end-date 2026-06-30
 ```
 
 Omit `--end-date` for the normal monthly job; the application then fixes the
-cutoff at the previous calendar month-end when the process starts.
+cutoff at the previous calendar month-end when the process starts. Without
+`--start-date` the build covers the rolling `config.ROLLING_INPUT_YEARS` (23)
+years before the end date, as production does; `--full-history` starts at
+1949-12-31.
 
 ## Push to Amazon ECR
 
@@ -114,8 +116,7 @@ docker run --rm --name jkp-monthly \
   build /data \
   --compustat-source xpressfeed \
   --bypass-crsp \
-  --persistent-connection \
-  --start-date 2000-01-01
+  --persistent-connection
 ```
 
 For the first full run, keep the stopped container available for inspection and
@@ -130,7 +131,6 @@ docker run -d --name jkp-monthly \
   --compustat-source xpressfeed \
   --bypass-crsp \
   --persistent-connection \
-  --start-date 2000-01-01 \
   --metrics-interval 60
 
 docker logs --follow jkp-monthly
@@ -171,12 +171,14 @@ directories, and restart with `--reuse-raw --force`. The recovery option
 validates all required source files and verifies that the `secd` and `g_secd`
 part sequences match their complete security-pair universes before it skips
 the database download. It fails closed when any input or daily part is
-missing or empty.
+missing or empty, or when `comp_age_anchor.parquet` predates the per-security
+first-daily-price anchor (re-download it in that case).
 
 The EC2 security group must be allowed to reach the XpressFeed RDS on port
 5432. No VPN is required when routing and security groups permit private VPC
 access.
 
-`/secure/jkp.env` should contain `COMPUSTAT=...` and should not be stored in the
-repository, image, user-data script, or ECR. A later automated deployment can
-retrieve it from AWS Secrets Manager immediately before starting the job.
+`/secure/jkp.env` holds `COMPUSTAT=...` (plus `RESEARCH_UPDATE=...` when the
+run uploads to the research database) and must not be stored in the repository,
+image, user-data script, or ECR. The EC2 host fetches it from SSM Parameter
+Store at boot; see [OPERATIONS.md](OPERATIONS.md), section 2.

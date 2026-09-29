@@ -39,20 +39,22 @@ If you do not have a WRDS subscription, you can still access pre-computed factor
    ```
 
    `--start-date` is a calculation-history bound, not just an output filter.
-   It defaults to the single `config.ACCOUNTING_START_DATE` value
-   (`1949-12-31`), matching the original accounting-history floor and retaining
-   all history currently available in the downloaded time-series sources. Firm
-   age can begin before that floor, so each download also creates a compact
-   `comp_age_anchor.parquet` from indexed full-history minima.
+   It defaults to `config.ROLLING_INPUT_YEARS` (23) years before the end date,
+   the shortest window that leaves no characteristic empty. `--full-history`
+   starts at `config.ACCOUNTING_START_DATE` (`1949-12-31`) instead, the
+   original accounting-history floor. Firm age can begin before either bound,
+   so each download also creates a compact `comp_age_anchor.parquet` from
+   indexed full-history minima. These are each company's first annual report
+   and first price record, and each North American security's first daily
+   price, so every window gives the same age.
 
-   `comp.secd` and `comp.g_secd` are downloaded in deterministic 250-security
-   parts by a shared two-worker pool. Each worker owns its database connection,
-   and interrupted runs reuse parts whose Parquet data and manifest still match
-   the requested pairs, columns, and date bounds. Use
-   `--daily-download-workers 1` for a serial comparison; values above 4 are
-   rejected. A failed batch is retried up to three times with a fresh connection
-   and 5, 10, then 20 seconds of backoff. Keep the production default at 2 until
-   database monitoring shows that a higher setting is safe.
+   `comp.secd` and `comp.g_secd` are downloaded in deterministic 350-security
+   parts by a shared pool of `config.DAILY_DOWNLOAD_WORKERS` (8) workers. Each
+   worker owns its database connection, and interrupted runs reuse parts whose
+   Parquet data and manifest still match the requested pairs, columns, and date
+   bounds. Use `--daily-download-workers 1` for a serial comparison; values
+   above 8 are rejected. A failed batch is retried up to three times with a
+   fresh connection and 5, 10, then 20 seconds of backoff.
 
    Download timing and throughput are written to
    `run_logs/<run-id>/download_telemetry.csv`, including table/batch rows,

@@ -243,14 +243,17 @@ production-correct value; override only for a reason.
 |---|---|---|
 | `COUNTRIES` | *(empty)* | Empty uploads every country. A space-separated list uploads only those; the six cross-country files still ship. |
 | `START_DATE` | *(empty)* | Empty gives the rolling `ROLLING_INPUT_YEARS` (23) window. |
-| `END_DATE` | `2026-06-30` | Last month end to build. |
+| `FULL_HISTORY` | `0` | `1` passes `--full-history`: sources start at `config.ACCOUNTING_START_DATE` (1949-12-31). Cannot be combined with `START_DATE`, and makes `DB_UPDATE` default to `0`. |
+| `END_DATE` | *(previous month end)* | Last month end to build, computed at launch. |
+| `PRODUCTION_YEARS` | *(empty)* | Empty keeps `config.PRODUCTION_OUTPUT_YEARS` (3) years in the per-country CSVs; `0` writes all years (required by `DB_REPLACE`). |
 | `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). |
 | `KEEP_INTERIM` | `1` | Keeps `interim/` and `raw/` and ships the accounting artefacts to S3. |
-| `DB_UPDATE` | `1` | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (currently `research_test`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
+| `DB_UPDATE` | `1` (`0` with `FULL_HISTORY=1`) | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (currently `research_test`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
+| `DB_REPLACE` | `0` | `1` passes `--db-replace` instead: the eight research tables in the same database are emptied and reloaded from the CSVs (see section 5). Needs `PRODUCTION_YEARS=0`. |
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
 | `MARKET` | `ondemand` | `spot` is available for a throwaway re-run; a reclaim on a delivery loses the run. |
-| `INSTANCE_TYPE` | `r7i.16xlarge` | 64 vCPU / 512 GiB. Cheaper *and* faster than `m6a.32xlarge` — see below. Do not move to `m7i.16xlarge`: 256 GiB against a ~351 GiB peak, so it OOMs. |
+| `INSTANCE_TYPE` | `r7i.16xlarge` | 64 vCPU / 512 GiB. Cheaper *and* faster than `m6a.32xlarge` — see below. Do not move to `m7i.16xlarge`: 256 GiB against a 314–378 GiB peak, so it OOMs. |
 | `VOLUME_GB` / `VOLUME_IOPS` / `VOLUME_MBPS` | `750` / `8000` / `1000` | gp3 root volume. Peak disk was 471–485 GiB, so do not go below 750. |
 
 `production-run.sh --unattended` additionally reads `RUN_TAG`, `IMAGE` and
@@ -320,8 +323,10 @@ option uses the configured source floor (1949-12-31), the same floor as
 upstream's unbounded build. Pin `END_DATE` to the required month end and leave
 `COUNTRIES` empty to upload every country. Memory is tight on the default
 r7i.16xlarge (496 GiB usable): 23-year builds peak at 314–378 GiB in
-`prepare_comp_sf`, and full history carries roughly 30% more daily rows. The
-first full-history run's `run_logs/resource_metrics.csv` gives the real peak.
+`prepare_comp_sf`, and the three full-history runs of September 2026 peaked at
+455–464 GiB there, leaving 34–41 GiB free. A 64 GiB swap file added on the host
+as insurance was never used. A full-history run takes about 6 hours on demand
+(~2 h build, ~4 h database reload), about $32.
 
 To reload the research tables from that build, add `DB_REPLACE=1`
 (`jkp build --db-replace`, in place of `--db-update`; same `RESEARCH_UPDATE`
@@ -331,8 +336,9 @@ from the CSVs. The upload refuses to start while the database is in FULL
 recovery, which would keep the whole reload in the transaction log on the
 volume shared with `research`; set it once with `ALTER DATABASE [research_test]
 SET RECOVERY SIMPLE`. The tables are empty or partial while it runs, and a
-failure stops it: rerun to start over. Dropping the nonclustered indexes
-beforehand makes the daily reload much faster.
+failure stops it: rerun to start over. Disabling the four nonclustered indexes
+on `dailyreturnsproduction` beforehand (`ALTER INDEX … DISABLE`) cuts its reload
+to ~1.5 h. Rebuild them afterwards (`ALTER INDEX … REBUILD`, 9–16 min each).
 
 After the completion email:
 
@@ -347,12 +353,10 @@ aws ec2 terminate-instances --region eu-central-1 --instance-ids i-0abc...
 against ~95 GiB unbounded). Whatever was not uploaded — the remaining CSVs and
 all parquet output — is lost, and recovering it means a full rerun.
 
-**The sasWrds uploader needs updating to match.** Its `Folder` enum walks
-`CharacteristicsProduction/` and `DailyReturnsProduction/`; the layout above uses
-`monthly/` and `daily/`. `FileFactory` returns `None` for unrecognised names and
-`WrdsUpdater` logs nothing, so anything unmatched is skipped silently while the
-job still reports success — point `FILE_PATH` at `processed/production/` and
-rename the two folder constants.
+**The build loads the research database itself.** With `DB_UPDATE=1` (the
+default) the container uploads these CSVs incrementally to the database named by
+`RESEARCH_UPDATE` (`jkp build --db-update`, `src/jkp/data/dataupdate.py`); the
+separate sasWrds uploader is not used.
 
 ---
 
@@ -438,4 +442,3 @@ The build is one command; nothing runs on a schedule yet. Still manual:
   the volume can be inspected. Terminate it when you are done — a 750 GB volume
   on a stopped instance still costs ~$60/month.
 - **Downloading the output.** `aws s3 sync s3://<bucket>/<run-tag>/production/ …`
-- **Loading the database.** Separate flow, separate repo.
