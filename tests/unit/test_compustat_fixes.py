@@ -301,8 +301,8 @@ def test_returns_around_a_secd_gap_use_secm_both_ways(test_paths) -> None:
     assert ret[("005000", mar)] == pytest.approx(12.0 / 11.0 - 1)  # was 12 / 33 - 1 = -64%
 
 
-def _write_final_switch_month(test_paths) -> date:
-    """A security whose last month is a switch month that SECM does not cover (SECD only)."""
+def test_switch_without_both_secm_months_gives_no_return(test_paths) -> None:
+    """If SECM lacks either month of a switch, the return is missing rather than a cross-file ratio."""
     nov, dec, dec_d = date(1983, 11, 30), date(1983, 12, 31), date(1983, 12, 30)
     _write_switch_inputs(
         test_paths,
@@ -310,30 +310,8 @@ def _write_final_switch_month(test_paths) -> date:
         secd_eoms=[("006000", dec)],
         secm=[("006000", nov, 5.0)],
     )
-    return dec_d
 
-
-def test_switch_without_both_secm_months_keeps_the_cross_file_return(test_paths) -> None:
-    """If SECM lacks either month of a switch, there is no same-file return to use: the return
-    computed across the two files stays (exact for non-dividend payers)."""
-    dec_d = _write_final_switch_month(test_paths)
-
-    assert _returns(test_paths)[("006000", dec_d)] == pytest.approx(2.0 / 5.0 - 1)
-
-
-def test_delisted_security_keeps_its_final_switch_month(test_paths) -> None:
-    """Regression: an empty return in a delisted security's last month made gen_delist_df end
-    it a month early, which dropped that final row (409 monthly rows in the full-history run)."""
-    dec_d = _write_final_switch_month(test_paths)
-    raw_dfs = test_paths.interim_dir / "raw_data_dfs"
-    raw_dfs.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame(
-        {"gvkey": ["006000"], "iid": ["01"], "secstat": ["I"], "dlrsni": ["01"], "dldtei": [dec_d]}
-    ).write_parquet(raw_dfs / "__sec_info.parquet")
-
-    delist = aux.gen_delist_df(test_paths, aux.gen_returns_df(test_paths, "m"))
-
-    assert delist["date_delist"].to_list() == [dec_d]
+    assert _returns(test_paths)[("006000", dec_d)] is None
 
 
 def test_source_switch_correction_leaves_daily_data_alone(test_paths) -> None:

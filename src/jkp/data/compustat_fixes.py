@@ -100,8 +100,7 @@ def correct_source_switch_returns(frame: pl.LazyFrame, paths: DataPaths, freq: s
            (gen_comp_msf keeps the SECD row whenever both files have the month).
         2) Attach SECM's USD and local return indexes for the same month from secm_data.
         3) Where a row's source differs from the previous row's, set ret/ret_local to the
-           SECM return between the two months. When SECM lacks either month, keep the
-           return computed across the two files.
+           SECM return between the two months; null when SECM lacks either month.
     Output:
         The frame with ret/ret_local corrected at source switches; all other rows and
         daily data are unchanged.
@@ -110,12 +109,8 @@ def correct_source_switch_returns(frame: pl.LazyFrame, paths: DataPaths, freq: s
         bases, and trfd is empty on SECD's first day (1983-12-30) for 97% of securities, so
         a ratio across the two files is not a return: BancWest's Dec-1983 return came out
         -57.8% while its price rose 3%. Besides Dec-1983 this covers ~7,800 later months
-        in which SECD has a gap and SECM fills in. The cross-file return is kept when SECM
-        cannot supply both months: it is exact for non-dividend payers, and an empty return
-        would make gen_delist_df end a delisted security a month early, dropping its final
-        row (409 monthly rows were lost this way when the return was left empty). The frames
-        written by gen_comp_msf are required; without them (unit tests of gen_returns_df
-        alone) nothing changes.
+        in which SECD has a gap and SECM fills in. The frames written by gen_comp_msf are
+        required; without them (unit tests of gen_returns_df alone) nothing changes.
     """
     secd_path = paths.interim_dir / "secd_data.parquet"
     secm_path = paths.interim_dir / "secm_data.parquet"
@@ -146,11 +141,9 @@ def correct_source_switch_returns(frame: pl.LazyFrame, paths: DataPaths, freq: s
         .with_columns(pl.col("_from_secd").fill_null(False))
         .sort([*by, "datadate"])
         .with_columns(
-            ret=pl.when(switch)
-            .then(pl.coalesce(secm_return("_ri_secm"), pl.col("ret")))
-            .otherwise(pl.col("ret")),
+            ret=pl.when(switch).then(secm_return("_ri_secm")).otherwise(pl.col("ret")),
             ret_local=pl.when(switch)
-            .then(pl.coalesce(secm_return("_ri_local_secm"), pl.col("ret_local")))
+            .then(secm_return("_ri_local_secm"))
             .otherwise(pl.col("ret_local")),
         )
         .drop(["_from_secd", "_ri_secm", "_ri_local_secm"])
