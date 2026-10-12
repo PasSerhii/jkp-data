@@ -3054,9 +3054,11 @@ def gen_comp_dsf(paths: DataPaths):
         (prc_local   * fx) * cshoc AS me,
         cshtrd       * (prc_local * fx) AS dolvol,
         ri_local     * fx AS ri,
-        COALESCE(div, 0)   * fx_div AS div_tot,
-        COALESCE(divd, 0)  * fx_div AS div_cash,
-        COALESCE(divsp, 0) * fx_div AS div_spc,
+        -- A day without a dividend is 0, also for a security with no dividend
+        -- currency (fx_div is then null); only a dividend without an FX rate stays null.
+        CASE WHEN COALESCE(div, 0)   = 0 THEN 0::DOUBLE ELSE div   * fx_div END AS div_tot,
+        CASE WHEN COALESCE(divd, 0)  = 0 THEN 0::DOUBLE ELSE divd  * fx_div END AS div_cash,
+        CASE WHEN COALESCE(divsp, 0) = 0 THEN 0::DOUBLE ELSE divsp * fx_div END AS div_spc,
         last_day(datadate) AS eom
 
     FROM __comp_dsf2;
@@ -3070,6 +3072,24 @@ def gen_comp_dsf(paths: DataPaths):
     con.disconnect()
 
 
+def _month_dividends(daily: ibis.Deferred, window) -> ibis.Deferred:
+    """
+    Description:
+        Sum a security-month's split-adjusted daily dividends.
+    Steps:
+        1) Sum dividend / ajexdi over the window and scale back by the month's ajexdi.
+        2) Null the month when a day's dividend is unknown: after gen_comp_dsf, a day without a
+           dividend is 0, so null means a dividend that could not be converted (no FX rate). A
+           dividend on a day without an adjustment factor (a dividend-only row on a non-trading
+           day) cannot be adjusted either. The month's dividend is then unknown, not 0.
+    Output:
+        Deferred ibis expression for the monthly dividend.
+    """
+    total = (daily / _.ajexdi).sum().over(window) * _.ajexdi
+    unknown = daily.isnull() | ((daily != 0) & _.ajexdi.isnull())
+    return ibis.ifelse(unknown.any().over(window), ibis.null("float64"), total)
+
+
 def gen_secd_data(paths: DataPaths):
     """
     Description:
@@ -3081,7 +3101,8 @@ def gen_secd_data(paths: DataPaths):
         2) Define window over {gvkey, iid, eom}.
         3) Compute monthly aggregates at adjusted units:
         - prc_highm/prc_lowm: month max/min using pre-adjusted local price with ajexdi.
-        - div_*m: sum of monthly dividends (by type) adjusted.
+        - div_*m: sum of monthly dividends (by type) adjusted; null when a day's dividend
+          could not be converted to USD or split-adjusted.
         - cshtrm: sum of adjusted share turnover; dolvolm: sum of USD dollar volume.
         - source=1 to mark SECD pipeline.
         4) Keep valid rows (local price/currency present, prcstd in {3,4,10});
@@ -3107,9 +3128,9 @@ def gen_secd_data(paths: DataPaths):
                 (_.prc_low / _.ajexdi).min().over(window),
             )
             * _.ajexdi,
-            div_totm=(_.div_tot / _.ajexdi).sum().over(window) * _.ajexdi,
-            div_cashm=(_.div_cash / _.ajexdi).sum().over(window) * _.ajexdi,
-            div_spcm=(_.div_spc / _.ajexdi).sum().over(window) * _.ajexdi,
+            div_totm=_month_dividends(_.div_tot, window),
+            div_cashm=_month_dividends(_.div_cash, window),
+            div_spcm=_month_dividends(_.div_spc, window),
             cshtrm=(_.cshtrd / _.ajexdi).sum().over(window) * _.ajexdi,
             dolvolm=_.dolvol.sum().over(window),
             source=1,
@@ -3158,7 +3179,8 @@ def gen_secm_data(paths: DataPaths):
             adjust NASDAQ cshtrm by historical factors.
         - Join FX for trading and dividend currencies; compute ri_local with the
             production coalesce(trfm, 1).
-        3) Project to final fields: USD prc, prc_high/low, ME, dolvol, RI, total dividends (cash/special null),
+        3) Project to final fields: USD prc, prc_high/low, ME, dolvol, RI, total dividends (0 without a
+        dividend; cash/special 0 then too, otherwise null),
         prcstd=10, source=0, and eom=last_day(datadate).
         4) Write to secm_data.parquet.
 
@@ -3229,9 +3251,10 @@ def gen_secm_data(paths: DataPaths):
         prc_local      * fx * cshoc        AS me,
         cshtrm         * fx * prc_local    AS dolvol,
         ri_local       * fx                AS ri,
-        dvpsxm         * fx_div            AS div_tot,
-        NULL::DOUBLE                       AS div_cash,
-        NULL::DOUBLE                       AS div_spc
+        CASE WHEN COALESCE(dvpsxm, 0) = 0 THEN 0::DOUBLE ELSE dvpsxm * fx_div END AS div_tot,
+        -- SECM has no cash/special split: 0 without a dividend, unknown with one
+        CASE WHEN COALESCE(dvpsxm, 0) = 0 THEN 0::DOUBLE END AS div_cash,
+        CASE WHEN COALESCE(dvpsxm, 0) = 0 THEN 0::DOUBLE END AS div_spc
         FROM base
         WHERE prc_local IS NOT NULL AND curcdd IS NOT NULL;
     """)

@@ -3,6 +3,16 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 12-10-2026
+__Changes__:
+- Dividend yields of stocks that pay no dividend are now 0 instead of missing, as the documentation specifies ("If DIV is missing, we set it to zero").
+  - The daily file converted dividends as `COALESCE(div, 0) * fx_div`. A stock that never paid has no dividend currency, so `fx_div` was null and so was the product. A day without a dividend now counts as 0.
+  - A dividend that cannot be converted (no FX rate) stays null, and so does the month that contains it; it is not counted as 0. The same holds for a dividend on a day without an adjustment factor (a dividend-only row on a non-trading day), which cannot be split-adjusted. Over 3, 6 and 12 months, such a month is skipped, as before.
+  - The monthly-file (SECM) fallback follows the same rule. It has no cash/special split: both are 0 in a month without a dividend and null in a month with one.
+  - In September 2026, `div12m_me` was missing for 3,367 of 5,167 US stocks (65%) and exactly 0 for 23. Of the missing ones, 2,958 had a full year of prices and paid nothing. SEC filings show no common dividend for 194 of a random 200 of them, and FactSet has a 12-month dividend for 91% of the payers but under 5% of them.
+  - Affects `div1m_me`, `div3m_me`, `div6m_me`, `div12m_me`, `divspc1m_me` and `divspc12m_me`, and the dividend-yield factors. The US `div12m_me` factor correlates 0.989 with the official JKP factor instead of 0.538 (US, February 2000 – December 2025). Securities with less than 12 months of history stay missing for the 12-month yield.
+  - The defect was inherited from the original JKP SAS (`project_macros.sas`).
+
 ## 07-10-2026
 __Changes__:
 - Restored splits that Compustat's daily adjustment factor (`ajexdi`) misses, from Capital IQ's split history in the same XpressFeed source.
