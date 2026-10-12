@@ -5855,7 +5855,7 @@ def standardized_accounting_data(
         "prstkcq",
         "sstkq",
         "purtshrq",
-        "dsq",
+        "dltisq",
         "dltrq",
         "ltdchq",
         "dlcchq",
@@ -5924,8 +5924,6 @@ def standardized_accounting_data(
             ocf_qtr=pl.coalesce(
                 ["oancfq", (col("ibq") + col("dpq") - pl.coalesce([col("wcaptq"), 0]))]
             ),
-            dsy=fl_none(),
-            dsq=fl_none(),
         )
         .sort(["gvkey", "fyr", "fyearq", "fqtr", "n"])
         .pipe(cumulate_4q, var_list=yrl_vars)
@@ -5950,7 +5948,6 @@ def standardized_accounting_data(
                 fl_none().alias(i)
                 for i in [
                     "gp",
-                    "dltis",
                     "do",
                     "dvc",
                     "ebit",

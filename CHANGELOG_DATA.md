@@ -12,6 +12,13 @@ __Changes__:
   - In September 2026, `div12m_me` was missing for 3,367 of 5,167 US stocks (65%) and exactly 0 for 23. Of the missing ones, 2,958 had a full year of prices and paid nothing. SEC filings show no common dividend for 194 of a random 200 of them, and FactSet has a 12-month dividend for 91% of the payers but under 5% of them.
   - Affects `div1m_me`, `div3m_me`, `div6m_me`, `div12m_me`, `divspc1m_me` and `divspc12m_me`, and the dividend-yield factors. The US `div12m_me` factor correlates 0.989 with the official JKP factor instead of 0.538 (US, February 2000 – December 2025). Securities with less than 12 months of history stay missing for the 12-month yield.
   - The defect was inherited from the original JKP SAS (`project_macros.sas`).
+- Quarterly long-term debt issuance (`dltis`) is now summed over four quarters like the other quarterly cash-flow items.
+  - The list of items summed had `dsq`, which is not a Compustat item, in place of `dltisq`, and quarterly `dltis` was then set to null. Net long-term debt issuance from a quarterly statement, `dltis − dltr`, therefore counted repayments only.
+  - Applies whenever a quarterly statement is newer than the annual one, which is most of the year. In September 2026, 2,047 of 5,167 US stocks had a wrong `dltnetis_at`. 1,220 of them should have been net issuers; 1,086 were shown as net repayers and 113 as zero. Meta showed −0.007 instead of +0.069 after its $30bn bond of October 2025.
+  - For the wrong rows, the corrected value matches FactSet's net long-term debt issuance within 1% of assets for 78% (the old value for 13%). SEC filings agree with its direction for 87% of a random sample (the old value for 44%).
+  - Affects `dltnetis_at`, `dbnetis_at`, `netis_at`, their `*_mev` variants and one- and three-year growth (`*_gr1a`, `*_gr3a`), and the `fincf_*` characteristics where reported financing cash flow is missing. Annual data is unchanged. North America only: Compustat's Global quarterly `dltisy` has no non-null values.
+  - In `accounting_data/quarterly.parquet`, `dltis` is now filled, and the columns `ds` (always null), `dltisq` and `dltisy` are gone, as for every other quarterly flow item.
+  - The defect was inherited from the original JKP SAS (`accounting_chars.sas`).
 
 ## 07-10-2026
 __Changes__:
