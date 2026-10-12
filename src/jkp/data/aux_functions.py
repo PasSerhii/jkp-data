@@ -27,7 +27,13 @@ import polars_ols  # noqa: F401 - required for least_squares method on polars ex
 from ibis import _
 from polars import col
 
-from .compustat_fixes import correct_source_switch_returns, register_security_ajex_at_report
+from .compustat_fixes import (
+    SPLIT_EVENTS_TABLE,
+    correct_source_switch_returns,
+    download_split_events_attached,
+    register_security_ajex_at_report,
+    restore_missed_splits,
+)
 from .config import (
     COLLECT_CHUNK_SIZE,
     END_DATE,
@@ -158,6 +164,7 @@ REUSABLE_COMPUSTAT_TABLES: tuple[str, ...] = (
     "comp.g_fundq",
     "comp.secd",
     "comp.g_secd",
+    SPLIT_EVENTS_TABLE,
 )
 
 REUSABLE_CRSP_TABLES: tuple[str, ...] = (
@@ -2432,6 +2439,7 @@ def download_raw_data_tables(
             download_compustat_industry_history_attached(
                 con, "source_db", paths, raw_schema, start_date, end_date, source_label
             )
+            download_split_events_attached(con, "source_db", paths, raw_schema, source_label)
             if queue_future is not None:
                 try:
                     queue_future.result()
@@ -2590,6 +2598,9 @@ def download_raw_data_tables(
                     )
                     download_compustat_industry_history_attached(
                         con, anchor_alias, paths, raw_schema, start_date, end_date, source_label
+                    )
+                    download_split_events_attached(
+                        con, anchor_alias, paths, raw_schema, source_label
                     )
                 finally:
                     with contextlib.suppress(Exception):
@@ -2952,6 +2963,8 @@ def gen_comp_dsf(paths: DataPaths):
         source_path=secd_path,
         history_path=history_path,
     )
+    restore_missed_splits(con, paths, "comp_g_secd", g_secd_path)
+    restore_missed_splits(con, paths, "comp_secd", secd_path)
 
     register_security_ajex_at_report(con, paths, daily=True)
     con.raw_sql(f"""

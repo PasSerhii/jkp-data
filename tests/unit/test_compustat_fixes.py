@@ -1,8 +1,10 @@
-"""Tests for the Compustat North America history fixes (compustat_fixes.py) through their hooks.
+"""Tests for the Compustat price-history fixes (compustat_fixes.py) through their hooks.
 
 1) Firm-shares fallback: scale the company's share count with the security's own adjustment
    factor at the report date (Berkshire class A: company factor 1,500 on the class B basis).
 2) Monthly returns across a SECM/SECD switch: use SECM prices at both ends (Dec-1983).
+3) Splits missing from Compustat's adjustment factor: restore them from Capital IQ's split
+   history (Mullen Automotive, 1-for-100 on 21 Dec 2023).
 """
 
 from __future__ import annotations
@@ -10,11 +12,19 @@ from __future__ import annotations
 from calendar import monthrange
 from datetime import date, timedelta
 
+import ibis
 import polars as pl
 import pytest
 
 import jkp.data.aux_functions as aux
-from jkp.data.compustat_fixes import correct_source_switch_returns
+from jkp.data.compustat_fixes import (
+    SPLIT_EVENT_SCHEMA,
+    SPLIT_EVENTS_TABLE,
+    build_split_events_query,
+    correct_source_switch_returns,
+    download_split_events_attached,
+    register_security_ajex_at_report,
+)
 
 REPORT = date(1985, 12, 31)
 
@@ -50,7 +60,13 @@ def _firm_shares(rows: list[tuple[str, float, float]], days: list[date]) -> pl.D
     """One company report (REPORT) per gvkey, valid on every listed day, as populate_own writes it."""
     return pl.DataFrame(
         [(d, g, REPORT, csho, ajex) for g, csho, ajex in rows for d in days],
-        schema=["ddate", "gvkey", "datadate", "csho_fund", "ajex_fund"],
+        schema={
+            "ddate": pl.Date,
+            "gvkey": pl.String,
+            "datadate": pl.Date,
+            "csho_fund": pl.Float64,
+            "ajex_fund": pl.Float64,
+        },
         orient="row",
     )
 
@@ -325,3 +341,398 @@ def test_source_switch_correction_leaves_daily_data_alone(test_paths) -> None:
         }
     )
     assert correct_source_switch_returns(frame, test_paths, "d").collect().equals(frame.collect())
+
+
+# --- splits missing from Compustat's adjustment factor ----------------------------------------
+
+EX = date(2023, 12, 21)
+
+
+def _weekdays(start: date, end: date) -> list[date]:
+    return [
+        start + timedelta(days=i)
+        for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).weekday() < 5
+    ]
+
+
+DAYS = _weekdays(date(2023, 11, 1), date(2024, 1, 31))
+
+
+def _prices(before: float, after: float, ex: date = EX, days: list[date] = DAYS) -> list[float]:
+    """A price path that wobbles by up to 4% a day and jumps from ``before`` to ``after`` at ``ex``."""
+    return [(before if d < ex else after) * (1 + 0.02 * (i % 5 - 2)) for i, d in enumerate(days)]
+
+
+def _secd(
+    gvkey: str,
+    prices: list[float],
+    ajexdi: list[float],
+    trfd: list[float] | None = None,
+    *,
+    days: list[date] = DAYS,
+    global_file: bool = False,
+) -> pl.DataFrame:
+    n = len(days)
+    data = {
+        "gvkey": [gvkey] * n,
+        "iid": ["01W" if global_file else "01"] * n,
+        "datadate": days,
+        "tpci": ["0"] * n,
+        "exchg": [104 if global_file else 14] * n,
+        "prcstd": [4] * n,
+        "curcdd": ["USD"] * n,
+        "prccd": prices,
+        "ajexdi": ajexdi,
+        "prchd": prices,
+        "prcld": prices,
+        "prcod": prices,
+        "cshtrd": [1000.0] * n,
+        "cshoc": [1e6] * n,
+        "trfd": pl.Series(trfd if trfd is not None else [None] * n, dtype=pl.Float64),
+        "curcddv": ["USD"] * n,
+        "div": [0.0] * n,
+        "divd": [0.0] * n,
+        "divsp": [0.0] * n,
+    }
+    if global_file:
+        data["qunit"] = [100.0] * n  # quoted per 100 units, as for pence-quoted lines
+    return pl.DataFrame(data)
+
+
+def _write_split_events(test_paths, events: list[tuple[str, str, date, float]]) -> None:
+    pl.DataFrame(events, schema=SPLIT_EVENT_SCHEMA, orient="row").write_parquet(
+        test_paths.raw_table_source(SPLIT_EVENTS_TABLE)
+    )
+
+
+def _daily(
+    test_paths,
+    monkeypatch,
+    na: pl.DataFrame,
+    events: list[tuple[str, str, date, float]] | None,
+    gl: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Run gen_comp_dsf on one SECD and one G_SECD frame; ``events=None`` means no split history.
+    Returns __comp_dsf with each row's daily return from the return index."""
+    days = na["datadate"].to_list()
+    if gl is None:
+        gl = _secd("200000", [10.0] * len(days), [1.0] * len(days), days=days, global_file=True)
+    na.write_parquet(test_paths.raw_tables_dir / "comp_secd.parquet")
+    gl.write_parquet(test_paths.raw_tables_dir / "comp_g_secd.parquet")
+    _firm_shares([], days).write_parquet(test_paths.interim_dir / "__firm_shares2.parquet")
+    _usd_fx(monkeypatch, sorted(set(days) | set(gl["datadate"].to_list())))
+    split_events = test_paths.raw_table_source(SPLIT_EVENTS_TABLE)
+    split_events.unlink(missing_ok=True)
+    if events is not None:
+        _write_split_events(test_paths, events)
+
+    aux.gen_comp_dsf(test_paths)
+
+    return (
+        pl.read_parquet(test_paths.interim_dir / "__comp_dsf.parquet")
+        .sort("gvkey", "iid", "datadate")
+        .with_columns(ret=pl.col("ri") / pl.col("ri").shift(1).over("gvkey", "iid") - 1)
+    )
+
+
+def _security(frame: pl.DataFrame, gvkey: str) -> pl.DataFrame:
+    return frame.filter(pl.col("gvkey") == gvkey)
+
+
+def test_split_missing_from_the_factor_is_restored(test_paths, monkeypatch) -> None:
+    """Mullen Automotive, 1-for-100 on 21 Dec 2023: Compustat holds the factor at 1.6e-7 on both
+    sides, so the split day returned the price ratio (about +8,900%). Restored from Capital IQ, the
+    day returns its true move and no other return changes."""
+    prices = _prices(0.10, 9.0)
+    secd = _secd("040116", prices, [1.6e-7] * len(DAYS))
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "040116")
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("040116", "01", EX, 0.01)]), "040116")
+
+    k = DAYS.index(EX)
+    assert raw["ret"][k] == pytest.approx(prices[k] / prices[k - 1] - 1)  # +8,900%
+    assert fixed["ret"][k] == pytest.approx(prices[k] / (prices[k - 1] * 100) - 1)  # -12%
+    others = [i for i in range(1, len(DAYS)) if i != k]
+    assert fixed["ret"].gather(others).to_list() == pytest.approx(
+        raw["ret"].gather(others).to_list(), rel=1e-12
+    )
+    # only the return index moves: the factor, share counts and market caps stay as delivered
+    for column in ("ajexdi", "cshoc", "me", "prc"):
+        assert fixed[column].to_list() == raw[column].to_list()
+
+
+def test_split_without_capital_iq_history_keeps_compustat_factor(test_paths, monkeypatch) -> None:
+    """An empty split history (a WRDS source has no Capital IQ tables) changes nothing."""
+    secd = _secd("040116", _prices(0.10, 9.0), [1.6e-7] * len(DAYS))
+
+    raw = _daily(test_paths, monkeypatch, secd, None)
+    empty = _daily(test_paths, monkeypatch, secd, [])
+
+    assert empty.select("gvkey", "datadate", "ajexdi", "ri").equals(
+        raw.select("gvkey", "datadate", "ajexdi", "ri")
+    )
+
+
+def _shift_after(days: list[date], ex: date, trading_days: int) -> date:
+    return days[days.index(ex) + trading_days]
+
+
+@pytest.mark.parametrize(
+    ("prices", "ajexdi", "trfd", "rate"),
+    [
+        pytest.param(
+            _prices(0.10, 9.0),
+            [1.6e-9 if d < EX else 1.6e-7 for d in DAYS],
+            None,
+            0.01,
+            id="compustat-applied-it",
+        ),
+        pytest.param(
+            # Warner Bros. Discovery Series A, 7 Aug 2014: one Series C share per share halves the
+            # price, and Compustat books it in the total-return factor
+            _prices(80.0, 40.0),
+            [1.0] * len(DAYS),
+            [1.0 if d < EX else 2.0 for d in DAYS],
+            2.0,
+            id="booked-in-trfd",
+        ),
+        pytest.param(
+            _prices(0.10, 0.10),
+            [1.0] * len(DAYS),
+            None,
+            0.01,
+            id="not-in-compustat-prices",
+        ),
+        pytest.param(
+            # Compustat moves the factor three trading days after Capital IQ's ex-date
+            _prices(0.10, 9.0),
+            [1.6e-9 if d < _shift_after(DAYS, EX, 3) else 1.6e-7 for d in DAYS],
+            None,
+            0.01,
+            id="factor-change-dated-nearby",
+        ),
+        pytest.param(
+            _prices(10.0, 8.0), [1.0] * len(DAYS), None, 1.25, id="too-small-to-tell-from-a-move"
+        ),
+        pytest.param(
+            # the factor moves by 15% across the ex-date: more than rounding, so not a missed split
+            _prices(0.10, 9.0),
+            [1.6e-7 if d < EX else 1.84e-7 for d in DAYS],
+            None,
+            0.01,
+            id="factor-moves-too-much",
+        ),
+    ],
+)
+def test_split_compustat_handles_is_left_alone(
+    test_paths, monkeypatch, prices, ajexdi, trfd, rate
+) -> None:
+    secd = _secd("001000", prices, ajexdi, trfd)
+
+    raw = _daily(test_paths, monkeypatch, secd, None)
+    fixed = _daily(test_paths, monkeypatch, secd, [("001000", "01", EX, rate)])
+
+    assert fixed["ajexdi"].to_list() == raw["ajexdi"].to_list()
+    assert fixed["ri"].to_list() == raw["ri"].to_list()
+
+
+def test_split_across_a_long_price_gap_is_left_alone(test_paths, monkeypatch) -> None:
+    """Six weeks without prices before the ex-date: the price ratio no longer identifies the split."""
+    days = [d for d in DAYS if not date(2023, 11, 10) <= d < EX]
+    secd = _secd("001000", _prices(0.10, 9.0, days=days), [1.6e-7] * len(days), days=days)
+
+    raw = _daily(test_paths, monkeypatch, secd, None)
+    fixed = _daily(test_paths, monkeypatch, secd, [("001000", "01", EX, 0.01)])
+
+    assert fixed["ri"].to_list() == raw["ri"].to_list()
+
+
+def test_several_missed_splits_stack(test_paths, monkeypatch) -> None:
+    """Two missed reverse splits: each stretch's factor carries every later missed split. The second
+    is two weeks before the data ends, as a recent split is in a monthly run."""
+    ex2 = date(2024, 1, 17)
+    prices = [
+        (0.10 if d < EX else 9.0 if d < ex2 else 200.0) * (1 + 0.02 * (i % 5 - 2))
+        for i, d in enumerate(DAYS)
+    ]
+    secd = _secd("040116", prices, [1.6e-7] * len(DAYS))
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "040116")
+    na = _security(
+        _daily(
+            test_paths,
+            monkeypatch,
+            secd,
+            [("040116", "01", EX, 0.01), ("040116", "01", ex2, 0.04)],
+        ),
+        "040116",
+    )
+
+    k1, k2 = DAYS.index(EX), DAYS.index(ex2)
+    assert na["ret"][k1] == pytest.approx(prices[k1] / (prices[k1 - 1] * 100) - 1)
+    assert na["ret"][k2] == pytest.approx(prices[k2] / (prices[k2 - 1] * 25) - 1)
+    assert (na["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [1 / (0.0004 if d < EX else 0.04 if d < ex2 else 1) for d in DAYS], rel=1e-12
+    )
+
+
+def test_split_hidden_by_factor_rounding_is_restored(test_paths, monkeypatch) -> None:
+    """Conduit Pharmaceuticals, 1-for-100 on 27 Jan 2025: Compustat's factor wobbles from 1.32e-6
+    to 1.33e-6 across the split instead of staying flat. The split is restored net of the wobble."""
+    prices = _prices(0.05, 3.3)
+    secd = _secd("040557", prices, [1.32e-6 if d < EX else 1.33e-6 for d in DAYS])
+
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("040557", "01", EX, 0.01)]), "040557")
+
+    k = DAYS.index(EX)
+    assert fixed["ret"][k] == pytest.approx(prices[k] / (prices[k - 1] * 100) - 1)
+
+
+def test_missed_split_is_restored_in_global_data(test_paths, monkeypatch) -> None:
+    """G_SECD quotes some lines per 100 units; the split shows in price / qunit / factor."""
+    prices = _prices(5.0, 75.0)
+    gl = _secd("200100", prices, [3e-8] * len(DAYS), global_file=True)
+    na = _secd("001000", _prices(10.0, 10.0), [1.0] * len(DAYS))
+
+    fixed = _daily(test_paths, monkeypatch, na, [("200100", "01W", EX, 1 / 15)], gl=gl)
+
+    k = DAYS.index(EX)
+    assert _security(fixed, "200100")["ret"][k] == pytest.approx(
+        prices[k] / (prices[k - 1] * 15) - 1
+    )
+
+
+MONTHS = [date(2023, 9, 30), date(2023, 10, 31), date(2023, 11, 30)] + [
+    date(2023, 12, 31),
+    date(2024, 1, 31),
+    date(2024, 2, 29),
+    date(2024, 3, 31),
+]
+
+
+def test_secm_is_left_as_delivered(test_paths, monkeypatch) -> None:
+    """The monthly file is not corrected (its monthly price ratio identifies a split less
+    reliably): with split history present, SECM's December 2023 return for Mullen is unchanged."""
+    prices = [0.15 if m < EX else 14.29 for m in MONTHS]
+    _secm_rows("040116", MONTHS, prices, [1.6e-7] * len(MONTHS)).write_parquet(
+        test_paths.raw_tables_dir / "comp_secm.parquet"
+    )
+    _firm_shares([], MONTHS).write_parquet(test_paths.interim_dir / "__firm_shares2.parquet")
+    _usd_fx(monkeypatch, MONTHS)
+    _write_split_events(test_paths, [("040116", "01", EX, 0.01)])
+
+    aux.gen_secm_data(test_paths)
+
+    ri = pl.read_parquet(test_paths.interim_dir / "secm_data.parquet").sort("datadate")["ri"]
+    k = MONTHS.index(date(2023, 12, 31))
+    assert ri[k] / ri[k - 1] == pytest.approx(14.29 / 0.15)
+
+
+def test_share_fallback_keeps_compustat_factors(test_paths) -> None:
+    """The firm-shares fallback reads SECM's factors as delivered, split history or not."""
+    _secm_rows("040116", MONTHS, [0.15] * 3 + [14.29] * 4, [1.6e-7] * len(MONTHS)).write_parquet(
+        test_paths.raw_tables_dir / "comp_secm.parquet"
+    )
+    _write_split_events(test_paths, [("040116", "01", EX, 0.01)])
+    con = ibis.duckdb.connect()
+
+    register_security_ajex_at_report(con, test_paths)
+
+    ajex = dict(con.raw_sql("SELECT rep_eom, ajex_sec FROM __sec_ajex_rep").fetchall())
+    assert list(ajex.values()) == pytest.approx([1.6e-7] * len(MONTHS))
+
+
+def test_split_restoration_leaves_inferred_share_counts_alone(test_paths, monkeypatch) -> None:
+    """A security without its own daily share count infers it from SECM's factor across months and
+    SECD's within the month. The daily file restores Mullen's missed split, the monthly file cannot
+    (no SECM price in the two months before it): the inferred counts and market caps must not move,
+    while the split-day return is restored."""
+    n = len(DAYS)
+    prices = _prices(0.10, 9.0)
+    months = [m for m in MONTHS if m not in (date(2023, 10, 31), date(2023, 11, 30))]
+
+    def run(events: list[tuple[str, str, date, float]] | None) -> pl.DataFrame:
+        _secd("040116", prices, [1.6e-7] * n).with_columns(
+            cshoc=pl.lit(None, dtype=pl.Float64)
+        ).write_parquet(test_paths.raw_tables_dir / "comp_secd.parquet")
+        _secd("200000", [10.0] * n, [1.0] * n, global_file=True).write_parquet(
+            test_paths.raw_tables_dir / "comp_g_secd.parquet"
+        )
+        _secm_rows(
+            "040116", months, [0.15 if m < EX else 14.29 for m in months], [1.6e-7] * len(months)
+        ).write_parquet(test_paths.raw_tables_dir / "comp_secm.parquet")
+        pl.DataFrame(
+            {
+                "ddate": DAYS,
+                "gvkey": ["040116"] * n,
+                "datadate": [date(2023, 9, 30)] * n,
+                "csho_fund": [5.0] * n,
+                "ajex_fund": [1.6e-7] * n,
+            }
+        ).write_parquet(test_paths.interim_dir / "__firm_shares2.parquet")
+        _usd_fx(monkeypatch, DAYS)
+        test_paths.raw_table_source(SPLIT_EVENTS_TABLE).unlink(missing_ok=True)
+        if events is not None:
+            _write_split_events(test_paths, events)
+        aux.gen_comp_dsf(test_paths)
+        return _security(
+            pl.read_parquet(test_paths.interim_dir / "__comp_dsf.parquet").sort("datadate"),
+            "040116",
+        )
+
+    raw = run(None)
+    fixed = run([("040116", "01", EX, 0.01)])
+
+    assert raw["cshoc"].null_count() == 0
+    assert fixed["cshoc"].to_list() == raw["cshoc"].to_list()
+    assert fixed["me"].to_list() == raw["me"].to_list()
+    k = DAYS.index(EX)
+    assert fixed["ri"][k] / fixed["ri"][k - 1] == pytest.approx(prices[k] / (prices[k - 1] * 100))
+
+
+def test_split_events_query_maps_capital_iq_to_compustat_securities() -> None:
+    query = build_split_events_query("public")
+
+    assert '"public"."ciqgvkeyiid"' in query and '"public"."ciqsplit"' in query
+    assert "s.appliedflag = 1" in query
+    assert "exp(sum(ln(" in query  # same-day events multiply
+    with pytest.raises(ValueError, match="Invalid raw PostgreSQL schema"):
+        build_split_events_query("public; DROP TABLE x")
+
+
+class _SourceConnection:
+    """Answers the Capital IQ table check and records every statement."""
+
+    def __init__(self, available: bool) -> None:
+        self.available = available
+        self.statements: list[str] = []
+        self._result: tuple = ()
+
+    def execute(self, sql: str) -> _SourceConnection:
+        self.statements.append(sql)
+        self._result = (self.available,) if "to_regclass" in sql else (0,)
+        return self
+
+    def fetchone(self) -> tuple:
+        return self._result
+
+
+def test_split_events_download_copies_capital_iq_history(test_paths) -> None:
+    con = _SourceConnection(available=True)
+
+    download_split_events_attached(con, "source_db", test_paths, "public", "RDS")
+
+    copies = [s for s in con.statements if "COPY (" in s]
+    assert len(copies) == 1
+    assert "ciqsplit" in copies[0] and "ciq_split_events.parquet" in copies[0]
+
+
+def test_split_events_download_without_capital_iq_writes_an_empty_table(test_paths) -> None:
+    con = _SourceConnection(available=False)
+
+    download_split_events_attached(con, "source_db", test_paths, "comp", "WRDS")
+
+    assert not [s for s in con.statements if "COPY (" in s]
+    events = pl.read_parquet(test_paths.raw_table_source(SPLIT_EVENTS_TABLE))
+    assert events.height == 0 and events.schema == pl.Schema(SPLIT_EVENT_SCHEMA)

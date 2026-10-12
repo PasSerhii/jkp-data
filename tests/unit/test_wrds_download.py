@@ -165,6 +165,22 @@ class TestDownloadRawDataTablesBranching:
         assert "2005-08-31" in query and "2026-08-31" in query
         assert "comp.funda" not in query
 
+    @pytest.mark.parametrize("persistent", [True, False])
+    def test_capital_iq_split_history_is_downloaded(self, mock_duckdb, test_paths, persistent):
+        from jkp.data.aux_functions import download_raw_data_tables
+
+        _, conn = mock_duckdb
+        download_raw_data_tables(
+            test_paths,
+            connection_info="host=test",
+            raw_schema="public",
+            persistent_connection=persistent,
+        )
+        sql = [call.args[0] for call in conn.execute.call_args_list]
+        copies = [s for s in sql if "COPY (" in s and "ciq_split_events.parquet" in s]
+        assert len(copies) == 1
+        assert '"public"."ciqsplit"' in copies[0]
+
     def test_persistent_connection_true_uses_attach(self, mock_duckdb, test_paths):
         """When persistent_connection=True, should use ATTACH."""
         from jkp.data.aux_functions import download_raw_data_tables
@@ -467,6 +483,19 @@ class TestReusableRawValidation:
             (*aux.REUSABLE_COMPUSTAT_TABLES, "comp.industry_history"),
         )
         with pytest.raises(RuntimeError, match="missing or empty comp_industry_history.parquet"):
+            aux.validate_reusable_raw_data(paths, bypass_crsp=True)
+
+    def test_old_raw_cache_without_split_history_is_rejected(self, tmp_path, monkeypatch):
+        import jkp.data.aux_functions as aux
+
+        assert "ciq.split_events" in aux.REUSABLE_COMPUSTAT_TABLES
+        paths = self._write_complete_fixture(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            aux,
+            "REUSABLE_COMPUSTAT_TABLES",
+            (*aux.REUSABLE_COMPUSTAT_TABLES, "ciq.split_events"),
+        )
+        with pytest.raises(RuntimeError, match="missing or empty ciq_split_events.parquet"):
             aux.validate_reusable_raw_data(paths, bypass_crsp=True)
 
     def test_old_raw_cache_without_first_daily_price_anchor_is_rejected(

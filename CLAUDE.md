@@ -60,7 +60,7 @@ The pipeline has two entry points that run sequentially:
 - `src/jkp/data/main.py` — Pipeline orchestration; calls functions from `aux_functions` in sequence
 - `src/jkp/data/aux_functions.py` — Core library: all characteristic calculations, data transformations, and I/O utilities
 - `src/jkp/data/portfolio.py` — Standalone factor portfolio construction script
-- `src/jkp/data/compustat_fixes.py` — Fixes for two Compustat North America history defects inherited from the production SAS (share-count fallback factors, SECM/SECD switch-month returns), hooked into `aux_functions`
+- `src/jkp/data/compustat_fixes.py` — Fixes for Compustat history defects inherited from the production SAS (share-count fallback factors, SECM/SECD switch-month returns, splits missing from the daily adjustment factor, restored from Capital IQ's split history), hooked into `aux_functions`
 - `src/jkp/data/dataupdate.py` — Upload of the production CSVs to the research MSSQL database: incremental (`jkp build --db-update`) or a full reload of every table (`jkp build --production-years 0 --db-replace`); target URL from the `RESEARCH_UPDATE` environment variable
 - `src/jkp/data/wrds_credentials.py` — WRDS credential resolution (env vars, system keyring, and the libpq `~/.pgpass` file)
 - `src/jkp/data/wrds_connection.py` — WRDS connection construction and verification (`gen_wrds_connection_info`, `verify_wrds_connection`), with password redaction on failure paths

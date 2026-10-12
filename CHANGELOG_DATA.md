@@ -3,6 +3,16 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 07-10-2026
+__Changes__:
+- Restored splits that Compustat's daily adjustment factor (`ajexdi`) misses, from Capital IQ's split history in the same XpressFeed source.
+  - S&P stores the factor with 8 decimals. After repeated reverse splits it drops the older split events and holds the factor flat, and some splits it never recorded. The split day then returned the split ratio: Mullen Automotive's December 2023 return was +9,301% instead of −6%, Inpixon's January 2020 return +2,570% instead of −41%.
+  - A split is restored when Capital IQ records it (a ratio of at least 1.5 either way), Compustat's factor moves by less than 10% around the ex-date, and the return index jumps by the split ratio across the ex-date (give or take half of it) between prices at most 31 days apart.
+  - In the full daily history this restores about 1,440 splits (about 800 North American, 640 Global), mostly in nano- and micro-caps. FactSet's split-adjusted prices agree with the restored return for 1,035 of the 1,071 splits it prices; the other 36 are splits FactSet lacks too, such as Tyler Technologies' 3-for-1 of 15 May 1990.
+  - Only returns change: `ret`, `ret_local`, `ret_exc` and everything built on them (momentum, volatility, betas, seasonality, factor returns), in every run, including characteristics of the 23-year production window that span a restored split. `adjfct`, share counts, market caps and prices are unchanged. Monthly SECM rows are not corrected.
+  - Of the 28 monthly returns above +1,000% that only the Python history had in the September 2026 comparison, 24 now match the SAS history, and Jaguar Health's January 2023 return (−30.5%) matches FactSet where the SAS value (+3.3%) does not. The other 3 are not splits.
+  - A raw-data cache from before this change must download `ciq_split_events`.
+
 ## 29-09-2026
 __Changes__:
 - Removed the accounting publication-date guard added on 26-07-2026. Statements again enter the panel 4 months after the period end and stay until the next statement or 18 months, as in the production SAS.
