@@ -42,6 +42,8 @@ from .config import (
 )
 from .industry import (
     build_industry_history_query,
+    company_industry_codes,
+    fill_from_company_header,
     fill_missing_industry_codes,
     resolve_industry_history,
 )
@@ -10490,7 +10492,9 @@ def merge_qmj_to_world_data(paths: DataPaths):
 
 
 @measure_time
-def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
+def merge_industry_to_world_msf(
+    paths: DataPaths, bypass_crsp: bool = False, company_codes: bool = False
+):
     """
     Description:
         Merge industry codes into world MSF dataset.
@@ -10502,10 +10506,19 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
         4) Fill remaining missing SIC/NAICS from the latest dated industry row.
            Preserve populated codes and save candidate provenance in
            sic_history_fallback.parquet (now includes NAICS candidates too).
+        5) If ``company_codes``, fill SIC/NAICS still missing with the company's
+           current codes from comp.company / comp.g_company.
 
     When ``bypass_crsp`` is True there is no CRSP industry file, so SIC/NAICS come
     from Compustat only (no crsp_ind join), mirroring the SAS bypass path
     (``coalesce(b.sic, .)``). See config.BYPASS_CRSP.
+
+    ``company_codes`` is on in regular runs and off in full-history runs. Many
+    stocks have no dated code: new listings without an annual report, and most
+    Canadian companies, whose historical SIC S&P rarely fills (3,628 of 46,947
+    stocks in September 2026). The current code matches the dated one for 99.6%
+    of 2025 annual reports, but for only 72–79% of those from the 1990s, so old
+    months keep the dated codes alone.
 
     Output:
         '__msf_world2.parquet' with industry codes appended.
@@ -10540,9 +10553,14 @@ def merge_industry_to_world_msf(paths: DataPaths, bypass_crsp: bool = False):
         history,
     ).collect()
     resolved.write_parquet(paths.interim_dir / "sic_history_fallback.parquet")
-    fill_missing_industry_codes(__msf_world, resolved.lazy()).collect().write_parquet(
-        paths.interim_dir / "__msf_world2.parquet"
-    )
+    __msf_world = fill_missing_industry_codes(__msf_world, resolved.lazy())
+    if company_codes:
+        header = company_industry_codes(
+            pl.scan_parquet(paths.raw_tables_dir / "comp_company.parquet"),
+            pl.scan_parquet(paths.raw_tables_dir / "comp_g_company.parquet"),
+        )
+        __msf_world = fill_from_company_header(__msf_world, header)
+    __msf_world.collect().write_parquet(paths.interim_dir / "__msf_world2.parquet")
 
 
 @measure_time

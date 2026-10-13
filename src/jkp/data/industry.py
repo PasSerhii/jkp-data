@@ -1,4 +1,5 @@
-"""Dated Compustat industry history used to recover missing SIC/NAICS codes."""
+"""Compustat industry codes used to recover missing SIC/NAICS: the dated industry
+history, and in regular runs the company header's current codes."""
 
 from __future__ import annotations
 
@@ -45,6 +46,18 @@ WHERE h.datadate >= {lower} OR h.datadate = a.anchor_date"""
     return f"WITH history AS MATERIALIZED ({sources})\n{selection}"
 
 
+def _valid_sic(code: pl.Expr) -> pl.Expr:
+    """A SIC code from 1 to 9999 as an integer; 0, blanks and text are null."""
+    code = code.cast(pl.String).str.strip_chars().cast(pl.Int64, strict=False)
+    return pl.when(code.is_between(1, 9999)).then(code)
+
+
+def _valid_naics(code: pl.Expr) -> pl.Expr:
+    """A 2- to 6-digit NAICS code as an integer; anything else is null."""
+    code = code.cast(pl.String).str.strip_chars()
+    return pl.when(code.str.contains(r"^[1-9]\d{1,5}$")).then(code.cast(pl.Int64, strict=False))
+
+
 def resolve_industry_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFrame:
     """Resolve one dated candidate per (gvkey, eom), retaining its provenance.
 
@@ -68,14 +81,8 @@ def resolve_industry_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.La
             & pl.any_horizontal(pl.col("sich", "naicsh").is_not_null())
         )
         .with_columns(
-            pl.when(pl.col("sich").is_between(1, 9999))
-            .then(pl.col("sich"))
-            .otherwise(None)
-            .alias("sic_history"),
-            pl.when(pl.col("naicsh").str.contains(r"^[1-9]\d{1,5}$"))
-            .then(pl.col("naicsh").cast(pl.Int64, strict=False))
-            .otherwise(None)
-            .alias("naics_history"),
+            _valid_sic(pl.col("sich")).alias("sic_history"),
+            _valid_naics(pl.col("naicsh")).alias("naics_history"),
         )
         .group_by("gvkey", "datadate", "popsrc", "consol")
         .agg(
@@ -112,24 +119,28 @@ def resolve_sic_history(keys: pl.LazyFrame, history: pl.LazyFrame) -> pl.LazyFra
 
 
 def _fill_missing_codes(
-    data: pl.LazyFrame, resolved: pl.LazyFrame, codes: tuple[str, ...]
+    data: pl.LazyFrame,
+    resolved: pl.LazyFrame,
+    codes: tuple[str, ...],
+    on: tuple[str, ...] = ("gvkey", "eom"),
+    suffix: str = "_history",
 ) -> pl.LazyFrame:
     schema = data.collect_schema()
     return (
         data.join(
-            resolved.select("gvkey", "eom", *[f"{code}_history" for code in codes]),
-            on=["gvkey", "eom"],
+            resolved.select(*on, *[f"{code}{suffix}" for code in codes]),
+            on=list(on),
             how="left",
             validate="m:1",
             maintain_order="left",
         )
         .with_columns(
-            pl.coalesce(code, f"{code}_history")
+            pl.coalesce(code, f"{code}{suffix}")
             .cast(pl.Int64 if schema[code] == pl.Null else schema[code])
             .alias(code)
             for code in codes
         )
-        .drop([f"{code}_history" for code in codes])
+        .drop([f"{code}{suffix}" for code in codes])
     )
 
 
@@ -141,3 +152,28 @@ def fill_missing_sic(data: pl.LazyFrame, resolved: pl.LazyFrame) -> pl.LazyFrame
 def fill_missing_industry_codes(data: pl.LazyFrame, resolved: pl.LazyFrame) -> pl.LazyFrame:
     """Fill only null SIC/NAICS after the existing Compustat/CRSP selections."""
     return _fill_missing_codes(data, resolved, ("sic", "naics"))
+
+
+def company_industry_codes(na_header: pl.LazyFrame, global_header: pl.LazyFrame) -> pl.LazyFrame:
+    """Current SIC/NAICS per gvkey from the company headers (comp.company, comp.g_company).
+
+    A company in both headers carries the same codes in both, so the NA row is kept.
+    Codes are validated as in the dated history.
+    """
+    return (
+        pl.concat(
+            [header.select("gvkey", "sic", "naics") for header in (na_header, global_header)],
+            how="vertical_relaxed",
+        )
+        .select(
+            pl.col("gvkey").cast(pl.String).str.strip_chars().str.pad_start(6, "0"),
+            _valid_sic(pl.col("sic")).alias("sic_header"),
+            _valid_naics(pl.col("naics")).alias("naics_header"),
+        )
+        .unique("gvkey", keep="first", maintain_order=True)
+    )
+
+
+def fill_from_company_header(data: pl.LazyFrame, header: pl.LazyFrame) -> pl.LazyFrame:
+    """Fill SIC/NAICS still null with the company's current codes; populated values stay."""
+    return _fill_missing_codes(data, header, ("sic", "naics"), on=("gvkey",), suffix="_header")

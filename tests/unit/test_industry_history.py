@@ -10,6 +10,8 @@ from polars.testing import assert_frame_equal
 from jkp.data.aux_functions import ff_ind_class, merge_industry_to_world_msf
 from jkp.data.industry import (
     build_industry_history_query,
+    company_industry_codes,
+    fill_from_company_header,
     fill_missing_industry_codes,
     fill_missing_sic,
     resolve_industry_history,
@@ -246,3 +248,65 @@ def test_naics_fill_preserves_populated_values_row_order_types_and_other_fields(
     assert_frame_equal(data.drop("naics"), out.drop("naics"), check_exact=True)
     with pytest.raises(pl.exceptions.ComputeError, match="m:1"):
         fill_missing_industry_codes(data.lazy(), pl.concat([resolved, resolved])).collect()
+
+
+def header_frame(rows):
+    return pl.DataFrame(
+        rows, schema={"gvkey": pl.String, "sic": pl.String, "naics": pl.String}, orient="row"
+    )
+
+
+def test_company_codes_fill_only_missing_codes_and_validate_them():
+    data = pl.DataFrame(
+        {
+            "id": [5, 1, 3, 2],
+            "gvkey": ["001000", "002000", "003000", "004000"],
+            "eom": [date(2026, 9, 30)] * 4,
+            "sic": [None, 7372, None, None],
+            "naics": [None, None, 333, None],
+            "me": [1.0, 2.0, None, 4.0],
+        },
+        schema_overrides={"sic": pl.Int32},
+    )
+    # NA and Global headers; a gvkey in both keeps the NA codes.
+    na = header_frame(
+        [("1000", "1311", "211120"), ("002000", "4813", "517"), ("003000", "0000", "00")]
+    )
+    global_ = header_frame([("001000", "9999", "999"), ("004000", " 0100 ", "ABC")])
+    header = company_industry_codes(na.lazy(), global_.lazy())
+    out = fill_from_company_header(data.lazy(), header).collect()
+    assert out["sic"].to_list() == [1311, 7372, None, 100]
+    assert out["naics"].to_list() == [211120, 517, 333, None]
+    assert out.schema["sic"] == pl.Int32
+    assert_frame_equal(data.drop("sic", "naics"), out.drop("sic", "naics"), check_exact=True)
+
+
+@pytest.mark.parametrize("company_codes", [False, True])
+def test_pipeline_uses_company_codes_only_when_asked(test_paths, company_codes):
+    stamp = date(2026, 9, 30)
+    paths = test_paths
+    world = pl.DataFrame(
+        {"id": [1, 2], "gvkey": ["001000", "002000"], "eom": [stamp] * 2, "me": [1.0, 2.0]}
+    )
+    world.write_parquet(paths.interim_dir / "__msf_world.parquet")
+    pl.DataFrame(
+        {
+            "gvkey": world["gvkey"],
+            "date": [stamp] * 2,
+            "sic": [None, 7372],
+            "naics": [None, 511210],
+            "gics": [None, 45103010],
+        }
+    ).write_parquet(paths.interim_dir / "comp_ind.parquet")
+    # No dated code for 001000: a new listing without an annual report.
+    history_frame([]).write_parquet(paths.raw_tables_dir / "comp_industry_history.parquet")
+    header_frame([("001000", "1311", "211120"), ("002000", "4813", "517")]).write_parquet(
+        paths.raw_tables_dir / "comp_company.parquet"
+    )
+    header_frame([]).write_parquet(paths.raw_tables_dir / "comp_g_company.parquet")
+    merge_industry_to_world_msf(paths, bypass_crsp=True, company_codes=company_codes)
+    ff_ind_class(paths, paths.interim_dir / "__msf_world2.parquet")
+    result = pl.read_parquet(paths.interim_dir / "__msf_world3.parquet").sort("id")
+    assert result["sic"].to_list() == [1311 if company_codes else None, 7372]
+    assert result["naics"].to_list() == [211120 if company_codes else None, 511210]
+    assert result["ff49"].to_list() == [30 if company_codes else None, 36]

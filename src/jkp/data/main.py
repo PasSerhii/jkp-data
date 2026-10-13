@@ -353,7 +353,7 @@ def run_pipeline(
         crsp_industry(paths)
     monitor.set_phase("market_returns")
     comp_industry(paths, end_date=effective_end_date)
-    merge_industry_to_world_msf(paths, bypass_crsp=bypass_crsp)
+    merge_industry_to_world_msf(paths, bypass_crsp=bypass_crsp, company_codes=not full_history)
     ff_ind_class(paths, interim / "__msf_world2.parquet")
     nyse_size_cutoffs(paths, interim / "__msf_world3.parquet", bypass_crsp=bypass_crsp)
     classify_stocks_size_groups(paths)

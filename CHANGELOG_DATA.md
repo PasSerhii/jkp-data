@@ -3,6 +3,15 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 13-10-2026
+__Changes__:
+- Runs without `--full-history` now fill `sic` and `naics` that are still missing after Compustat's dated industry codes with the company's current codes from the Compustat header (`comp.company`, `comp.g_company`). `ff49` follows from the filled `sic`.
+  - The dated SIC (`sich`) is missing for new listings that have no annual report yet, and for most Canadian companies: S&P fills it for only 15–20% of Canadian annual reports since 2010. The original JKP code filled US gaps from CRSP, which the CRSP-bypass build does not have.
+  - In September 2026, `sic` was missing for 3,628 of 46,947 stocks (1.5% of market value), including 1,274 of 1,748 Canadian stocks and 436 US stocks. With the current codes 217 remain, none of them in the US or Canada; missing `ff49` falls from 4,242 to 1,210 and missing `naics` from 3,272 to 1,313.
+  - Where a stock has both, the current SIC matches the dated one for 99.3% of stocks and gives the same `ff49` for 99.5%.
+  - Full-history runs do not use the current codes: for old months they are a later classification. The current SIC matches the dated one for 99.6% of 2025 annual reports, but for only 72–79% of those from the 1990s.
+  - The gap was inherited from the production SAS in CRSP-bypass mode.
+
 ## 12-10-2026
 __Changes__:
 - Dividend yields of stocks that pay no dividend are now 0 instead of missing, as the documentation specifies ("If DIV is missing, we set it to zero").
