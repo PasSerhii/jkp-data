@@ -3,6 +3,15 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 15-10-2026
+__Changes__:
+- The split restoration of 07-10-2026 counted a split twice when Compustat books the split's adjustment-factor step on another day than the price's split. Such splits are now bridged when the factor step can be matched to them unambiguously; otherwise they are restored as before.
+  - The restoration treats a split as missed when Compustat's factor moves by less than 10% within 15 days of Capital IQ's ex-date. When the factor steps 16 days or more away, the split was restored although the factor already held it, and the factor's step stayed in the return index as a jump of the split ratio. 029024, 1-for-5 in April 1997 (factor step on 1 April, price on 30 April): April at −82.3% instead of −11.7%.
+  - Now Compustat's step is moved to the ex-date when the price itself jumps by the split ratio on the ex-date, and within 120 days the factor steps by the split (within 10%) on a day when the price moves by less than half the split's log ratio and less than a factor of 1.5 either way, and the total-return factor by less than 10%. No other Capital IQ split may be within 15 days of that day, nor one the step fits that is at least as close, and the split and the day must pair only with each other. Only two daily returns can change: the factor day's, which loses Compustat's factor jump, and the ex-date's, which takes Compustat's own step (net of any factor wobble across the ex-date) instead of Capital IQ's ratio.
+  - Around all 1,422 restored splits in the daily files this bridges 12, 6 of them since September 2003 (South Korea, Singapore, Hong Kong): 18 daily returns change, one on each split's factor day and six ex-day returns by the difference between Compustat's step and Capital IQ's ratio. Nothing else moves.
+  - FactSet's split-adjusted prices give the corrected factor-day return for 10 of the 12, within 0.7 points (the old one was 31–166 points off); for the other two (025292 and 103618, 1996) the vendors' daily prices are a day apart. Over the window from 25 days before the first of the two days to 25 days after the second, the return matches FactSet within 0.31 points for 10; FactSet lacks the split itself for 201438 (3-for-2, Jordan, 1997), and 295108 differs on a day the change does not touch. Yahoo Finance, which still lists one of them (Paratech, 2.5-for-1 in April 2021), matches every day.
+  - A split that shows only in Compustat's total-return factor, with the price flat on the ex-date, is not bridged (Becamex IJC, 17 January 2017).
+
 ## 13-10-2026
 __Changes__:
 - Runs without `--full-history` now fill `sic` and `naics` that are still missing after Compustat's dated industry codes with the company's current codes from the Compustat header (`comp.company`, `comp.g_company`). `ff49` follows from the filled `sic`.

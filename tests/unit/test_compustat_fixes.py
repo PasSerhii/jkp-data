@@ -577,6 +577,212 @@ def test_several_missed_splits_stack(test_paths, monkeypatch) -> None:
     )
 
 
+def _price_moves(prices: list[float], ex: date, ratio: float) -> list[float]:
+    """Each day's true return: the price's own move, with the split taken out on its ex-date."""
+    return [
+        prices[i] / (prices[i - 1] * (ratio if DAYS[i] == ex else 1)) - 1
+        for i in range(1, len(prices))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("factor_day", "before", "after", "rate"),
+    [
+        # 029024, 1-for-5 in April 1997: Compustat's factor moves on 1 Apr, the price on 30 Apr
+        pytest.param(date(2023, 11, 22), 0.002, 0.01, 0.2, id="factor-booked-29-days-early"),
+        # 252410, 1-for-20 on 14 Dec 2018: the factor follows on 2 Jan 2019, in the next month
+        pytest.param(date(2024, 1, 9), 0.05, 1.0, 0.05, id="factor-booked-19-days-late"),
+    ],
+)
+def test_split_whose_factor_step_is_booked_on_another_day_is_bridged(
+    test_paths, monkeypatch, factor_day, before, after, rate
+) -> None:
+    """Compustat books the split's factor step weeks away from the price's split, outside the
+    window that tells a missed split. Restoring the split alone would leave the factor's step in
+    the index as a jump of the split ratio; bridged, every return is the price's own move, and
+    the index outside the two days is as delivered."""
+    prices = _prices(0.45, 0.45 / rate)
+    secd = _secd("029024", prices, [before if d < factor_day else after for d in DAYS])
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "029024")
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("029024", "01", EX, rate)]), "029024")
+
+    assert fixed["ret"].to_list()[1:] == pytest.approx(_price_moves(prices, EX, 1 / rate))
+    first, last = min(factor_day, EX), max(factor_day, EX)
+    outside = [i for i, d in enumerate(DAYS) if not first <= d < last]
+    assert (fixed["ri"] / raw["ri"]).gather(outside).to_list() == pytest.approx(
+        [1.0] * len(outside), rel=1e-12
+    )
+
+
+def test_split_with_a_genuine_split_nearby_is_not_bridged(test_paths, monkeypatch) -> None:
+    """The factor step 29 days earlier comes with its own price jump: Compustat applied another
+    split there. Only the missed split is restored, as without a factor step."""
+    early = date(2023, 11, 22)
+    prices = [
+        (0.10 if d < early else 10.0 if d < EX else 900.0) * (1 + 0.02 * (i % 5 - 2))
+        for i, d in enumerate(DAYS)
+    ]
+    secd = _secd("040116", prices, [1.6e-9 if d < early else 1.6e-7 for d in DAYS])
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "040116")
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("040116", "01", EX, 0.01)]), "040116")
+
+    assert (fixed["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [100.0 if d < EX else 1.0 for d in DAYS], rel=1e-12
+    )
+
+
+def test_split_seen_only_in_the_total_return_factor_is_not_bridged(test_paths, monkeypatch) -> None:
+    """294435 (Becamex IJC), Capital IQ 1-for-2 on 17 Jan 2017: the price stays put on the ex-date
+    and only Compustat's total-return factor jumps; the factor steps on 20 Apr with the price again
+    flat. No price split to move the factor step to, so the split is restored as without a step."""
+    early = date(2023, 11, 22)
+    secd = _secd(
+        "294435",
+        _prices(8400.0, 8400.0),
+        [0.772 if d < early else 1.544 for d in DAYS],
+        [1.0 if d < EX else 2.0 for d in DAYS],
+    )
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "294435")
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("294435", "01", EX, 0.5)]), "294435")
+
+    assert (fixed["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [2.0 if d < EX else 1.0 for d in DAYS], rel=1e-12
+    )
+
+
+def test_factor_step_at_another_capital_iq_split_is_not_bridged(test_paths, monkeypatch) -> None:
+    """A factor step on a day Capital IQ has a split of its own belongs to that split, not to the
+    missed one, even when the price does not show it."""
+    early = date(2023, 11, 22)
+    prices = _prices(0.45, 2.25)
+    secd = _secd("029024", prices, [0.002 if d < early else 0.01 for d in DAYS])
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "029024")
+    fixed = _security(
+        _daily(
+            test_paths,
+            monkeypatch,
+            secd,
+            [("029024", "01", EX, 0.2), ("029024", "01", early, 0.2)],
+        ),
+        "029024",
+    )
+
+    assert (fixed["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [5.0 if d < EX else 1.0 for d in DAYS], rel=1e-12
+    )
+
+
+EARLY = date(2023, 11, 22)
+
+
+@pytest.mark.parametrize(
+    ("ajexdi", "trfd", "other_splits"),
+    [
+        pytest.param(
+            [0.002 if d < EARLY else 0.01 for d in DAYS],
+            [1.0 if d < EARLY else 0.2 for d in DAYS],
+            [],
+            id="trfd-offsets-the-factor-step",
+        ),
+        pytest.param(
+            [0.002 if d < EARLY else 0.008 for d in DAYS],
+            None,
+            [],
+            id="step-does-not-fit-the-split",
+        ),
+        pytest.param(
+            [0.002 if d < EARLY else 0.01 for d in DAYS],
+            None,
+            [("029024", "01", EARLY - timedelta(days=20), 0.2)],
+            id="a-closer-split-fits-the-step",
+        ),
+    ],
+)
+def test_factor_step_that_may_belong_elsewhere_is_not_bridged(
+    test_paths, monkeypatch, ajexdi, trfd, other_splits
+) -> None:
+    """A factor step that the total-return factor cancels, that does not fit the split, or that a
+    Capital IQ split at least as close fits too, is left alone: the split is restored as without
+    a step."""
+    secd = _secd("029024", _prices(0.45, 2.25), ajexdi, trfd)
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "029024")
+    fixed = _security(
+        _daily(test_paths, monkeypatch, secd, [("029024", "01", EX, 0.2), *other_splits]),
+        "029024",
+    )
+
+    assert (fixed["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [5.0 if d < EX else 1.0 for d in DAYS], rel=1e-12
+    )
+
+
+def test_two_splits_competing_for_two_factor_steps_are_not_bridged(test_paths, monkeypatch) -> None:
+    """Two missed 1-for-5 splits (20 Nov, 21 Dec) and two factor steps of 5x (10 Jan, 25 Jan):
+    the later split fits both steps and the pairing is ambiguous, so neither is bridged and both
+    are restored as without a step."""
+    first, step1, step2 = date(2023, 11, 20), date(2024, 1, 10), date(2024, 1, 25)
+    prices = [
+        (0.45 if d < first else 2.25 if d < EX else 11.25) * (1 + 0.02 * (i % 5 - 2))
+        for i, d in enumerate(DAYS)
+    ]
+    ajexdi = [0.0004 if d < step1 else 0.002 if d < step2 else 0.01 for d in DAYS]
+    secd = _secd("029024", prices, ajexdi)
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "029024")
+    fixed = _security(
+        _daily(
+            test_paths,
+            monkeypatch,
+            secd,
+            [("029024", "01", first, 0.2), ("029024", "01", EX, 0.2)],
+        ),
+        "029024",
+    )
+
+    assert (fixed["ri"] / raw["ri"]).to_list() == pytest.approx(
+        [25.0 if d < first else 5.0 if d < EX else 1.0 for d in DAYS], rel=1e-12
+    )
+
+
+def test_bridged_split_keeps_the_factor_wobble_across_the_ex_date_out(
+    test_paths, monkeypatch
+) -> None:
+    """The factor wobbles by 5% across the ex-date, as rounded factors do, and steps 5x 29 days
+    earlier. Bridged, the ex-date still returns the price's move net of the split alone."""
+    prices = _prices(0.45, 2.25)
+    ajexdi = [0.002 if d < EARLY else 0.01 if d < EX else 0.0105 for d in DAYS]
+    secd = _secd("029024", prices, ajexdi)
+
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("029024", "01", EX, 0.2)]), "029024")
+
+    assert fixed["ret"].to_list()[1:] == pytest.approx(_price_moves(prices, EX, 5.0))
+
+
+def test_bridge_moves_compustats_own_step(test_paths, monkeypatch) -> None:
+    """103618, 2-for-1 on 16 Dec 1996: Compustat's factor steps by 2.067, not 2, and only on
+    10 Jan 1997. Its own step moves to the ex-date: the factor day returns the price's move, the
+    ex-date the price's move net of 2.067, and the index outside the two days is as delivered."""
+    late = date(2024, 1, 9)
+    prices = _prices(8.0, 4.0)
+    secd = _secd("103618", prices, [2.06712 if d < late else 1.0 for d in DAYS])
+
+    raw = _security(_daily(test_paths, monkeypatch, secd, None), "103618")
+    fixed = _security(_daily(test_paths, monkeypatch, secd, [("103618", "01", EX, 2.0)]), "103618")
+
+    k, f = DAYS.index(EX), DAYS.index(late)
+    assert fixed["ret"][f] == pytest.approx(prices[f] / prices[f - 1] - 1)
+    assert fixed["ret"][k] == pytest.approx(prices[k] * 2.06712 / prices[k - 1] - 1)
+    outside = [i for i, d in enumerate(DAYS) if not EX <= d < late]
+    assert (fixed["ri"] / raw["ri"]).gather(outside).to_list() == pytest.approx(
+        [1.0] * len(outside), rel=1e-12
+    )
+
+
 def test_split_hidden_by_factor_rounding_is_restored(test_paths, monkeypatch) -> None:
     """Conduit Pharmaceuticals, 1-for-100 on 27 Jan 2025: Compustat's factor wobbles from 1.32e-6
     to 1.33e-6 across the split instead of staying flat. The split is restored net of the wobble."""

@@ -57,6 +57,9 @@ SPLIT_WINDOW_DAYS = 15
 # Longest gap between the prices either side of an ex-date for which their ratio still shows
 # the split.
 SPLIT_MAX_GAP_DAYS = 31
+# Furthest a factor step can lie from a missed split's ex-date and still be that split, booked
+# on the wrong day (029024: factor 5x on 1 Apr 1997, price 5x on 30 Apr; seen up to 93 days).
+SPLIT_BRIDGE_DAYS = 120
 # The daily price files and their quote-unit column (G_SECD quotes some lines per 100 units).
 _DAILY_QUOTE_UNIT = {"comp_secd": None, "comp_g_secd": "qunit"}
 
@@ -308,7 +311,8 @@ def restore_missed_splits(
         exactly as Compustat delivers them. A missed split returns the split ratio on its
         ex-date (Mullen Automotive's 1-for-100 on 21 Dec 2023: +17,700% that day); within
         each stretch between missed splits the index is scaled by a constant, so that one
-        return is the only one that changes.
+        return is the only one that changes. Where Compustat books the split's factor step on
+        another day, the returns of those two days change and no other return.
         The monthly file (SECM) is not corrected: its monthly price ratio cannot tell a split
         from a month's move as well, and FactSet confirmed only 82-84% of the splits it would
         restore where the daily file has no matching jump or no rows. SECM months enter the
@@ -360,8 +364,20 @@ def _missed_split_table(con: Backend, events: Path, view_name: str, source: str)
            take half of it, and (c) those two rows are at most SPLIT_MAX_GAP_DAYS apart.
         4) The restored step is ``rate * ajexdi after / ajexdi before``: the split, net of the
            factor's own drift across the ex-date (none when it is flat).
-        5) For each security, stretches end at each missed ex-date; the rows of a stretch
-           need the product of the restored steps of all missed splits from its end onwards.
+        5) Compustat may book a missed split's factor step on another day, up to
+           SPLIT_BRIDGE_DAYS away. That step is moved to the ex-date ("bridged") when the
+           split shows in the price itself (its jump across the ex-date is within half the
+           log ratio, not only in the return index), and on the other day, between two rows
+           at most SPLIT_MAX_GAP_DAYS apart, the factor moves by the split within
+           MAX_FACTOR_DRIFT, while the price moves by less than half the split's log ratio
+           and less than MIN_SPLIT_RATIO, and ``trfd`` by less than MAX_FACTOR_DRIFT. No other
+           Capital IQ split may be within SPLIT_WINDOW_DAYS of that day, nor one the step fits
+           that is at least as close to it, and the split and the day must pair only with each
+           other; otherwise the split is restored as in 4). That day gets the factor's own step
+           as a counter-step, and the ex-date the factor's drift across it divided by that
+           step, instead of the restored step.
+        6) For each security, stretches end at each missed ex-date and counter-step day; the
+           rows of a stretch need the product of the steps from its end onwards.
     Output:
         DuckDB table ``__missed_splits_{view_name}`` {gvkey, iid, valid_from, valid_to,
         multiplier}: rows with valid_from <= datadate < valid_to get their return index
@@ -381,23 +397,43 @@ def _missed_split_table(con: Backend, events: Path, view_name: str, source: str)
         books in ``trfd`` (Warner Bros. Discovery Series A, 7 Aug 2014: one Series C share
         per share, a halved price and a doubled trfd). The window in (a) skips splits whose
         factor change Compustat dates a few days away from Capital IQ's ex-date.
+        Step 5 handles a factor change dated further away. Restoring such a split alone would
+        count it twice: the factor's own step would stay in the index as a jump of the split
+        ratio (029024, 1-for-5: April 1997 at -82% instead of -12%). Moving Compustat's own
+        step to the ex-date changes only two daily returns: the other day's loses the
+        factor's jump, and the ex-date's takes Compustat's step (net of any wobble across the
+        ex-date) instead of Capital IQ's ratio. Where the two differ, Compustat's step is the
+        one that keeps the return over both days as delivered (103618, 2-for-1 in December
+        1996, a step of 2.067: FactSet confirms the return over the two months).
+        Checked on 14 October 2026 around all 1,422 restored splits in the daily files: 12 are
+        bridged, 18 daily returns change and nothing else. FactSet's split-adjusted prices match the return over
+        the bridged stretch for 10; FactSet lacks one of the splits (201438, Jordan, 1997), and
+        the last differs on a day the change does not touch. A split seen only in ``trfd``
+        (Becamex IJC, 17 Jan 2017, flat price) is not bridged.
     """
     table = f"__missed_splits_{view_name}"
     quote_unit = _DAILY_QUOTE_UNIT[view_name]
     qunit = f"CAST(s.{quote_unit} AS DOUBLE)" if quote_unit else "1"
     reach = SPLIT_WINDOW_DAYS + SPLIT_MAX_GAP_DAYS
+    bridge_reach = SPLIT_BRIDGE_DAYS + SPLIT_MAX_GAP_DAYS
     con.raw_sql(f"""
     CREATE TABLE IF NOT EXISTS {table} AS
-    WITH events AS (
-        SELECT gvkey, iid, CAST(exdate AS DATE) AS exdate, CAST(rate AS DOUBLE) AS rate,
-               CAST(exdate AS DATE) - {SPLIT_WINDOW_DAYS} AS window_start,
-               CAST(exdate AS DATE) + {SPLIT_WINDOW_DAYS} AS window_end
+    WITH all_events AS (
+        SELECT gvkey, iid, CAST(exdate AS DATE) AS exdate, CAST(rate AS DOUBLE) AS rate
         FROM read_parquet('{_sql_path(events)}')
-        WHERE rate > 0 AND abs(ln(rate)) >= ln({MIN_SPLIT_RATIO})
+        WHERE rate > 0
+    ),
+    events AS (
+        SELECT gvkey, iid, exdate, rate,
+               exdate - {SPLIT_WINDOW_DAYS} AS window_start,
+               exdate + {SPLIT_WINDOW_DAYS} AS window_end
+        FROM all_events
+        WHERE abs(ln(rate)) >= ln({MIN_SPLIT_RATIO})
     ),
     prices AS (
         SELECT s.gvkey, s.iid, CAST(s.datadate AS DATE) AS datadate,
                CAST(s.ajexdi AS DOUBLE) AS factor,
+               CAST(s.prccd AS DOUBLE) / {qunit} AS price,
                CAST(s.prccd AS DOUBLE) / {qunit} / CAST(s.ajexdi AS DOUBLE)
                    * COALESCE(CAST(s.trfd AS DOUBLE), 1) AS ri
         FROM read_parquet('{source}') AS s
@@ -413,7 +449,9 @@ def _missed_split_table(con: Backend, events: Path, view_name: str, source: str)
     around AS (
         SELECT e.gvkey, e.iid, e.exdate, e.rate,
                b.datadate AS before_date, b.factor AS before_factor, b.ri AS before_ri,
-               a.datadate AS after_date, a.factor AS after_factor, a.ri AS after_ri
+               b.price AS before_price,
+               a.datadate AS after_date, a.factor AS after_factor, a.ri AS after_ri,
+               a.price AS after_price
         FROM events AS e
         ASOF JOIN prices AS b
             ON e.gvkey = b.gvkey AND e.iid = b.iid AND e.exdate > b.datadate
@@ -430,13 +468,79 @@ def _missed_split_table(con: Backend, events: Path, view_name: str, source: str)
         GROUP BY ALL
     ),
     missed AS (
-        SELECT gvkey, iid, exdate, rate * after_factor / before_factor AS step
+        SELECT gvkey, iid, exdate, rate, rate * after_factor / before_factor AS step,
+               abs(ln(after_price / before_price) + ln(rate)) < abs(ln(rate)) / 2 AS price_split
         FROM around
         LEFT JOIN window_factors USING (gvkey, iid, exdate)
         WHERE greatest(before_factor, after_factor, window_max)
                 / least(before_factor, after_factor, window_min) < {MAX_FACTOR_DRIFT}
           AND after_date - before_date <= {SPLIT_MAX_GAP_DAYS}
           AND abs(ln(after_ri / before_ri) + ln(rate)) < abs(ln(rate)) / 2
+    ),
+    near_missed AS (
+        SELECT s.gvkey, s.iid, CAST(s.datadate AS DATE) AS datadate,
+               CAST(s.ajexdi AS DOUBLE) AS factor,
+               CAST(s.prccd AS DOUBLE) / {qunit} AS price,
+               COALESCE(CAST(s.trfd AS DOUBLE), 1) AS trfd
+        FROM read_parquet('{source}') AS s
+        SEMI JOIN (SELECT DISTINCT gvkey, iid FROM missed WHERE price_split) AS k
+          ON s.gvkey = k.gvkey AND s.iid = k.iid
+        WHERE s.prccd > 0 AND s.ajexdi > 0
+          AND COALESCE(s.trfd, 1) > 0
+          AND {qunit} > 0
+          AND EXISTS (
+              SELECT 1 FROM missed AS m
+              WHERE m.price_split AND m.gvkey = s.gvkey AND m.iid = s.iid
+                AND CAST(s.datadate AS DATE)
+                    BETWEEN m.exdate - {bridge_reach} AND m.exdate + {bridge_reach}
+          )
+    ),
+    factor_steps AS (
+        SELECT gvkey, iid, datadate, factor / prev_factor AS step,
+               price / prev_price AS price_move, trfd / prev_trfd AS trfd_move
+        FROM (
+            SELECT *,
+                   lag(datadate) OVER w AS prev_date,
+                   lag(factor) OVER w AS prev_factor,
+                   lag(price) OVER w AS prev_price,
+                   lag(trfd) OVER w AS prev_trfd
+            FROM near_missed
+            WINDOW w AS (PARTITION BY gvkey, iid ORDER BY datadate)
+        )
+        WHERE factor <> prev_factor AND datadate - prev_date <= {SPLIT_MAX_GAP_DAYS}
+    ),
+    candidates AS (
+        SELECT m.gvkey, m.iid, m.exdate, f.datadate AS factor_day, f.step
+        FROM missed AS m
+        JOIN factor_steps AS f
+          ON f.gvkey = m.gvkey AND f.iid = m.iid
+         AND f.datadate BETWEEN m.exdate - {SPLIT_BRIDGE_DAYS} AND m.exdate + {SPLIT_BRIDGE_DAYS}
+        WHERE m.price_split
+          AND abs(ln(f.step * m.rate)) < ln({MAX_FACTOR_DRIFT})
+          AND abs(ln(f.price_move)) < least(abs(ln(m.rate)) / 2, ln({MIN_SPLIT_RATIO}))
+          AND abs(ln(f.trfd_move)) < ln({MAX_FACTOR_DRIFT})
+          AND NOT EXISTS (
+              SELECT 1 FROM all_events AS e
+              WHERE e.gvkey = f.gvkey AND e.iid = f.iid AND e.exdate <> m.exdate
+                AND (
+                    e.exdate BETWEEN f.datadate - {SPLIT_WINDOW_DAYS}
+                                 AND f.datadate + {SPLIT_WINDOW_DAYS}
+                    OR (abs(ln(f.step * e.rate)) < ln({MAX_FACTOR_DRIFT})
+                        AND abs(e.exdate - f.datadate) <= abs(m.exdate - f.datadate))
+                )
+          )
+    ),
+    bridges AS (
+        SELECT * FROM candidates
+        QUALIFY count(*) OVER (PARTITION BY gvkey, iid, exdate) = 1
+            AND count(*) OVER (PARTITION BY gvkey, iid, factor_day) = 1
+    ),
+    steps AS (
+        SELECT m.gvkey, m.iid, m.exdate, COALESCE(m.step / m.rate / b.step, m.step) AS step
+        FROM missed AS m
+        LEFT JOIN bridges AS b USING (gvkey, iid, exdate)
+        UNION ALL
+        SELECT gvkey, iid, factor_day AS exdate, step FROM bridges
     )
     SELECT gvkey, iid,
            lag(exdate, 1, DATE '0001-01-01') OVER (PARTITION BY gvkey, iid ORDER BY exdate)
@@ -446,6 +550,6 @@ def _missed_split_table(con: Backend, events: Path, view_name: str, source: str)
                PARTITION BY gvkey, iid ORDER BY exdate DESC
                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
            )) AS multiplier
-    FROM missed;
+    FROM steps;
     """)
     return table
