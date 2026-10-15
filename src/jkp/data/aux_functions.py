@@ -1979,6 +1979,9 @@ def build_compustat_age_anchor_query(raw_schema: str) -> str:
     years used by ``firm_age`` without scanning or downloading full history.
 
     Company rows (``iid`` NULL) carry the first accounting and return dates.
+    A Global security's return date is its first daily row with a price: the
+    total-return table starts most Global securities with an empty 2 January
+    1984 row, which would date them all from 1983.
     Security rows carry ``comp_dprc_first``, the first daily price of a North
     American security that the monthly panel would keep (price, currency,
     prcstd 3/4/10): a full-history panel can start there, before the monthly
@@ -1988,16 +1991,14 @@ def build_compustat_age_anchor_query(raw_schema: str) -> str:
         raise ValueError(f"Invalid raw PostgreSQL schema: {raw_schema!r}")
     schema = _pg_ident(raw_schema)
 
-    def first_date(table: str) -> str:
+    def first_date(table: str, condition: str = "") -> str:
         return (
             f"(SELECT x.datadate FROM {schema}.{_pg_ident(table)} x "
-            "WHERE x.gvkey=s.gvkey AND x.iid=s.iid "
+            f"WHERE x.gvkey=s.gvkey AND x.iid=s.iid{condition} "
             "ORDER BY x.datadate LIMIT 1)"
         )
 
-    global_first = ",\n             ".join(
-        first_date(table) for table in ("sec_dprc", "sec_divid", "sec_dtrt", "sec_split")
-    )
+    global_first = first_date("sec_dprc", " AND x.prccd IS NOT NULL")
     national_first = ",\n             ".join(
         first_date(table) for table in ("sec_mth", "sec_mthprc", "sec_mthtrt")
     )
@@ -2012,9 +2013,7 @@ WITH security_pairs AS MATERIALIZED (
   SELECT s.gvkey,
          s.iid,
          CASE WHEN s.iid LIKE '%W' THEN
-           LEAST(
-             {global_first}
-           )
+           {global_first}
          ELSE
            LEAST(
              {national_first}

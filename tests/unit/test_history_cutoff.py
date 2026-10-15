@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
+import duckdb
 import polars as pl
 import pytest
 
@@ -20,17 +21,9 @@ def test_age_anchor_query_uses_indexed_first_row_probes_not_daily_aggregate() ->
 
     assert 'FROM "public"."security" s' in sql
     assert 'FROM "public"."co_adesind"' in sql
-    for table in (
-        "sec_dprc",
-        "sec_divid",
-        "sec_dtrt",
-        "sec_split",
-        "sec_mth",
-        "sec_mthprc",
-        "sec_mthtrt",
-    ):
+    for table in ("sec_dprc", "sec_mth", "sec_mthprc", "sec_mthtrt"):
         assert f'FROM "public"."{table}" x' in sql
-    assert sql.count("ORDER BY x.datadate LIMIT 1") == 8
+    assert sql.count("ORDER BY x.datadate LIMIT 1") == 5
     assert "FROM comp.g_secd" not in sql
     assert "FROM comp.secd" not in sql
     assert "MIN(x.datadate)" not in sql
@@ -38,6 +31,34 @@ def test_age_anchor_query_uses_indexed_first_row_probes_not_daily_aggregate() ->
     assert "x.prcstd IN (3, 4, 10)" in sql
     assert "first_daily::date" in sql
     assert "AS comp_dprc_first" in sql
+
+
+def test_age_anchor_skips_global_rows_without_a_price() -> None:
+    """Shenzhen JLC Technology listed on 4 Aug 2026; its total-return table starts with an
+    empty 2 Jan 1984 row, which made its age 513 months. Only a priced row dates it."""
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.security (gvkey VARCHAR, iid VARCHAR)")
+    con.execute("CREATE TABLE raw.company (gvkey VARCHAR, fic VARCHAR)")
+    con.execute("CREATE TABLE raw.co_adesind (gvkey VARCHAR, datadate DATE, popsrc VARCHAR)")
+    con.execute(
+        "CREATE TABLE raw.sec_dprc (gvkey VARCHAR, iid VARCHAR, datadate DATE, "
+        "prccd DOUBLE, curcdd VARCHAR, prcstd INTEGER)"
+    )
+    for table in ("sec_dtrt", "sec_mth", "sec_mthprc", "sec_mthtrt"):
+        con.execute(f"CREATE TABLE raw.{table} (gvkey VARCHAR, iid VARCHAR, datadate DATE)")
+    con.execute("INSERT INTO raw.security VALUES ('372997', '01W')")
+    con.execute("INSERT INTO raw.company VALUES ('372997', 'CHN')")
+    con.execute("INSERT INTO raw.sec_dtrt VALUES ('372997', '01W', DATE '1984-01-02')")
+    con.execute(
+        "INSERT INTO raw.sec_dprc VALUES "
+        "('372997', '01W', DATE '2026-08-03', NULL, 'CNY', 10), "
+        "('372997', '01W', DATE '2026-08-04', 208.01, 'CNY', 10)"
+    )
+
+    rows = con.execute(build_compustat_age_anchor_query("raw")).fetchall()
+
+    assert rows == [("372997", None, date(2026, 8, 4), None, None)]
 
 
 def test_age_anchor_query_rejects_untrusted_schema() -> None:
