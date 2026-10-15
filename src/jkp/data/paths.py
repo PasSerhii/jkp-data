@@ -35,6 +35,31 @@ class DataPaths:
     def processed_dir(self) -> Path:
         return self.base_dir / "processed"
 
+    @property
+    def production_dir(self) -> Path:
+        """The single production CSV directory.
+
+        Holds ``monthly/<country>.csv``, ``daily/<country>.csv`` and the six
+        cross-country files (market returns, cutoffs, world monthly returns).
+        This replaces the former ``processed/output/`` tree, which held a
+        byte-identical second copy of every country CSV purely to present the
+        SAS directory shape.
+        """
+        return self.processed_dir / "production"
+
+    def raw_table_source(self, table_name: str) -> Path | str:
+        """Return a file or Parquet glob for a downloaded source table.
+
+        Most source tables are stored as one ``<schema>_<table>.parquet``
+        file.  The very large daily Compustat tables are downloaded in
+        restart-sized parts and exposed to DuckDB/Polars as one glob.
+        """
+        stem = table_name.replace(".", "_")
+        parts_dir = self.raw_tables_dir / f"{stem}_parts"
+        if parts_dir.is_dir():
+            return str(parts_dir / "part-*.parquet")
+        return self.raw_tables_dir / f"{stem}.parquet"
+
 
 def _resource_path(filename: str) -> Path:
     """Return a filesystem Path to a bundled resource file.
@@ -73,3 +98,13 @@ def get_factor_details_path() -> Path:
 def get_data_readme_path() -> Path:
     """Return the path to the bundled data directory README file."""
     return _resource_path("README.md")
+
+
+def get_production_monthly_columns() -> list[str]:
+    """Return the ordered column list for the monthly production CSV output.
+
+    Mirrors the column order of the SAS `save_main_production_data_csv` output
+    (e.g. usa.csv), one column name per line.
+    """
+    path = _resource_path("production_monthly_columns.txt")
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
