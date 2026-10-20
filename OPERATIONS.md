@@ -238,6 +238,37 @@ credential. Run tag and end date are resolved on the host at boot
 `user-data.sh` at the time it was written, so rerun it after any change to
 `launch.sh` or `user-data.sh`.
 
+**Updating the scheduled run's template.** Pull `compustat_migration` first:
+the template takes `launch.sh` and `user-data.sh` as they are on disk. Then, in
+Git Bash at the repo root:
+
+```bash
+bash scripts/aws/launch.sh --template
+```
+
+From PowerShell, call Git Bash explicitly, so that WSL's `bash` is not picked up:
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" scripts/aws/launch.sh --template
+```
+
+It needs the aws CLI signed in to `485357734136`, and starts nothing and costs
+nothing. It checks that `/jkp-data/production/env` exists and names ODBC Driver
+18 (the value is read, never printed), and that `jkp-data:production` is in ECR.
+It then writes a new version of `jkp-data-monthly` and makes it the default; the
+version description records the commit it was written from. Check that the
+default moved to the newest version:
+
+```bash
+aws ec2 describe-launch-templates --region eu-central-1 \
+  --launch-template-names jkp-data-monthly \
+  --query 'LaunchTemplates[0].[DefaultVersionNumber,LatestVersionNumber]' --output text
+```
+
+The two numbers must be equal. To go back to an earlier version, make it the
+default again:
+`aws ec2 modify-launch-template --region eu-central-1 --launch-template-name jkp-data-monthly --default-version <n>`.
+
 Alerts arrive on start, on completion (with elapsed time), on failure, and on
 bootstrap failure. **A missing "started" alert means the host never got that
 far** — the bootstrap fails loudly rather than idling, so look for
@@ -504,7 +535,7 @@ Still manual:
 - **Re-running a month the schedule did not deliver.** `production-run.sh` on
   your machine (mind the RDS stop, section 8).
 - **Keeping the template in step.** `launch.sh --template` after a change to
-  `launch.sh` or `user-data.sh`.
+  `launch.sh` or `user-data.sh` (how: section 3, `scripts/aws/launch.sh`).
 - **Rotating credentials.** `put-production-credentials.sh`.
 - **Downloading the output.** `aws s3 sync s3://<bucket>/<run-tag>/production/ …`,
   when needed.
