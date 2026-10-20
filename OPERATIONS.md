@@ -11,14 +11,22 @@ There is one job: the monthly production build. Everything below serves it.
 
 | I want to | Run | Where |
 |---|---|---|
-| The monthly production build | `scripts/production-run.sh` | your machine, VPN up |
+| The monthly production build | nothing: it starts itself at 09:00 Israel time on the 1st | AWS |
+| Run a month by hand (one the schedule did not deliver) | `scripts/production-run.sh` | your machine, VPN up |
 | Check whether it *could* run, change nothing | `scripts/production-run.sh --check-only` | your machine |
 | Just the feed-readiness verdict | `uv run python scripts/check_source_ready.py` | your machine |
 | Watch a run in flight | `scripts/aws/status.sh <instance-id>` | your machine |
 | Store credentials for unattended runs | `scripts/put-production-credentials.sh` | your machine, once |
 | Re-launch a month already prepared | `scripts/aws/launch.sh <run-tag>` | your machine |
+| Update the scheduled run after changing `launch.sh` or `user-data.sh` | `scripts/aws/launch.sh --template` | your machine |
 
-`production-run.sh` is the entry point. It runs every gate, refreshes
+On the 1st, EventBridge Scheduler starts a host from the launch template
+`jkp-data-monthly`. The host runs `production-run.sh --unattended` (the gates,
+a bounded wait for the feed, the Fama-French refresh and the identifier capture),
+then the build, which uploads to the research database. It reports by email and
+in the #wrds Slack channel and terminates itself.
+
+By hand, `production-run.sh` is the entry point. It runs every gate, refreshes
 Fama-French, captures identifiers, and *then* calls `launch.sh` for you. Calling
 `launch.sh` directly skips all of that — right only when you have already
 prepared that month and just need another host.
@@ -42,11 +50,12 @@ out in full.
 Only `COMPUSTAT` is required. Without the WRDS pair the run still completes; it
 skips the FF refresh and falls back to the last rate already in the database,
 exactly as the production SAS does. `RESEARCH_UPDATE` is optional and only
-consulted when `--db-update` is passed; it currently points at `research_test`,
-and switching the upload to the production `research` database is a change to
-this value only.
+consulted when `--db-update` or `--db-replace` is passed. It points at the
+production `research` database (since 20 October 2026; the Python-built
+`research_test` was renamed `research` on 19 October). The target database is
+chosen by this value only.
 
-### Today: attended run, credentials start on your machine
+### Attended run (by hand): credentials start on your machine
 
 ```
 your machine                          EC2 host                    container
@@ -77,7 +86,7 @@ the host never needs WRDS — you already ran the FF refresh locally. The
 credential's plaintext never appears in an SSM command, in CloudTrail, or in the
 launcher's terminal, and there is no handshake that can stall.
 
-### Unattended: credentials live on AWS, `.env` is only the seed
+### Scheduled run (unattended): credentials live on AWS, `.env` is only the seed
 
 ```
 your machine                          EC2 host                    container
@@ -211,17 +220,32 @@ shot).
 
 ```bash
 scripts/aws/launch.sh [RUN_TAG]
+scripts/aws/launch.sh --template      # write the scheduled run's launch template
 ```
 
 Idempotent: reuses the bucket, IAM role/profile and security group if they
 exist. Blocks only on capacity; everything after that the host does itself and
-reports by email. Default run tag `prod-<UTC date>`, and it refuses to start if
-that tag already has objects in S3 — pass a distinct tag for a same-day re-run.
+reports by email and in #wrds. Default run tag `prod-<UTC date>`, and it refuses
+to start if that tag already has objects in S3 — pass a distinct tag for a
+same-day re-run.
 
-Email arrives on start, on completion (with elapsed time), on failure, and on
-bootstrap failure. **A missing "started" email means the host never got that
+`--template` launches nothing. It writes the scheduled monthly run into the EC2
+launch template `jkp-data-monthly` as a new version and makes it the default,
+which is the version the schedule starts. The template is always the monthly
+delivery: on demand, unattended, every country, `--db-update`, the persistent
+credential. Run tag and end date are resolved on the host at boot
+(`prod-<UTC date>`, the previous month end). It carries the text of
+`user-data.sh` at the time it was written, so rerun it after any change to
+`launch.sh` or `user-data.sh`.
+
+Alerts arrive on start, on completion (with elapsed time), on failure, and on
+bootstrap failure. **A missing "started" alert means the host never got that
 far** — the bootstrap fails loudly rather than idling, so look for
 `JKP RUN: BOOTSTRAP FAILED`, which carries the reason.
+
+The host terminates itself: right after the S3 upload when the run succeeds,
+and 5 hours after a failure, which leaves time for diagnosis (`sudo shutdown -c`
+on the host keeps it). Its volume goes with it.
 
 ### `scripts/aws/status.sh`
 
@@ -241,14 +265,14 @@ production-correct value; override only for a reason.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `COUNTRIES` | *(empty)* | Empty uploads every country. A space-separated list uploads only those; the six cross-country files still ship. |
+| `COUNTRIES` | *(empty)* | Empty uploads every country. A space-separated list uploads only those; the seven cross-country files still ship. |
 | `START_DATE` | *(empty)* | Empty gives the rolling `ROLLING_INPUT_YEARS` (23) window. |
 | `FULL_HISTORY` | `0` | `1` passes `--full-history`: sources start at `config.ACCOUNTING_START_DATE` (1949-12-31). Cannot be combined with `START_DATE`, and makes `DB_UPDATE` default to `0`. |
 | `END_DATE` | *(previous month end)* | Last month end to build, computed at launch. |
 | `PRODUCTION_YEARS` | *(empty)* | Empty keeps `config.PRODUCTION_OUTPUT_YEARS` (3) years in the per-country CSVs; `0` writes all years (required by `DB_REPLACE`). |
 | `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). |
 | `KEEP_INTERIM` | `1` | Keeps `interim/` and `raw/` and ships the accounting artefacts to S3. |
-| `DB_UPDATE` | `1` (`0` with `FULL_HISTORY=1`) | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (currently `research_test`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
+| `DB_UPDATE` | `1` (`0` with `FULL_HISTORY=1`) | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (`research`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
 | `DB_REPLACE` | `0` | `1` passes `--db-replace` instead: the nine research tables in the same database are emptied and reloaded from the CSVs (see section 5). Needs `PRODUCTION_YEARS=0`. |
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
@@ -308,6 +332,7 @@ processed/production/
     market_returns.csv  market_returns_daily.csv
     nyse_cutoffs.csv    return_cutoffs.csv  return_cutoffs_daily.csv
     world_ret_monthly.csv
+    fama_french_factors_monthly.csv   # the Fama-French factors the run used
 ```
 
 The per-country CSVs carry `config.PRODUCTION_OUTPUT_YEARS` (3) of history, not
@@ -315,7 +340,7 @@ the whole panel — the loader downstream only reads rows past its own high-wate
 mark, so the rest was written and shipped unread. `jkp build --production-years 0`
 emits everything for a re-seed. This bounds the *output* only: characteristics
 are computed over the full source window either way, so the retained rows are
-identical. The six cross-country files keep full history.
+identical. The seven cross-country files keep full history.
 
 For a complete Python-history rebuild on EC2, the launcher accepts
 `FULL_HISTORY=1 PRODUCTION_YEARS=0`. Leave `START_DATE` unset: the full-history
@@ -334,24 +359,27 @@ target). After the outputs are written, each of the nine tables is emptied
 with `TRUNCATE`, which keeps its column types, key and indexes, and reloaded
 from the CSVs. The upload refuses to start while the database is in FULL
 recovery, which would keep the whole reload in the transaction log on the
-volume shared with `research`; set it once with `ALTER DATABASE [research_test]
-SET RECOVERY SIMPLE`. The tables are empty or partial while it runs, and a
+volume the databases share. `research` has been in SIMPLE recovery since
+19 October 2026; a database restored from a FULL-recovery backup comes back in
+FULL, so set it again with `ALTER DATABASE [research] SET RECOVERY SIMPLE`. The
+tables are empty or partial while it runs, and a
 failure stops it: rerun to start over. Disabling the four nonclustered indexes
 on `dailyreturnsproduction` beforehand (`ALTER INDEX … DISABLE`) cuts its reload
 to ~1.5 h. Rebuild them afterwards (`ALTER INDEX … REBUILD`, 9–16 min each).
 
-After the completion email:
+After the completion alert, fetch what you need from S3:
 
 ```bash
 aws s3 sync s3://jkp-data-runs-485357734136-eu-central-1/<run-tag>/ \
     "D:/jkp-run-<date>/" --exclude "production/*"        # logs only
-aws ec2 terminate-instances --region eu-central-1 --instance-ids i-0abc...
 ```
 
-**Terminating destroys the volume.** By default the whole of
-`processed/production/` reaches S3 first (~12 GiB with the 3-year window,
-against ~95 GiB unbounded). Whatever was not uploaded — the remaining CSVs and
-all parquet output — is lost, and recovering it means a full rerun.
+**The host and its volume are gone by then.** A successful run terminates
+itself right after the upload. By default the whole of `processed/production/`
+reaches S3 first (~12 GiB with the 3-year window, against ~95 GiB unbounded).
+Whatever was not uploaded — the remaining CSVs and all parquet output — is lost,
+and recovering it means a full rerun. A failed run stays up for 5 hours for
+diagnosis; `scripts/aws/status.sh` and SSM reach it.
 
 **The build loads the research database itself.** With `DB_UPDATE=1` (the
 default) the container uploads these CSVs incrementally to the database named by
@@ -376,9 +404,14 @@ rebuild `dailyreturnsproduction_full_history` (the USA rows of
 | Security group | `jkp-data-run-sg` — egress only, no inbound |
 | IAM | role `jkp-data-run-role`, profile `jkp-data-run-profile` |
 | S3 | `jkp-data-runs-485357734136-eu-central-1` (AES256, public access blocked) |
-| SNS | `jkp-spot-run-alerts` → serhii@alpha-beta.co.il |
+| SNS | `jkp-spot-run-alerts` → serhii@alpha-beta.co.il and the #wrds Slack channel (its channel email address; unsubscribing needs AWS credentials) |
 | Credential (unattended) | SSM SecureString `/jkp-data/production/env` |
 | Instance tag | `Purpose=jkp-data-production` — the in-flight interlock filters on it |
+| Schedule | EventBridge Scheduler `jkp-data/jkp-data-monthly-run`, `cron(0 9 1 * ? *)` Asia/Jerusalem, 2 retries within an hour. Launches it gave up on go to the SQS queue `jkp-data-monthly-run-dlq`; the alarms `jkp-data-monthly-run-launch-errors` and `jkp-data-monthly-run-not-launched` go to `jkp-spot-run-alerts`. Terraform: alpha_infra `modules/jkp-monthly-run`. |
+| Launch template | `jkp-data-monthly`, written by `launch.sh --template`; the schedule starts its default version |
+| Image publishing | GitHub Actions `docker-publish.yml`, from `compustat_migration` only, through the OIDC role `jkp-data-ecr-publish`, whose trust admits that branch only |
+| Research database | `research` on the research MSSQL server, named by `RESEARCH_UPDATE` |
+| Compustat RDS | `compustat`, started at 07:30 and stopped at 14:45 Israel time every day (alpha_infra `modules/rds-instance-scheduler`); SSM `/compustat/hold-until` suspends the stops |
 
 **The subnet is not optional.** The Compustat RDS has no public endpoint; its
 security group admits `10.10.0.0/16` on 5432, so the instance must sit in that
@@ -403,9 +436,14 @@ and downloads from 1949 instead of 23 years. The gate compares the image's push
 time against the last commit touching the paths that trigger a rebuild;
 `tests/unit/test_unattended_run_wiring.py` asserts those two path lists match.
 
-A push to `compustat_migration` or `main` touching `src/`, `sql/`, either baked
-script, `Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock` or
-`.python-version` rebuilds and republishes automatically.
+A push to `compustat_migration`, the only branch that publishes, touching `src/`,
+`sql/`, either baked script, `Dockerfile`, `.dockerignore`, `pyproject.toml`,
+`uv.lock` or `.python-version` rebuilds and republishes automatically.
+
+The scheduled run reads `launch.sh` and `user-data.sh` from neither the image nor
+the repo but from the launch template, which holds them as they were at the last
+`launch.sh --template`. A change to either reaches the schedule only after
+rerunning it.
 
 ---
 
@@ -433,18 +471,40 @@ script, `Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock` or
   `ondemand`.
 - **The spot discount is very type-specific**, if you do opt into it. In
   eu-central-1b: `m6a.32xlarge` was ~77% off on demand but `r7i.16xlarge` only
-  ~49%. Check `describe-spot-price-history` rather than assuming.
+  ~49%. Check `describe-spot-price-history` rather than assuming. A spot test
+  run of 20 October 2026 was reclaimed after 1h18m, before any output.
+- **The Compustat RDS stops at 14:45 Israel time.** The build reads it only
+  during `source_download` (~26 minutes). The scheduled run is done with it by
+  about 10:40 at the latest: a 09:00 start, up to 60 minutes of waiting for the
+  feed, then the download. A run started by hand after 14:45 needs it started
+  first (`aws rds start-db-instance --db-instance-identifier compustat`, ~10
+  minutes); one that would still be downloading at 14:45 needs
+  `/compustat/hold-until` set to a later UTC time.
 
 ---
 
-## 9. What is not automated
+## 9. What is automated and what is not
 
-The build is one command; nothing runs on a schedule yet. Still manual:
+Automated since 20 October 2026; the first scheduled run is on 1 November 2026:
 
-- **Starting the run.** No EventBridge trigger, no Launch Template, no
-  self-termination. `UNATTENDED=1` and the persistent credential exist and work,
-  but something still has to call `launch.sh`.
-- **Terminating the instance.** The host stays up after a run, deliberately, so
-  the volume can be inspected. Terminate it when you are done — a 750 GB volume
-  on a stopped instance still costs ~$60/month.
-- **Downloading the output.** `aws s3 sync s3://<bucket>/<run-tag>/production/ …`
+- **Starting the run.** EventBridge Scheduler at 09:00 Israel time on the 1st,
+  from the launch template.
+- **Preparing the month.** The host runs `production-run.sh --unattended`: the
+  gates, up to 60 minutes of waiting for the feed, the Fama-French refresh and
+  the identifier capture.
+- **Loading the research database.** `--db-update`, including
+  `fama_french_factors_monthly` and `dailyreturnsproduction_full_history`.
+- **Terminating the host.** Right after the S3 upload, or 5 hours after a failure.
+- **Reporting.** Start, finish and failure by email and in #wrds, and an alarm
+  when the schedule cannot launch a host.
+
+Still manual:
+
+- **Checking the result.** Nothing compares the new month with the previous one.
+- **Re-running a month the schedule did not deliver.** `production-run.sh` on
+  your machine (mind the RDS stop, section 8).
+- **Keeping the template in step.** `launch.sh --template` after a change to
+  `launch.sh` or `user-data.sh`.
+- **Rotating credentials.** `put-production-credentials.sh`.
+- **Downloading the output.** `aws s3 sync s3://<bucket>/<run-tag>/production/ …`,
+  when needed.

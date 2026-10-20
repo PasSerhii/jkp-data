@@ -288,7 +288,7 @@ for f in $INTERIM_KEEP; do
 done
 
 # processed/production/ is the whole production deliverable: monthly/<country>.csv,
-# daily/<country>.csv, and the six cross-country files the sasWrds uploader reads.
+# daily/<country>.csv, and the seven cross-country files the research upload reads.
 CSV_DIR=/mnt/jkp-data/processed/production
 if [ -z "$COUNTRIES" ]; then
   # Default: everything. `sync` uploads in parallel and resumes cleanly, which
@@ -303,7 +303,8 @@ else
   # The cross-country files are not per-country, so a country subset still needs
   # them explicitly or the uploader has nothing to read.
   for f in market_returns.csv market_returns_daily.csv nyse_cutoffs.csv \
-           return_cutoffs.csv return_cutoffs_daily.csv world_ret_monthly.csv; do
+           return_cutoffs.csv return_cutoffs_daily.csv world_ret_monthly.csv \
+           fama_french_factors_monthly.csv; do
     [ -f "$CSV_DIR/$f" ] && aws s3 cp "$CSV_DIR/$f" "$RUN_PREFIX/production/$f" --only-show-errors
   done
 fi

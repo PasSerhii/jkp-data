@@ -662,8 +662,8 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
 def _check_recovery_model(engine: sa.Engine) -> None:
     """Refuse a replace while the target database is in FULL recovery.
 
-    FULL recovery (research_test comes back that way from every restore of
-    research) keeps the whole reload in the transaction log, which would fill the
+    FULL recovery (a database restored from a FULL-recovery backup comes back
+    that way) keeps the whole reload in the transaction log, which would fill the
     volume the databases share.
     """
     with engine.connect() as conn:

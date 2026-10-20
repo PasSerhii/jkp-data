@@ -110,7 +110,7 @@ if [ "$FULL_HISTORY" = "1" ]; then
 else
   DB_UPDATE="${DB_UPDATE:-1}"
 fi
-# 1 passes --db-replace instead of --db-update: the eight research tables in the
+# 1 passes --db-replace instead of --db-update: the nine research tables in the
 # same RESEARCH_UPDATE database are emptied and reloaded from the CSVs, keeping
 # their definitions. Needs PRODUCTION_YEARS=0 (the pipeline refuses it otherwise)
 # and a target database in SIMPLE recovery.

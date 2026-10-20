@@ -65,6 +65,12 @@ years before the end date, as production does; `--full-history` starts at
 The image has its own ECR repository, so the name is the same locally and
 remotely: `jkp-data:production`. Each push replaces it.
 
+Normally nobody pushes by hand. A push to `compustat_migration` that changes
+what goes into the image rebuilds and publishes it (`.github/workflows/docker-publish.yml`,
+which also tags `git-<sha>` and verifies the result), and only that branch can
+publish. A manual push, below, is for testing an image that is not committed;
+the next automatic publish replaces it.
+
 ```powershell
 $AwsRegion = "eu-central-1"
 $AwsAccountId = aws sts get-caller-identity --query Account --output text

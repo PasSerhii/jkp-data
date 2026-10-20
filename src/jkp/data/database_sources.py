@@ -113,8 +113,8 @@ def get_research_update_connection_info(*, dotenv_path: Path | None = None) -> s
     """Resolve the research MSSQL connection URL for the database-update phase.
 
     The value is returned unmodified: the target database is chosen solely by
-    this URL, so switching research_test -> research is a configuration change
-    only.  Special characters in the password must be percent-encoded, the same
+    this URL, so switching databases (research_test -> research on 20 October
+    2026) was a configuration change only.  Special characters in the password must be percent-encoded, the same
     constraint ``COMPUSTAT`` already carries.
     """
     value = os.environ.get(RESEARCH_UPDATE_ENV_VAR)
