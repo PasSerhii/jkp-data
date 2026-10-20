@@ -13,7 +13,15 @@ REGION=@@REGION@@
 BUCKET=@@BUCKET@@
 TOPIC=@@TOPIC@@
 IMAGE=@@IMAGE@@
-RUN_PREFIX="s3://$BUCKET/@@RUN_TAG@@"
+RUN_TAG="@@RUN_TAG@@"
+END_DATE="@@END_DATE@@"
+# The scheduled monthly run starts from a launch template written once
+# (launch.sh --template), so it carries "auto" for both: the host names the run
+# after its own UTC date and builds the last month end, as launch.sh computes
+# for a manual launch.
+[ "$RUN_TAG" = "auto" ] && RUN_TAG="prod-$(date -u +%Y%m%d)"
+[ "$END_DATE" = "auto" ] && END_DATE="$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m-%d)"
+RUN_PREFIX="s3://$BUCKET/$RUN_TAG"
 COUNTRIES="@@COUNTRIES@@"
 WORKERS="@@WORKERS@@"
 START_DATE="@@START_DATE@@"
@@ -177,7 +185,7 @@ fi
 # fatal here stops the run before the two-hour pipeline starts.
 if [ "$UNATTENDED" = "1" ]; then
   if [ -x /opt/jkp/scripts/production-run.sh ]; then
-    RUN_TAG="@@RUN_TAG@@" IMAGE="$IMAGE" ENV_FILE=/secure/jkp.env \
+    RUN_TAG="$RUN_TAG" END_DATE="$END_DATE" IMAGE="$IMAGE" ENV_FILE=/secure/jkp.env \
       /opt/jkp/scripts/production-run.sh --unattended \
       || fail "unattended preflight failed; see /var/log/jkp-setup.log"
   else
@@ -243,7 +251,7 @@ docker run --name jkp-run \
   --bypass-crsp \
   --persistent-connection \
   "${HISTORY_ARGS[@]}" \
-  --end-date @@END_DATE@@ \
+  --end-date "$END_DATE" \
   --production \
   ${WORKERS:+--daily-download-workers $WORKERS} \
   ${KEEP_FLAG} \

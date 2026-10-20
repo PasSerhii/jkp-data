@@ -11,10 +11,14 @@ through. All of them would first surface on the instance, an hour into the month
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -38,6 +42,15 @@ BAKED = (
     "sql/xpressfeed_views/load_ff_factors.py",
     "sql/xpressfeed_views/capture_sec_ids.py",
 )
+
+
+@pytest.fixture(scope="module")
+def bash() -> str:
+    git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    executable = str(git_bash) if git_bash.exists() else shutil.which("bash")
+    if not executable:
+        pytest.skip("Bash is required")
+    return executable
 
 
 class TestCredentialLoading:
@@ -246,18 +259,125 @@ class TestHostRetirement:
         failure_branch = user_data[user_data.index("else", success) :]
         assert "retire_later" in failure_branch and "shutdown -h now" not in failure_branch
 
-    def test_retire_later_schedules_the_delay_in_minutes(self, user_data, tmp_path):
+    def test_retire_later_schedules_the_delay_in_minutes(self, user_data, tmp_path, bash):
         """Runs the real function with `shutdown` stubbed: +300 minutes, cancellable."""
-        bash = Path("C:/Program Files/Git/bin/bash.exe")
-        executable = str(bash) if bash.exists() else shutil.which("bash")
-        if not executable:
-            pytest.skip("Bash is required")
         func = user_data[user_data.index("DIAGNOSIS_HOURS=") :]
         func = func[: func.index("\n}\n") + 3]
         record = tmp_path / "shutdown_args"
         script = (
             f'shutdown() {{ printf "%s\n" "$@" > "{record.as_posix()}"; }}\n{func}\nretire_later\n'
         )
-        out = subprocess.run([executable, "-c", script], capture_output=True, text=True, check=True)
+        out = subprocess.run([bash, "-c", script], capture_output=True, text=True, check=True)
         assert record.read_text().splitlines()[:2] == ["-h", "+300"]
         assert out.stdout.strip().endswith("UTC")
+
+
+FAKE_AWS = r"""#!/usr/bin/env bash
+# Stand-in for the aws CLI: records every call, answers what launch.sh reads,
+# keeps the launch template data it is handed, and refuses to start a host.
+printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
+case "$1 $2" in
+  "ssm get-parameter")
+    case "$*" in *--with-decryption*)
+      echo 'RESEARCH_UPDATE=mssql+pyodbc://u:p@h/research?driver=ODBC+Driver+18+for+SQL+Server' ;;
+    esac ;;
+  "ec2 describe-security-groups") echo sg-0fake ;;
+  "ec2 describe-launch-templates") exit 254 ;;
+  "ec2 create-launch-template")
+    for a in "$@"; do case "$a" in file://*) cp "${a#file://}" "$FAKE_LT_DATA" ;; esac; done
+    echo 1 ;;
+  "ec2 run-instances") echo "run-instances must not be called" >&2; exit 1 ;;
+esac
+exit 0
+"""
+
+
+class TestLaunchTemplate:
+    """``launch.sh --template`` writes the scheduled run; the host resolves the month."""
+
+    def test_host_resolves_auto_run_tag_and_month_end(self, bash):
+        text = USER_DATA.read_text(encoding="utf-8")
+        block = text[text.index('RUN_TAG="@@RUN_TAG@@"') : text.index("COUNTRIES=")]
+        block = block.replace("@@RUN_TAG@@", "auto").replace("@@END_DATE@@", "auto")
+        script = "BUCKET=b\n" + block + 'printf "%s %s %s\n" "$RUN_TAG" "$END_DATE" "$RUN_PREFIX"\n'
+        out = subprocess.run([bash, "-c", script], capture_output=True, text=True, check=True)
+        today = datetime.now(UTC).date()
+        month_end = today.replace(day=1) - timedelta(days=1)
+        tag = f"prod-{today:%Y%m%d}"
+        assert out.stdout.split() == [tag, f"{month_end:%Y-%m-%d}", f"s3://b/{tag}"]
+
+    def test_explicit_run_tag_and_month_end_are_kept(self, bash):
+        text = USER_DATA.read_text(encoding="utf-8")
+        block = text[text.index('RUN_TAG="@@RUN_TAG@@"') : text.index("COUNTRIES=")]
+        block = block.replace("@@RUN_TAG@@", "full-x").replace("@@END_DATE@@", "2026-09-30")
+        script = "BUCKET=b\n" + block + 'printf "%s %s\n" "$RUN_TAG" "$END_DATE"\n'
+        out = subprocess.run([bash, "-c", script], capture_output=True, text=True, check=True)
+        assert out.stdout.split() == ["full-x", "2026-09-30"]
+
+    @pytest.fixture(scope="class")
+    def template(self, bash, tmp_path_factory):
+        """Runs the real launcher in --template mode against the fake aws CLI."""
+        work = tmp_path_factory.mktemp("lt")
+        (work / "aws").write_text(FAKE_AWS, encoding="utf-8", newline="\n")
+        (work / "aws").chmod(0o755)
+        env = dict(os.environ)
+        env.update(
+            PATH=str(work) + os.pathsep + env["PATH"],
+            FAKE_AWS_LOG=str(work / "calls.log"),
+            FAKE_LT_DATA=str(work / "lt.json"),
+            MSYS_NO_PATHCONV="1",
+            # A template must ignore all of these.
+            MARKET="spot",
+            FULL_HISTORY="1",
+            PRODUCTION_YEARS="0",
+            DB_REPLACE="1",
+            COUNTRIES="usa",
+            UNATTENDED="0",
+        )
+        result = subprocess.run(
+            [bash, LAUNCH.as_posix(), "--template"], env=env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        data = json.loads((work / "lt.json").read_text(encoding="utf-8"))
+        user_data = base64.b64decode(data["UserData"]).decode("utf-8")
+        calls = (work / "calls.log").read_text(encoding="utf-8")
+        return data, user_data, calls, result.stdout
+
+    def test_template_matches_a_manual_launch(self, template):
+        data, _, _, _ = template
+        assert data["InstanceType"] == "r7i.16xlarge"
+        assert data["ImageId"].startswith("resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023")
+        assert data["IamInstanceProfile"] == {"Name": "jkp-data-run-profile"}
+        assert data["NetworkInterfaces"][0]["SubnetId"] == "subnet-0a74f7b1e230a2f12"
+        assert data["NetworkInterfaces"][0]["Groups"] == ["sg-0fake"]
+        ebs = data["BlockDeviceMappings"][0]["Ebs"]
+        assert (ebs["VolumeSize"], ebs["Iops"], ebs["Throughput"]) == (750, 8000, 1000)
+        assert ebs["DeleteOnTermination"] is True and ebs["Encrypted"] is True
+        assert data["InstanceInitiatedShutdownBehavior"] == "terminate"
+        assert data["MetadataOptions"]["HttpTokens"] == "required"
+        tags = {t["Key"]: t["Value"] for t in data["TagSpecifications"][0]["Tags"]}
+        assert tags["Purpose"] == "jkp-data-production"
+
+    def test_template_is_always_the_monthly_delivery(self, template):
+        _, user_data, _, _ = template
+        assert "@@" not in user_data
+        for line in (
+            'RUN_TAG="auto"',
+            'END_DATE="auto"',
+            'UNATTENDED="1"',
+            'MARKET="ondemand"',
+            'DB_UPDATE="1"',
+            'DB_REPLACE="0"',
+            'FULL_HISTORY="0"',
+            'PRODUCTION_YEARS=""',
+            'COUNTRIES=""',
+            'PARAM="/jkp-data/production/env"',
+            'PARAM_EPHEMERAL="0"',
+        ):
+            assert line in user_data, line
+
+    def test_template_starts_no_host_and_stages_no_secret(self, template):
+        _, _, calls, _ = template
+        assert "ec2 create-launch-template" in calls
+        assert "run-instances" not in calls
+        assert "ssm put-parameter" not in calls and "ssm delete-parameter" not in calls

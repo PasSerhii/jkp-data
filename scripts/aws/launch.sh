@@ -2,6 +2,7 @@
 # Launch a full jkp-data run on EC2.
 #
 #   scripts/aws/launch.sh [RUN_TAG]
+#   scripts/aws/launch.sh --template      # write the scheduled monthly run's launch template
 #
 # This is the launcher, not the entry point. A monthly production build starts
 # at scripts/production-run.sh, which runs every gate, refreshes Fama-French and
@@ -20,6 +21,17 @@ set -euo pipefail
 # Git Bash rewrites bare /dev/... and /app/... arguments into Windows paths.
 export MSYS_NO_PATHCONV=1
 
+# --template writes the monthly production run into the EC2 launch template
+# that EventBridge Scheduler starts at 09:00 Israel time on the 1st (alpha_infra:
+# modules/jkp-monthly-run) instead of launching a host. Same setup and same
+# user-data as a manual launch, so the two cannot drift. Rerun it after any
+# change to this script or user-data.sh; the schedule uses the default version.
+TEMPLATE_MODE=0
+if [ "${1:-}" = "--template" ]; then
+  TEMPLATE_MODE=1
+  shift
+fi
+TEMPLATE_NAME="${TEMPLATE_NAME:-jkp-data-monthly}"
 RUN_TAG="${1:-prod-$(date -u +%Y%m%d)}"
 REGION=eu-central-1
 ACCOUNT=485357734136
@@ -88,7 +100,7 @@ MARKET="${MARKET:-ondemand}"
 KEEP_INTERIM="${KEEP_INTERIM:-1}"
 # 1 passes --db-update: after the outputs are written, the production CSVs are
 # uploaded incrementally to the research MSSQL database named by the
-# RESEARCH_UPDATE URL in the credential parameter (currently research_test).
+# RESEARCH_UPDATE URL in the credential parameter (currently research).
 # The URL must name "ODBC Driver 18 for SQL Server" -- that is the driver baked
 # into the image. Ignored by images that predate --db-update; the host probes
 # for it before starting. 0 skips the upload. A full-history build defaults to
@@ -114,6 +126,17 @@ CREDENTIAL_PARAM="${CREDENTIAL_PARAM:-}"
 # the readiness poll, the FF refresh and the identifier capture. 0 assumes a human
 # already did those on their own machine, which is what production-run.sh does.
 UNATTENDED="${UNATTENDED:-0}"
+
+# A template is always the monthly delivery, whatever the environment says:
+# unattended, on demand, the rolling window, every country, the incremental
+# upload, the persistent credential. RUN_TAG and END_DATE stay "auto" and the
+# host resolves them at boot, so the template never goes stale.
+if [ "$TEMPLATE_MODE" = "1" ]; then
+  RUN_TAG=auto END_DATE=auto UNATTENDED=1 MARKET=ondemand KEEP_INTERIM=1
+  FULL_HISTORY=0 START_DATE="" PRODUCTION_YEARS="" COUNTRIES="" WORKERS=""
+  DB_UPDATE=1 DB_REPLACE=0 DB_UPLOAD=1
+  CREDENTIAL_PARAM="${CREDENTIAL_PARAM:-/jkp-data/production/env}"
+fi
 
 # Validate before any AWS call, so an invalid history request cannot launch a
 # paid host. Leave an unspecified CSV window to the image's configured default.
@@ -184,8 +207,9 @@ aws s3api put-bucket-encryption --bucket "$BUCKET" --server-side-encryption-conf
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
 
 # RUN_TAG defaults to the UTC date, so a second launch on the same day would
-# overwrite the first run's artifacts without warning.
-if aws s3 ls "s3://$BUCKET/$RUN_TAG/" 2>/dev/null | grep -q .; then
+# overwrite the first run's artifacts without warning. A template's tag is only
+# known on the day; the host's preflight checks it then.
+if [ "$TEMPLATE_MODE" = "0" ] && aws s3 ls "s3://$BUCKET/$RUN_TAG/" 2>/dev/null | grep -q .; then
   echo "s3://$BUCKET/$RUN_TAG/ already contains objects." >&2
   echo "Pass a distinct run tag: launch.sh ${RUN_TAG}b" >&2
   exit 1
@@ -261,9 +285,15 @@ if [ "$PARAM_EPHEMERAL" = "1" ]; then
   rm -f "$TMP"
 fi
 
-AMI=$(aws ec2 describe-images --region "$REGION" --owners amazon \
-  --filters "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" "Name=state,Values=available" \
-  --query "sort_by(Images,&CreationDate)[-1].ImageId" --output text)
+if [ "$TEMPLATE_MODE" = "1" ]; then
+  # Resolved by EC2 at each launch, so a template written once still boots the
+  # current AL2023 image months later. Same family as the lookup below.
+  AMI="resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+else
+  AMI=$(aws ec2 describe-images --region "$REGION" --owners amazon \
+    --filters "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" "Name=state,Values=available" \
+    --query "sort_by(Images,&CreationDate)[-1].ImageId" --output text)
+fi
 
 USER_DATA="$(mktemp)"
 sed -e "s|@@REGION@@|$REGION|g" -e "s|@@BUCKET@@|$BUCKET|g" -e "s|@@TOPIC@@|$TOPIC|g" \
@@ -275,6 +305,51 @@ sed -e "s|@@REGION@@|$REGION|g" -e "s|@@BUCKET@@|$BUCKET|g" -e "s|@@TOPIC@@|$TOP
     -e "s|@@MARKET@@|$MARKET|g" -e "s|@@PARAM_EPHEMERAL@@|$PARAM_EPHEMERAL|g" \
     -e "s|@@UNATTENDED@@|$UNATTENDED|g" \
     "$HERE/user-data.sh" | tr -d '\r' > "$USER_DATA"
+
+if [ "$TEMPLATE_MODE" = "1" ]; then
+  # Everything run-instances below passes, as launch template data. The user-data
+  # holds no secret: the host reads its credential from SSM itself.
+  LT_DATA="$(mktemp)"
+  cat > "$LT_DATA" <<EOF
+{
+  "ImageId": "$AMI",
+  "InstanceType": "$INSTANCE_TYPE",
+  "IamInstanceProfile": {"Name": "$PROFILE"},
+  "NetworkInterfaces": [{"DeviceIndex": 0, "SubnetId": "$SUBNET", "Groups": ["$SG"]}],
+  "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": $VOLUME_GB, "VolumeType": "gp3", "Iops": $VOLUME_IOPS, "Throughput": $VOLUME_MBPS, "DeleteOnTermination": true, "Encrypted": true}}],
+  "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
+  "InstanceInitiatedShutdownBehavior": "terminate",
+  "UserData": "$(base64 -w0 < "$USER_DATA")",
+  "TagSpecifications": [{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "$TEMPLATE_NAME"}, {"Key": "Purpose", "Value": "jkp-data-production"}]}]
+}
+EOF
+  DESC="jkp-data $(cd "$REPO" && git describe --always --dirty 2>/dev/null || echo unknown), written $(date -u +%Y-%m-%dT%H:%MZ)"
+  if aws ec2 describe-launch-templates --region "$REGION" --launch-template-names "$TEMPLATE_NAME" >/dev/null 2>&1; then
+    VERSION=$(aws ec2 create-launch-template-version --region "$REGION" \
+      --launch-template-name "$TEMPLATE_NAME" --version-description "$DESC" \
+      --launch-template-data "$(aws_file_uri "$LT_DATA")" \
+      --query LaunchTemplateVersion.VersionNumber --output text)
+    aws ec2 modify-launch-template --region "$REGION" --launch-template-name "$TEMPLATE_NAME" \
+      --default-version "$VERSION" >/dev/null
+  else
+    VERSION=$(aws ec2 create-launch-template --region "$REGION" \
+      --launch-template-name "$TEMPLATE_NAME" --version-description "$DESC" \
+      --launch-template-data "$(aws_file_uri "$LT_DATA")" \
+      --query LaunchTemplate.LatestVersionNumber --output text)
+  fi
+  rm -f "$LT_DATA" "$USER_DATA"
+  cat <<EOF
+
+Launch template $TEMPLATE_NAME: version $VERSION is now the default ($DESC).
+Every launch from it is the monthly delivery: $INSTANCE_TYPE on demand, unattended
+preflight, rolling window, all countries, upload to the database in $PARAM.
+The host names the run prod-YYYYMMDD after its UTC date and builds the last month end.
+EventBridge Scheduler starts it at 09:00 Israel time on the 1st (alpha_infra:
+modules/jkp-monthly-run). To start it by hand instead:
+  aws ec2 run-instances --region $REGION --launch-template LaunchTemplateName=$TEMPLATE_NAME,Version='\$Default'
+EOF
+  exit 0
+fi
 
 MARKET_OPT=(); [ "$MARKET" = "spot" ] && MARKET_OPT=(--instance-market-options 'MarketType=spot')
 
