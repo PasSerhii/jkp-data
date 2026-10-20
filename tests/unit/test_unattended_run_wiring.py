@@ -170,6 +170,12 @@ class TestImageContents:
     def test_revision_label_is_stamped(self):
         assert "org.opencontainers.image.revision" in WORKFLOW.read_text(encoding="utf-8")
 
+    def test_only_one_branch_publishes(self):
+        """:production is what the scheduled run pulls; a second branch would overwrite it."""
+        text = WORKFLOW.read_text(encoding="utf-8")
+        assert re.findall(r"branches: \[([^\]]*)\]", text) == ["compustat_migration"]
+        assert "if: github.ref == 'refs/heads/compustat_migration'" in text
+
 
 class TestFreshnessGateMatchesBuildTrigger:
     """The gate compares the image against the paths that rebuild the image.

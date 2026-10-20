@@ -9,7 +9,9 @@ name: Publish Docker image
 # or the gate will fail a run for a change that never triggers a build.
 on:
   push:
-    branches: [compustat_migration, main]
+    # One publishing branch only: :production is what the scheduled monthly run
+    # pulls, and two branches would overwrite each other's image.
+    branches: [compustat_migration]
     paths:
       - "src/**"
       - "sql/**"
@@ -40,6 +42,9 @@ env:
 jobs:
   publish:
     name: Build and push to ECR
+    # workflow_dispatch can start from any branch; only this one may publish.
+    # The jkp-data-ecr-publish role's trust policy admits no other ref either.
+    if: github.ref == 'refs/heads/compustat_migration'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
