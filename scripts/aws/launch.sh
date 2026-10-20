@@ -283,6 +283,7 @@ INSTANCE=$(aws ec2 run-instances --region "$REGION" \
   --image-id "$AMI" --instance-type "$INSTANCE_TYPE" \
   --subnet-id "$SUBNET" --security-group-ids "$SG" \
   --iam-instance-profile "Name=$PROFILE" "${MARKET_OPT[@]}" \
+  --instance-initiated-shutdown-behavior terminate \
   --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=$VOLUME_GB,VolumeType=gp3,Iops=$VOLUME_IOPS,Throughput=$VOLUME_MBPS,DeleteOnTermination=true,Encrypted=true}" \
   --metadata-options 'HttpTokens=required,HttpEndpoint=enabled' \
   --user-data "$(aws_file_uri "$USER_DATA")" \
@@ -313,7 +314,10 @@ on its own. Expect "JKP RUN: started" in a few minutes, or
 Watch:
   scripts/aws/status.sh $INSTANCE
 
-When finished (email arrives with the elapsed time):
+The host terminates itself: right after the upload when the run succeeds, and
+5 hours after a failure (kept for diagnosis; \`sudo shutdown -c\` on it keeps it).
+To fetch the results (email arrives with the elapsed time):
   aws s3 sync s3://$BUCKET/$RUN_TAG/ "D:/jkp-full-run-${RUN_TAG#run-}/" --exclude "production/*"
+To stop it early:
   aws ec2 terminate-instances --region $REGION --instance-ids $INSTANCE
 EOF

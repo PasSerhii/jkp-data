@@ -12,6 +12,8 @@ through. All of them would first surface on the instance, an hour into the month
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -211,3 +213,51 @@ class TestProductionRunModes:
     def test_unattended_excludes_itself_from_the_in_flight_check(self, text):
         assert "meta-data/instance-id" in text
         assert 'grep -vx "$SELF"' in text
+
+
+class TestHostRetirement:
+    """An unattended run has nobody to terminate the host, so it must retire itself."""
+
+    @pytest.fixture(scope="class")
+    def user_data(self):
+        return USER_DATA.read_text(encoding="utf-8")
+
+    def test_shutdown_terminates_the_instance(self):
+        launch = LAUNCH.read_text(encoding="utf-8")
+        call = launch[launch.index("aws ec2 run-instances") :]
+        call = call[: call.index('--query "Instances[0].InstanceId"')]
+        assert "--instance-initiated-shutdown-behavior terminate" in call
+
+    def test_success_shuts_down_after_everything_is_in_s3(self, user_data):
+        upload = user_data.index('aws s3 sync "$CSV_DIR" "$RUN_PREFIX/production/"')
+        done = user_data.index("touch /mnt/jkp-data/DONE")
+        success = user_data.index('if [ "$RC" -eq 0 ]; then')
+        failure = user_data.index("else", success)
+        shutdown = user_data.index("shutdown -h now")
+        assert upload < done < success < shutdown < failure
+        assert user_data.index("ship_setup_log", done) < shutdown
+
+    def test_failures_keep_the_host_for_five_hours(self, user_data):
+        assert "DIAGNOSIS_HOURS=5" in user_data
+        fail_body = user_data[user_data.index("fail() {") :]
+        fail_body = fail_body[: fail_body.index("\n}\n")]
+        assert "retire_later" in fail_body and "ship_setup_log" in fail_body
+        success = user_data.index('if [ "$RC" -eq 0 ]; then')
+        failure_branch = user_data[user_data.index("else", success) :]
+        assert "retire_later" in failure_branch and "shutdown -h now" not in failure_branch
+
+    def test_retire_later_schedules_the_delay_in_minutes(self, user_data, tmp_path):
+        """Runs the real function with `shutdown` stubbed: +300 minutes, cancellable."""
+        bash = Path("C:/Program Files/Git/bin/bash.exe")
+        executable = str(bash) if bash.exists() else shutil.which("bash")
+        if not executable:
+            pytest.skip("Bash is required")
+        func = user_data[user_data.index("DIAGNOSIS_HOURS=") :]
+        func = func[: func.index("\n}\n") + 3]
+        record = tmp_path / "shutdown_args"
+        script = (
+            f'shutdown() {{ printf "%s\n" "$@" > "{record.as_posix()}"; }}\n{func}\nretire_later\n'
+        )
+        out = subprocess.run([executable, "-c", script], capture_output=True, text=True, check=True)
+        assert record.read_text().splitlines()[:2] == ["-h", "+300"]
+        assert out.stdout.strip().endswith("UTC")

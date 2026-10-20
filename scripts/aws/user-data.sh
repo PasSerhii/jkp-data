@@ -28,11 +28,24 @@ MARKET="@@MARKET@@"
 UNATTENDED="@@UNATTENDED@@"
 
 # The interim files the accounting tests read. The whole tree is ~230 GiB, so
-# only these ship to S3; --keep-interim leaves the rest on the volume to inspect
-# before the instance is terminated.
+# only these ship to S3; the rest goes with the volume when the host terminates.
 INTERIM_KEEP="acc_std_ann.parquet acc_std_qtr.parquet achars_world.parquet qchars_world.parquet acc_chars_world.parquet"
 
 notify() { aws sns publish --region "$REGION" --topic-arn "$TOPIC" --subject "$1" --message "$2" >/dev/null 2>&1 || true; }
+
+# The host retires itself, so an unattended run cannot leave a paid instance
+# idling. launch.sh starts it with --instance-initiated-shutdown-behavior
+# terminate, so `shutdown` ends the instance and its volume. A successful run
+# shuts down once everything is in S3; a failed one stays up this long for
+# diagnosis first (`sudo shutdown -c` on the host keeps it).
+DIAGNOSIS_HOURS=5
+retire_later() {
+  shutdown -h "+$((DIAGNOSIS_HOURS * 60))" "jkp: terminating ${DIAGNOSIS_HOURS}h after a failed run" >/dev/null 2>&1 || true
+  date -u -d "+${DIAGNOSIS_HOURS} hours" +"%Y-%m-%d %H:%M UTC"
+}
+# The setup log (bootstrap trace, unattended preflight) lives on the host only,
+# so ship it before the host can go.
+ship_setup_log() { aws s3 cp /var/log/jkp-setup.log "$RUN_PREFIX/jkp-setup.log" --only-show-errors >/dev/null 2>&1 || true; }
 
 install -d -m 700 /secure
 install -d -o 10001 -g 10001 -m 700 /mnt/jkp-data
@@ -44,12 +57,15 @@ install -d -o 10001 -g 10001 -m 700 /mnt/jkp-data
 fail() {
   echo "BOOTSTRAP FAILED: $1"
   touch /mnt/jkp-data/BOOTSTRAP_FAILED 2>/dev/null
+  local term_at
+  term_at=$(retire_later)
+  ship_setup_log
   notify "JKP RUN: BOOTSTRAP FAILED" \
 "$1
 
 The pipeline never started, so no output was produced.
-Setup log: /var/log/jkp-setup.log
-Instance still RUNNING for diagnosis — terminate it when done."
+Setup log: $RUN_PREFIX/jkp-setup.log
+Instance kept for diagnosis; it terminates itself at $term_at. To keep it longer: sudo shutdown -c"
   exit 1
 }
 
@@ -288,6 +304,7 @@ aws s3 cp /mnt/jkp-data/UPLOADED "$RUN_PREFIX/UPLOADED" --only-show-errors
 df -h /mnt/jkp-data > /mnt/jkp-data/DISK_FINAL
 aws s3 cp /mnt/jkp-data/DISK_FINAL "$RUN_PREFIX/DISK_FINAL" --only-show-errors
 touch /mnt/jkp-data/DONE
+ship_setup_log
 
 if [ "$RC" -eq 0 ]; then
   notify "JKP RUN: FINISHED OK ($(cat /mnt/jkp-data/ELAPSED))" \
@@ -299,13 +316,14 @@ Countries uploaded: ${COUNTRIES:-all}
 $(tail -3 /mnt/jkp-data/UPLOADED)
 Full listing: $RUN_PREFIX/UPLOADED
 Disk: $(tail -1 /mnt/jkp-data/DISK_FINAL)
-Interim retained on the volume: ${KEEP_FLAG:-no}
 
-Instance still RUNNING for verification. Terminate when done."
+Everything is in $RUN_PREFIX/; the instance terminates itself now."
+  shutdown -h now
 else
+  UNTIL=$(retire_later)
   notify "JKP RUN: FAILED (exit $RC) after $(cat /mnt/jkp-data/ELAPSED)" \
-"Exit $RC. Logs: $RUN_PREFIX/run_logs/ and $RUN_PREFIX/container.log
+"Exit $RC. Logs: $RUN_PREFIX/run_logs/, $RUN_PREFIX/container.log and $RUN_PREFIX/jkp-setup.log
 $(tail -40 /mnt/jkp-data/container.log)
 
-Instance still RUNNING for diagnosis."
+Instance kept for diagnosis; it terminates itself at $UNTIL. To keep it longer: sudo shutdown -c"
 fi
