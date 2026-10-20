@@ -12,15 +12,21 @@ import polars as pl
 import pyodbc
 import pytest
 
+from jkp.data.aux_functions import _write_sas_csv
 from jkp.data.database_sources import get_research_update_connection_info
 from jkp.data.dataupdate import (
     CHARACTERISTICS_TABLE,
     DAILY_RETURNS_TABLE,
+    FF_FACTORS_CSV,
+    FF_FACTORS_TABLE,
     INSERT_CHUNK_ROWS,
     RETURN_CUTOFFS_DAILY_TABLE,
     STANDALONE_TABLE_SPECS,
+    USA_DAILY_HISTORY_TABLE,
     DataUpdateError,
     _insert_rows,
+    _rebuild_usa_daily_history,
+    _replace_ff_factors_monthly,
     _replace_table,
     _update_characteristics_production,
     _update_daily_returns_production,
@@ -115,6 +121,11 @@ class FakeConnection:
         if sql.startswith("TRUNCATE"):
             self.engine.truncates.append(table)
             return _FakeResult()
+        if sql.startswith("INSERT INTO"):
+            if table in self.engine.fail_insert_tables:
+                raise RuntimeError(f"simulated insert failure on {table}")
+            self.engine.insert_selects.append((sql, parameters))
+            return _FakeResult(rowcount=1)
         raise AssertionError(f"unexpected SQL in test: {sql}")
 
 
@@ -163,6 +174,8 @@ class FakeEngine:
         self.deletes: list[tuple[str, object]] = []
         self.truncates: list[str] = []
         self.inserts: list[tuple[str, list[dict]]] = []
+        # INSERT ... SELECT statements, which run server-side through execute().
+        self.insert_selects: list[tuple[str, object]] = []
         self.input_sizes: list[list] = []
         self.transactions: list[str] = []
         self.disposed = False
@@ -448,6 +461,138 @@ def test_daily_returns_skips_delete_when_no_tail(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# fama_french_factors_monthly (replaced in full; dates stored as ISO strings)
+# ---------------------------------------------------------------------------
+
+
+_FF_COLUMNS = {
+    FF_FACTORS_TABLE: {
+        "date": "varchar",
+        "mktrf": "float",
+        "smb": "float",
+        "hml": "float",
+        "rf": "float",
+        "year": "float",
+        "month": "float",
+        "umd": "float",
+        "dateff": "varchar",
+    }
+}
+
+
+def _write_ff_csv(path: Path) -> None:
+    # Written by the pipeline's own CSV writer, so the upload is tested on the
+    # exact format save_output_files produces (quoted ISO dates, blank nulls).
+    _write_sas_csv(
+        pl.DataFrame(
+            {
+                "date": [date(1926, 7, 1), date(2026, 8, 1)],
+                "mktrf": [0.0296, 0.0256],
+                "smb": [-0.0256, 0.0034],
+                "hml": [-0.0243, -0.0354],
+                "rf": [0.0022, 0.0029],
+                "year": [1926.0, 2026.0],
+                "month": [7.0, 8.0],
+                "umd": [None, -0.057],
+                "dateff": [date(1926, 7, 31), date(2026, 8, 31)],
+            }
+        ),
+        path,
+    )
+
+
+@pytest.mark.unit
+def test_ff_factors_are_truncated_and_reloaded_in_one_transaction(tmp_path):
+    csv_path = tmp_path / FF_FACTORS_CSV
+    _write_ff_csv(csv_path)
+    engine = FakeEngine(_FF_COLUMNS)
+
+    _replace_ff_factors_monthly(engine, csv_path)
+
+    assert engine.truncates == [FF_FACTORS_TABLE]
+    rows = _inserted_rows(engine)
+    # Every month, dates as the table's ISO strings, a missing factor as NULL.
+    assert [(row["date"], row["dateff"], row["umd"]) for row in rows] == [
+        ("1926-07-01", "1926-07-31", None),
+        ("2026-08-01", "2026-08-31", -0.057),
+    ]
+    assert (rows[1]["rf"], rows[1]["year"], rows[1]["month"]) == (0.0029, 2026.0, 8.0)
+    assert engine.transactions == ["commit"]
+
+
+@pytest.mark.unit
+def test_ff_factors_failed_insert_rolls_back_the_truncate(tmp_path):
+    csv_path = tmp_path / FF_FACTORS_CSV
+    _write_ff_csv(csv_path)
+    engine = FakeEngine(_FF_COLUMNS, fail_insert_tables=frozenset({FF_FACTORS_TABLE}))
+
+    with pytest.raises(RuntimeError, match="simulated insert failure"):
+        _replace_ff_factors_monthly(engine, csv_path)
+
+    assert engine.truncates == [FF_FACTORS_TABLE]
+    assert engine.transactions == ["rollback"]
+
+
+@pytest.mark.unit
+def test_ff_factors_column_drift_refused_before_truncating(tmp_path):
+    csv_path = tmp_path / FF_FACTORS_CSV
+    _write_ff_csv(csv_path)
+    engine = FakeEngine({FF_FACTORS_TABLE: {"date": "varchar", "rf": "float"}})
+
+    with pytest.raises(RuntimeError, match=r"not present in dbo\.fama_french_factors_monthly"):
+        _replace_ff_factors_monthly(engine, csv_path)
+
+    assert engine.truncates == []
+    assert engine.inserts == []
+
+
+@pytest.mark.unit
+def test_ff_factors_empty_csv_refused_before_connecting(tmp_path):
+    csv_path = tmp_path / FF_FACTORS_CSV
+    pl.DataFrame(schema=dict.fromkeys(_FF_COLUMNS[FF_FACTORS_TABLE], pl.String)).write_csv(csv_path)
+    engine = FakeEngine(_FF_COLUMNS)
+
+    with pytest.raises(RuntimeError, match="is empty"):
+        _replace_ff_factors_monthly(engine, csv_path)
+
+    assert engine.executed == []
+
+
+# ---------------------------------------------------------------------------
+# dailyreturnsproduction_full_history (rebuilt from dailyreturnsproduction)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_usa_daily_history_is_truncated_and_refilled_in_one_transaction():
+    engine = FakeEngine({})
+
+    _rebuild_usa_daily_history(engine)
+
+    statements = [sql for sql, _params in engine.executed]
+    assert statements == [
+        f"TRUNCATE TABLE dbo.{USA_DAILY_HISTORY_TABLE}",
+        f"INSERT INTO dbo.{USA_DAILY_HISTORY_TABLE} WITH (TABLOCK) "
+        "([excntry], [id], [date], [ret_exc]) "
+        "SELECT [excntry], [id], [date], [ret_exc_dollar] "
+        f"FROM dbo.{DAILY_RETURNS_TABLE} WHERE [excntry] = :excntry",
+    ]
+    assert engine.insert_selects[0][1] == {"excntry": "USA"}
+    assert engine.transactions == ["commit"]
+
+
+@pytest.mark.unit
+def test_usa_daily_history_failed_insert_rolls_back_the_truncate():
+    engine = FakeEngine({}, fail_insert_tables=frozenset({USA_DAILY_HISTORY_TABLE}))
+
+    with pytest.raises(RuntimeError, match="simulated insert failure"):
+        _rebuild_usa_daily_history(engine)
+
+    assert engine.truncates == [USA_DAILY_HISTORY_TABLE]
+    assert engine.transactions == ["rollback"]
+
+
+# ---------------------------------------------------------------------------
 # return_cutoffs_daily (period-keyed, extra eom column dropped)
 # ---------------------------------------------------------------------------
 
@@ -585,6 +730,7 @@ def _write_all_production_fixtures(production_dir: Path) -> None:
         production_dir / "market_returns_daily.csv"
     )
     _write_cutoffs_daily_csv(production_dir / "return_cutoffs_daily.csv", [(2026, 8), (2026, 9)])
+    _write_ff_csv(production_dir / FF_FACTORS_CSV)
     _write_monthly_csv(production_dir / "monthly" / "usa.csv", [20260531, 20260630])
     _write_daily_csv(production_dir / "daily" / "usa.csv", [20260820, 20260828])
 
@@ -598,6 +744,7 @@ def _full_fake_engine(**kwargs) -> FakeEngine:
         "return_cutoffs": eom_keyed,
         "world_ret_monthly": eom_keyed,
         **_CUTOFFS_DAILY_COLUMNS,
+        **_FF_COLUMNS,
         **_CHARACTERISTICS_COLUMNS,
         **_DAILY_COLUMNS,
     }
@@ -628,7 +775,16 @@ def test_update_research_db_uploads_every_element_and_disposes_engine(test_paths
     assert create_engine.call_args.args == (FAKE_URL,)
     # 5 standalone + return_cutoffs_daily + 1 monthly country + 1 daily country
     assert len(engine.deletes) == 8
-    assert engine.transactions == ["commit"] * 8
+    # ... plus the Fama-French replace (a TRUNCATE, no DELETE), then the USA
+    # history rebuild once dailyreturnsproduction is updated.
+    assert engine.truncates == [FF_FACTORS_TABLE, USA_DAILY_HISTORY_TABLE]
+    assert engine.transactions == ["commit"] * 10
+    statements = [sql for sql, _params in engine.executed]
+    assert statements[-2:] == [
+        f"TRUNCATE TABLE dbo.{USA_DAILY_HISTORY_TABLE}",
+        engine.insert_selects[0][0],
+    ]
+    assert statements[-3].startswith(f"DELETE FROM dbo.{DAILY_RETURNS_TABLE} WHERE")
     assert engine.disposed
 
 
@@ -646,7 +802,23 @@ def test_failure_rolls_back_and_isolation_continues_to_next_element(test_paths):
     assert "simulated insert failure" in str(error.value)
     assert engine.transactions[0] == "rollback"
     # Every other element still committed after the first one failed.
-    assert engine.transactions[1:] == ["commit"] * 7
+    assert engine.transactions[1:] == ["commit"] * 9
+    assert engine.disposed
+
+
+@pytest.mark.unit
+def test_usa_history_failure_is_reported_after_every_upload_committed(test_paths):
+    _write_all_production_fixtures(test_paths.production_dir)
+    engine = _full_fake_engine(fail_insert_tables=frozenset({USA_DAILY_HISTORY_TABLE}))
+
+    with (
+        patch("jkp.data.dataupdate.sa.create_engine", return_value=engine),
+        pytest.raises(DataUpdateError, match="1 failed element") as error,
+    ):
+        update_research_db(test_paths, connection_url=FAKE_URL)
+
+    assert f"{USA_DAILY_HISTORY_TABLE}: RuntimeError" in str(error.value)
+    assert engine.transactions == ["commit"] * 9 + ["rollback"]
     assert engine.disposed
 
 
@@ -697,11 +869,14 @@ def test_replace_truncates_every_table_once_and_loads_every_row(test_paths):
         replace_research_db(test_paths, connection_url=FAKE_URL)
 
     tables = [spec.table for spec in STANDALONE_TABLE_SPECS] + [
+        FF_FACTORS_TABLE,
         RETURN_CUTOFFS_DAILY_TABLE,
         CHARACTERISTICS_TABLE,
         DAILY_RETURNS_TABLE,
     ]
-    assert engine.truncates == tables
+    # The USA history last, rebuilt from the reloaded dailyreturnsproduction.
+    assert engine.truncates == [*tables, USA_DAILY_HISTORY_TABLE]
+    assert len(engine.insert_selects) == 1
     assert engine.deletes == []
     # Every CSV row, including those an incremental update would leave alone.
     assert _row_counts(engine) == dict.fromkeys(tables, 2)

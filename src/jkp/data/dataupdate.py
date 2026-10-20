@@ -4,9 +4,12 @@ Replaces the legacy sasWrds uploader (AlphaJobs/sasWrds) for the Python
 pipeline, keeping its business semantics: for each table, the rows at or after
 the table's current maximum date are deleted and re-inserted from the CSVs
 inside one transaction per element, so the last stored period absorbs upstream
-revisions and later periods are appended. An empty target table is an error for
+revisions and later periods are appended; fama_french_factors_monthly, which
+mirrors WRDS, is reloaded in full. An empty target table is an error for
 this incremental update, not a bootstrap. ``replace_research_db`` is the full
 reload instead: it empties every table and loads it from a full-history build.
+Both then rebuild dailyreturnsproduction_full_history, the USA rows of
+dailyreturnsproduction, from that table.
 
 The target database is chosen solely by the connection URL (resolved from the
 ``RESEARCH_UPDATE`` environment variable by ``database_sources``).
@@ -46,6 +49,12 @@ DAILY_OVERLAP_DAYS = 14
 CHARACTERISTICS_TABLE = "characteristicsproduction"
 DAILY_RETURNS_TABLE = "dailyreturnsproduction"
 RETURN_CUTOFFS_DAILY_TABLE = "return_cutoffs_daily"
+# The USA rows of dailyreturnsproduction, with the dollar excess return as
+# ret_exc. Not loaded from a CSV: rebuilt from dailyreturnsproduction.
+USA_DAILY_HISTORY_TABLE = "dailyreturnsproduction_full_history"
+# The Fama-French monthly factors (WRDS ff.factors_monthly) the run used.
+FF_FACTORS_TABLE = "fama_french_factors_monthly"
+FF_FACTORS_CSV = f"{FF_FACTORS_TABLE}.csv"
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CHARACTER_DB_TYPES = frozenset({"char", "nchar", "varchar", "nvarchar"})
@@ -450,6 +459,62 @@ def _update_daily_returns_production(engine: sa.Engine, csv_path: Path, skipped:
     )
 
 
+def _replace_ff_factors_monthly(engine: sa.Engine, csv_path: Path) -> None:
+    """Replace fama_french_factors_monthly with the run's Fama-French factors.
+
+    Description:
+        Every month is reloaded, not a trailing window, as the WRDS loader this
+        replaces did (ff_monthly.py), so revisions to older months come along.
+        The CSV is read and its columns checked before the table is touched;
+        the TRUNCATE and the insert share one transaction, so readers wait for
+        the commit and a failure leaves the previous contents. Dates land as
+        ISO strings, the table's character format.
+    Steps:
+        1) Read the CSV (refused if empty) and check its columns against the table.
+        2) TRUNCATE the table and insert every row, in one transaction.
+    Output:
+        The table holds exactly the CSV's rows; the count is logged.
+    """
+    df = _read_production_csv(csv_path, iso_date_columns=("date", "dateff"))
+    with engine.connect() as conn:
+        db_columns = _table_columns(conn, FF_FACTORS_TABLE)
+    _check_columns(FF_FACTORS_TABLE, df.columns, db_columns)
+    with engine.begin() as conn:
+        conn.execute(sa.text(f"TRUNCATE TABLE {_qualified(FF_FACTORS_TABLE)}"))
+        inserted = _insert_rows(conn, FF_FACTORS_TABLE, df, db_columns)
+    _log(f"{SCHEMA}.{FF_FACTORS_TABLE}: replaced, {inserted} row(s)")
+
+
+def _rebuild_usa_daily_history(engine: sa.Engine) -> None:
+    """Refill dailyreturnsproduction_full_history from dailyreturnsproduction.
+
+    Description:
+        Empty the table and copy every USA row of dailyreturnsproduction into it,
+        ``ret_exc_dollar`` as ``ret_exc``, in one transaction. It then matches
+        dailyreturnsproduction exactly, including the days the 14-day rewind
+        revised; readers wait for the commit instead of seeing it empty, and a
+        failure rolls back to the previous contents. TABLOCK lets SQL Server log
+        the insert into the heap minimally outside FULL recovery.
+    Steps:
+        1) TRUNCATE the table.
+        2) INSERT ... SELECT the USA rows of dailyreturnsproduction.
+    Output:
+        The table rebuilt; its new row count is logged.
+    """
+    with engine.begin() as conn:
+        conn.execute(sa.text(f"TRUNCATE TABLE {_qualified(USA_DAILY_HISTORY_TABLE)}"))
+        inserted = conn.execute(
+            sa.text(
+                f"INSERT INTO {_qualified(USA_DAILY_HISTORY_TABLE)} WITH (TABLOCK) "
+                "([excntry], [id], [date], [ret_exc]) "
+                "SELECT [excntry], [id], [date], [ret_exc_dollar] "
+                f"FROM {_qualified(DAILY_RETURNS_TABLE)} WHERE [excntry] = :excntry"
+            ),
+            {"excntry": "USA"},
+        ).rowcount
+    _log(f"{SCHEMA}.{USA_DAILY_HISTORY_TABLE}: rebuilt, {inserted} row(s)")
+
+
 def _update_return_cutoffs_daily(engine: sa.Engine, csv_path: Path) -> None:
     """Reload the table's latest year/month period and append the newer ones.
 
@@ -507,6 +572,8 @@ def _preflight_production_files(paths: DataPaths) -> tuple[list[Path], list[Path
     ]
     if not (production_dir / "return_cutoffs_daily.csv").is_file():
         errors.append(f"return_cutoffs_daily.csv: missing from {production_dir}")
+    if not (production_dir / FF_FACTORS_CSV).is_file():
+        errors.append(f"{FF_FACTORS_CSV}: missing from {production_dir}")
     monthly = sorted((production_dir / "monthly").glob("*.csv"))
     daily = sorted((production_dir / "daily").glob("*.csv"))
     if not monthly:
@@ -527,7 +594,10 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
            (characteristicsproduction) and each daily country CSV
            (dailyreturnsproduction): delete the trailing window and re-insert
            it from the CSV in one transaction. One element's failure is
-           recorded and the loop continues.
+           recorded and the loop continues. fama_french_factors_monthly is
+           replaced in full instead (_replace_ff_factors_monthly).
+        3) Rebuild dailyreturnsproduction_full_history from the updated
+           dailyreturnsproduction (_rebuild_usa_daily_history).
     Output:
         Rows appended/replaced in the database named by ``connection_url``.
         Raises DataUpdateError listing every failed element, if any.
@@ -552,6 +622,9 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
             csv_path = paths.production_dir / spec.csv_name
             if csv_path.is_file():
                 run_element(spec.table, _update_standalone_table, engine, spec, csv_path)
+        ff_csv = paths.production_dir / FF_FACTORS_CSV
+        if ff_csv.is_file():
+            run_element(FF_FACTORS_TABLE, _replace_ff_factors_monthly, engine, ff_csv)
         cutoffs_daily_csv = paths.production_dir / "return_cutoffs_daily.csv"
         if cutoffs_daily_csv.is_file():
             run_element(
@@ -573,6 +646,7 @@ def update_research_db(paths: DataPaths, *, connection_url: str) -> None:
                 csv_path,
                 skipped,
             )
+        run_element(USA_DAILY_HISTORY_TABLE, _rebuild_usa_daily_history, engine)
     finally:
         engine.dispose()
 
@@ -657,12 +731,16 @@ def replace_research_db(paths: DataPaths, *, connection_url: str) -> None:
     Steps:
         1) Before anything is changed, require every production file and a
            recovery model other than FULL.
-        2) Replace the cross-country tables, return_cutoffs_daily, then
-           characteristicsproduction (all countries at once, in key order) and
-           dailyreturnsproduction (country by country, each in key order).
+        2) Replace the cross-country tables, fama_french_factors_monthly,
+           return_cutoffs_daily, then characteristicsproduction (all countries
+           at once, in key order) and dailyreturnsproduction (country by
+           country, each in key order).
+        3) Rebuild dailyreturnsproduction_full_history from the reloaded
+           dailyreturnsproduction (_rebuild_usa_daily_history).
     Output:
-        The eight tables in the database named by ``connection_url`` hold
-        exactly the rows of the CSVs.
+        The nine tables in the database named by ``connection_url`` hold
+        exactly the rows of the CSVs, and dailyreturnsproduction_full_history
+        the USA rows of dailyreturnsproduction.
     """
     url = sa.engine.make_url(connection_url)
     _log(f"Database replace target: host={url.host} database={url.database}")
@@ -678,6 +756,7 @@ def replace_research_db(paths: DataPaths, *, connection_url: str) -> None:
                 production_dir / spec.csv_name, iso_date_columns=(spec.date_column,)
             ).drop(spec.drop_columns, strict=False)
             _replace_table(engine, spec.table, [frame])
+        _replace_ff_factors_monthly(engine, production_dir / FF_FACTORS_CSV)
         cutoffs_daily = _read_production_csv(production_dir / "return_cutoffs_daily.csv")
         _replace_table(
             engine, RETURN_CUTOFFS_DAILY_TABLE, [cutoffs_daily.drop("eom", strict=False)]
@@ -688,6 +767,7 @@ def replace_research_db(paths: DataPaths, *, connection_url: str) -> None:
             DAILY_RETURNS_TABLE,
             (_country_frame(path, "date")[0].sort("id", "date") for path in daily),
         )
+        _rebuild_usa_daily_history(engine)
     finally:
         engine.dispose()
     _log("Database replace completed successfully")

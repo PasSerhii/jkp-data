@@ -10280,7 +10280,10 @@ def save_output_files(paths: DataPaths):
         2) Includes market returns (monthly/daily) and cutoff files.
         3) Write the five CSV files exported by the modified SAS main.sas to
            processed/production/.
-        4) Interim files are preserved for downstream steps.
+        4) Write the Fama-French factors this run used (raw ff_factors_monthly,
+           every month) as fama_french_factors_monthly.csv, the source of the
+           research table of that name.
+        5) Interim files are preserved for downstream steps.
 
     Output:
         Files copied into 'other_output/' directory.
@@ -10308,6 +10311,19 @@ def save_output_files(paths: DataPaths):
             pl.scan_parquet(paths.interim_dir / f"{name}.parquet"),
             paths.production_dir / f"{name}.csv",
         )
+
+    # Explicit casts: the download can store the factors as decimals, and the
+    # table expects plain numbers and ISO dates.
+    _write_sas_csv(
+        pl.scan_parquet(paths.raw_tables_dir / "ff_factors_monthly.parquet")
+        .select(
+            pl.col("date").cast(pl.Date),
+            pl.col("mktrf", "smb", "hml", "rf", "year", "month", "umd").cast(pl.Float64),
+            pl.col("dateff").cast(pl.Date),
+        )
+        .sort("date"),
+        paths.production_dir / "fama_french_factors_monthly.csv",
+    )
 
 
 @measure_time

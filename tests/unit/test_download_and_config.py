@@ -645,9 +645,8 @@ class TestSaveMonthlyRet:
 class TestSaveOutputFiles:
     """Tests for the SAS-compatible small output CSVs."""
 
-    def test_writes_sas_output_csv_files(self, test_paths):
-        from jkp.data.aux_functions import save_output_files
-
+    @staticmethod
+    def _write_inputs(test_paths) -> None:
         sample = pl.DataFrame({"excntry": ["USA"], "date": [date(2020, 1, 31)], "ret": [0.01]})
         for name in (
             "market_returns",
@@ -659,6 +658,63 @@ class TestSaveOutputFiles:
             "ap_factors_daily",
         ):
             sample.write_parquet(test_paths.interim_dir / f"{name}.parquet")
+        # As downloaded from ff.factors_monthly: numeric columns may arrive as
+        # decimals, and rows in no particular order.
+        test_paths.raw_tables_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "date": [date(2026, 8, 1), date(1926, 7, 1)],
+                "mktrf": [0.0256, 0.0296],
+                "smb": [0.0034, -0.0256],
+                "hml": [-0.0354, -0.0243],
+                "rf": [0.0029, 0.0022],
+                "year": [2026.0, 1926.0],
+                "month": [8.0, 7.0],
+                "umd": [-0.057, None],
+                "dateff": [date(2026, 8, 31), date(1926, 7, 31)],
+            }
+        ).with_columns(
+            pl.col("mktrf", "smb", "hml", "umd").cast(pl.Decimal(8, 6)),
+            pl.col("rf").cast(pl.Decimal(7, 5)),
+        ).write_parquet(test_paths.raw_tables_dir / "ff_factors_monthly.parquet")
+
+    def test_writes_the_runs_fama_french_factors_as_plain_numbers(self, test_paths):
+        from jkp.data.aux_functions import save_output_files
+
+        self._write_inputs(test_paths)
+
+        save_output_files(test_paths)
+
+        written = pl.read_csv(test_paths.production_dir / "fama_french_factors_monthly.csv")
+        assert written.to_dicts() == [
+            {
+                "date": "1926-07-01",
+                "mktrf": 0.0296,
+                "smb": -0.0256,
+                "hml": -0.0243,
+                "rf": 0.0022,
+                "year": 1926.0,
+                "month": 7.0,
+                "umd": None,
+                "dateff": "1926-07-31",
+            },
+            {
+                "date": "2026-08-01",
+                "mktrf": 0.0256,
+                "smb": 0.0034,
+                "hml": -0.0354,
+                "rf": 0.0029,
+                "year": 2026.0,
+                "month": 8.0,
+                "umd": -0.057,
+                "dateff": "2026-08-31",
+            },
+        ]
+
+    def test_writes_sas_output_csv_files(self, test_paths):
+        from jkp.data.aux_functions import save_output_files
+
+        self._write_inputs(test_paths)
 
         save_output_files(test_paths)
 

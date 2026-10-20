@@ -249,7 +249,7 @@ production-correct value; override only for a reason.
 | `WORKERS` | *(empty)* | Empty uses `config.DAILY_DOWNLOAD_WORKERS` (8). |
 | `KEEP_INTERIM` | `1` | Keeps `interim/` and `raw/` and ships the accounting artefacts to S3. |
 | `DB_UPDATE` | `1` (`0` with `FULL_HISTORY=1`) | Passes `--db-update`: after the outputs are written, the production CSVs are uploaded incrementally to the research MSSQL database named by `RESEARCH_UPDATE` (currently `research_test`). The host probes the image for the flag first, like `KEEP_INTERIM`. `0` skips the upload. |
-| `DB_REPLACE` | `0` | `1` passes `--db-replace` instead: the eight research tables in the same database are emptied and reloaded from the CSVs (see section 5). Needs `PRODUCTION_YEARS=0`. |
+| `DB_REPLACE` | `0` | `1` passes `--db-replace` instead: the nine research tables in the same database are emptied and reloaded from the CSVs (see section 5). Needs `PRODUCTION_YEARS=0`. |
 | `CREDENTIAL_PARAM` | *(empty)* | Empty stages a per-run secret from `.env` and the host deletes it. Set to an existing SSM path and the host keeps it. |
 | `UNATTENDED` | `0` | `1` runs `production-run.sh --unattended` on the host before the pipeline. |
 | `MARKET` | `ondemand` | `spot` is available for a throwaway re-run; a reclaim on a delivery loses the run. |
@@ -330,7 +330,7 @@ as insurance was never used. A full-history run takes about 6 hours on demand
 
 To reload the research tables from that build, add `DB_REPLACE=1`
 (`jkp build --db-replace`, in place of `--db-update`; same `RESEARCH_UPDATE`
-target). After the outputs are written, each of the eight tables is emptied
+target). After the outputs are written, each of the nine tables is emptied
 with `TRUNCATE`, which keeps its column types, key and indexes, and reloaded
 from the CSVs. The upload refuses to start while the database is in FULL
 recovery, which would keep the whole reload in the transaction log on the
@@ -356,7 +356,13 @@ all parquet output — is lost, and recovering it means a full rerun.
 **The build loads the research database itself.** With `DB_UPDATE=1` (the
 default) the container uploads these CSVs incrementally to the database named by
 `RESEARCH_UPDATE` (`jkp build --db-update`, `src/jkp/data/dataupdate.py`); the
-separate sasWrds uploader is not used.
+separate sasWrds uploader is not used. Both modes replace
+`fama_french_factors_monthly` in full with the Fama-French factors the run used
+(`fama_french_factors_monthly.csv`, from `ff.factors_monthly`), about two days
+before WRDS's `ff_monthly.py` used to. After the daily returns, both modes
+rebuild `dailyreturnsproduction_full_history` (the USA rows of
+`dailyreturnsproduction`, `ret_exc_dollar` as `ret_exc`) with `TRUNCATE` and
+`INSERT … SELECT` in one transaction.
 
 ---
 

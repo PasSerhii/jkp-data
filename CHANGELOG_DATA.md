@@ -3,6 +3,12 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 20-10-2026
+__Changes__:
+- New production file `processed/production/fama_french_factors_monthly.csv`: the Fama-French monthly factors (`ff.factors_monthly`: `mktrf`, `smb`, `hml`, `rf`, `umd`) the run used, every month since July 1926.
+  - The database update loads it into `research.dbo.fama_french_factors_monthly`, replacing every row. The table was loaded by `ff_monthly.py` on WRDS after the SAS job, about two days after the 1st; it is now current when the monthly run finishes.
+  - Values are unchanged: rebuilt from the data of 20-10-2026, all 1,202 months match the table WRDS loaded within 6×10⁻¹⁷.
+
 ## 15-10-2026
 __Changes__:
 - The split restoration of 07-10-2026 counted a split twice when Compustat books the split's adjustment-factor step on another day than the price's split. Such splits are now bridged when the factor step can be matched to them unambiguously; otherwise they are restored as before.
