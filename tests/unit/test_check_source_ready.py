@@ -211,6 +211,73 @@ class TestDailyCompleteness:
         assert "no daily rows" in detail
 
 
+class TestFxCompleteness:
+    """The rates gen_fx1 converts with must be present for the day the target needs.
+
+    2026-10-31 was a Saturday. S&P's Saturday rates arrive with Monday's, so the
+    run on Sunday 1 November saw 152 rates on Friday and none on the month end;
+    gen_fx1 carries Friday's rate over that weekend, so Friday is what counts.
+    """
+
+    @staticmethod
+    def _october(last_day=30, rates=152, usd=True):
+        """Per-date FX counts for October 2026, through ``last_day``."""
+        return [(date(2026, 10, d), rates, usd) for d in range(1, last_day + 1)]
+
+    @pytest.mark.parametrize(
+        ("target", "needed"),
+        [
+            (date(2026, 9, 30), date(2026, 9, 30)),  # Wednesday: the day itself
+            (date(2026, 7, 31), date(2026, 7, 31)),  # Friday
+            (date(2026, 10, 31), date(2026, 10, 30)),  # Saturday: the Friday before
+            (date(2027, 1, 31), date(2027, 1, 29)),  # Sunday: the Friday before
+            (date(2026, 8, 31), date(2026, 8, 31)),  # Monday
+        ],
+    )
+    def test_day_needed(self, mod, target, needed):
+        assert mod.fx_day_needed(target) == needed
+
+    def test_saturday_month_end_is_ready_on_fridays_rates(self, mod):
+        """The 2026-11-01 case: nothing dated the 31st yet, Friday complete."""
+        _, ok, detail = mod.assess_fx(self._october(), date(2026, 10, 31))
+        assert ok, detail
+        assert "on 2026-10-30, carried over the Sat month end" in detail
+
+    def test_sunday_month_end_is_ready_on_fridays_rates(self, mod):
+        counts = [(date(2027, 1, d), 152, True) for d in range(1, 30)]
+        _, ok, detail = mod.assess_fx(counts, date(2027, 1, 31))
+        assert ok, detail
+
+    def test_weekday_month_end_still_needs_its_own_rates(self, mod):
+        counts = [(date(2026, 9, d), 152, True) for d in range(1, 30)]
+        _, ok, detail = mod.assess_fx(counts, date(2026, 9, 30))
+        assert not ok
+        assert "0 GBP-based rates on 2026-09-30" in detail
+
+    def test_friday_missing_blocks_a_weekend_month_end(self, mod):
+        _, ok, _ = mod.assess_fx(self._october(last_day=29), date(2026, 10, 31))
+        assert not ok
+
+    def test_partial_friday_is_rejected(self, mod):
+        counts = self._october()
+        counts[-1] = (date(2026, 10, 30), 140, True)  # 92% of median
+        _, ok, _ = mod.assess_fx(counts, date(2026, 10, 31))
+        assert not ok
+
+    def test_missing_usd_leg_is_rejected_whatever_the_count(self, mod):
+        """Every cross goes through GBP->USD; without it no rate converts to USD."""
+        counts = self._october()
+        counts[-1] = (date(2026, 10, 30), 152, False)
+        _, ok, detail = mod.assess_fx(counts, date(2026, 10, 31))
+        assert not ok
+        assert "GBP->USD MISSING" in detail
+
+    def test_empty_month_is_rejected(self, mod):
+        _, ok, detail = mod.assess_fx([], date(2026, 10, 31))
+        assert not ok
+        assert "no FX rows" in detail
+
+
 class TestArguments:
     @pytest.mark.parametrize(
         "argv",

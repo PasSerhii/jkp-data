@@ -49,8 +49,11 @@ FULL_DAY_SHARE = 0.5
 
 Gate = tuple[str, bool, str]
 DayCounts = list[tuple[date, int]]
+# (datadate, valid GBP-based rates, GBP->USD rate present)
+FxCounts = list[tuple[date, int, bool]]
 
 DAILY_GATE = "daily prices through month end"
+FX_GATE = "FX through month end"
 
 
 def _previous_month_end(today: date) -> date:
@@ -78,6 +81,39 @@ def assess_daily_month(counts: DayCounts, target: date) -> Gate:
         ok,
         f"last full day {last_day} ({lag}d before month end), "
         f"{last_n:,} rows = {share:.0%} of median",
+    )
+
+
+def fx_day_needed(target: date) -> date:
+    """The last day whose exchange rates must be delivered to build ``target``.
+
+    FX publishes on every calendar day, weekends included, so a weekday target
+    needs its own rates. A Saturday or Sunday target needs the Friday before it:
+    S&P's weekend rates are copies of Friday's, delivered only with Monday's, and
+    gen_fx1 carries Friday's rate over a weekend that ends the build window.
+    """
+    return target - timedelta(days=max(target.weekday() - 4, 0))
+
+
+def assess_fx(counts: FxCounts, target: date) -> Gate:
+    """Are the rates the build converts with present for the day ``target`` needs?
+
+    ``counts`` holds every date in the target month. It mirrors gen_fx1, which
+    crosses every currency through GBP->USD: a day without that rate yields no
+    USD conversion at all, however many other rates it has. Pure so it can be
+    tested without a database.
+    """
+    if not counts:
+        return (FX_GATE, False, "no FX rows in the target month")
+    day = fx_day_needed(target)
+    median = statistics.median(n for _, n, _ in counts)
+    n, usd = next(((n, usd) for d, n, usd in counts if d == day), (0, False))
+    carried = "" if day == target else f", carried over the {target:%a} month end"
+    return (
+        FX_GATE,
+        usd and n >= COVERAGE_MIN * median,
+        f"{n:,} GBP-based rates on {day}{carried} vs median {median:,}, "
+        f"GBP->USD {'present' if usd else 'MISSING'} (gates USD conversion)",
     )
 
 
@@ -113,10 +149,13 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
                 "GROUP BY 1"
             )
         ]
-        fx_counts: DayCounts = [
-            (as_date(d), int(n))
-            for d, n in rows(
-                "SELECT datadate, count(*) FROM public.exrt_dly "
+        fx_counts: FxCounts = [
+            (as_date(d), int(n), bool(usd))
+            for d, n, usd in rows(
+                "SELECT datadate, "
+                "count(DISTINCT tocurd) FILTER (WHERE fromcurd = 'GBP' AND exratd > 0), "
+                "coalesce(bool_or(fromcurd = 'GBP' AND tocurd = 'USD' AND exratd > 0), false) "
+                "FROM public.exrt_dly "
                 f"WHERE datadate BETWEEN date '{month_start}' AND date '{target}' "
                 "GROUP BY 1"
             )
@@ -136,19 +175,9 @@ def evaluate(target: date) -> tuple[list[Gate], str]:
     monthly_cov = rows_target / rows_prev if rows_prev else 0.0
     daily_cov = len(daily_counts) / days_prev if days_prev else 0.0
 
-    # FX publishes on every calendar day, weekends included, so the month end
-    # itself must be present rather than the last trading day before it.
-    fx_by_date = dict(fx_counts)
-    fx_median = statistics.median(n for _, n in fx_counts) if fx_counts else 0
-    fx_target = fx_by_date.get(target, 0)
-
     gates: list[Gate] = [
         assess_daily_month(daily_counts, target),
-        (
-            "FX through month end",
-            bool(fx_median) and fx_target >= COVERAGE_MIN * fx_median,
-            f"{fx_target:,} rows on {target} vs median {fx_median:,} (gates USD conversion)",
-        ),
+        assess_fx(fx_counts, target),
         (
             "monthly universe complete",
             monthly_cov >= COVERAGE_MIN,

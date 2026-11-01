@@ -3,6 +3,13 @@ This change log keeps track of changes to the underlying data set. In brackets, 
 
 This repository ports the original SAS pipeline ([ReplicationCrisis](https://github.com/bkelly-lab/ReplicationCrisis)) to Python using Polars. Entries up to and including 05-03-2025 are from the original change log.
 
+## 01-11-2026
+__Changes__:
+- When the build's end date is a Saturday or Sunday whose exchange rates S&P has not delivered yet, each currency's latest rate is carried over those days. S&P publishes weekend rates as copies of Friday's (53 of the 56 weekends from October 2025 to October 2026; the exceptions are the three around New Year) but delivers them only with Monday's rates, so the monthly run on Sunday 1 November 2026 had no rate for Saturday 31 October.
+  - Accounting values are converted to USD at the month end. Without a rate for it, `assets`, `sales`, `book_equity`, `net_income` and every characteristic scaled by market equity or enterprise value (`*_me`, `*_mev`, `enterprise_value`, `eq_dur`, `aliq_mat`) would be empty for the month, for every company. The production SAS has the same dependency and would wait for Monday's delivery.
+  - Values are unchanged whenever the month end has been delivered: only missing weekend days at the very end of the build window are filled, never a weekday. The next monthly update rewrites the month with the rate S&P delivers.
+  - The readiness check (`scripts/check_source_ready.py`) now accepts Friday's rates for a weekend month end. It counts only the GBP-based rates the pipeline crosses through and requires the GBP→USD rate itself.
+
 ## 20-10-2026
 __Changes__:
 - New production file `processed/production/fama_french_factors_monthly.csv`: the Fama-French monthly factors (`ff.factors_monthly`: `mktrf`, `smb`, `hml`, `rf`, `umd`) the run used, every month since July 1926.
