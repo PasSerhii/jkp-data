@@ -627,7 +627,49 @@ def gen_prihist_files(paths: DataPaths):
     con.disconnect()
 
 
-def gen_fx1(paths: DataPaths):
+def carry_fx_over_weekend_end(fx: pl.DataFrame, end_date: date) -> pl.DataFrame:
+    """
+    Description:
+        Give a Saturday/Sunday that ends the build window the latest rate when the feed has not
+        delivered it yet. S&P publishes weekend rates as copies of Friday's but delivers them
+        only with Monday's, so a build on the 1st after a month ending on a weekend finds no
+        rate for the month end, the date accounting values are converted at
+        (convert_raw_vars_to_usd).
+
+    Steps:
+        1) Take each currency's latest observation on or before end_date.
+        2) Keep it when its rate is finite and positive and every day after it through
+           end_date (one or two days) is a Saturday or Sunday.
+        3) Append one row per such day with that rate. Delivered rows are never replaced:
+           the latest observation is later than any delivered day up to end_date.
+
+    Output:
+        DataFrame with the columns of fx and the missing weekend days appended.
+    """
+    latest = (
+        fx.filter(pl.col("datadate") <= end_date)
+        .sort(["curcdd", "datadate"])
+        .group_by("curcdd")
+        .agg(pl.col("datadate").last(), pl.col("fx").last())
+    )
+    rate = pl.col("fx").cast(pl.Float64)
+    weekend = (
+        latest.filter(
+            rate.is_finite()
+            & (rate > 0)
+            & (pl.lit(end_date) - pl.col("datadate")).dt.total_days().is_between(1, 2)
+        )
+        .with_columns(
+            datadate=pl.date_ranges(pl.col("datadate").dt.offset_by("1d"), pl.lit(end_date))
+        )
+        .filter(pl.col("datadate").list.eval(pl.element().dt.weekday() >= 6).list.all())
+        .explode("datadate")
+        .select(fx.columns)
+    )
+    return pl.concat([fx, weekend])
+
+
+def gen_fx1(paths: DataPaths, end_date: date | None = None) -> None:
     """
     Description:
         Build daily FX (to USD) series per currency using Compustat daily exchange rates.
@@ -637,10 +679,13 @@ def gen_fx1(paths: DataPaths):
         2) Join table to itself on (fromcurd, datadate) with fromcurd='GBP' and b.tocurd='USD'.
         3) Compute fx = b.exratd / a.exratd, label a.tocurd as curcdd.
         4) DISTINCT rows and write out.
+        5) With end_date, carry each currency's latest rate over a Saturday/Sunday that ends
+           the build window and is not delivered yet (carry_fx_over_weekend_end).
 
     Output:
         Parquet: raw_data_dfs/__fx1.parquet (curcdd, datadate, fx to USD).
     """
+    out_path = paths.interim_dir / "raw_data_dfs" / "__fx1.parquet"
     con = ibis.duckdb.connect(threads=os.cpu_count())
     con.create_table(
         "comp_exrt_dly", con.read_parquet(paths.raw_tables_dir / "comp_exrt_dly.parquet")
@@ -658,8 +703,10 @@ def gen_fx1(paths: DataPaths):
     WHERE a.fromcurd = 'GBP'
     AND b.tocurd  = 'USD';
     """)
-    con.table("__fx1").to_parquet(paths.interim_dir / "raw_data_dfs" / "__fx1.parquet")
+    con.table("__fx1").to_parquet(out_path)
     con.disconnect()
+    if end_date is not None:
+        carry_fx_over_weekend_end(pl.read_parquet(out_path), end_date).write_parquet(out_path)
 
 
 def _record_ff_snapshot(paths: DataPaths) -> None:
@@ -697,13 +744,14 @@ def _record_ff_snapshot(paths: DataPaths) -> None:
 
 
 @measure_time
-def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
+def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False, end_date: date | None = None):
     """
     Description:
         Generate a suite of “raw data” helper Parquet files from Compustat/CRSP sources.
 
     Steps:
-        1) Call gen_firmshares(), gen_prihist_files(), gen_fx1().
+        1) Call gen_firmshares(), gen_prihist_files(), gen_fx1() (with the build's end_date,
+        for an undelivered weekend at the end of the window).
         2) Derive SIC/NAICS (NA & Global), GICS (NA & Global), delist files (CRSP m/d),
         security info (NA & Global), T-bill return, FF monthly factors, exchange code map,
         exchange→country map, company headers (NA+Global), and CRSP security files (m & d).
@@ -823,7 +871,7 @@ def gen_raw_data_dfs(paths: DataPaths, bypass_crsp: bool = False):
         paths.interim_dir / "raw_data_dfs" / "__header.parquet",
     )
     gen_prihist_files(paths)
-    gen_fx1(paths)
+    gen_fx1(paths, end_date)
     if not bypass_crsp:
         aug_msf_v2(paths)
         gen_crsp_sf(paths, "m").to_parquet(

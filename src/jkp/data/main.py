@@ -342,7 +342,7 @@ def run_pipeline(
             daily_download_workers=daily_download_workers,
         )
     monitor.set_phase("security_panels")
-    gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp)
+    gen_raw_data_dfs(paths, bypass_crsp=bypass_crsp, end_date=effective_end_date)
     prepare_comp_sf(paths, "both", bypass_crsp=bypass_crsp)
     if not bypass_crsp:
         prepare_crsp_sf(paths, "m")
