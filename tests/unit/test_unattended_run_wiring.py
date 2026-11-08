@@ -399,7 +399,10 @@ class TestLaunchTemplate:
 
     def test_the_role_may_publish_to_the_default_bus_only(self):
         launch = LAUNCH.read_text(encoding="utf-8")
-        assert 'events:PutEvents\\",\\"Resource\\":\\"arn:aws:events:$REGION:$ACCOUNT:event-bus/default' in launch
+        assert (
+            'events:PutEvents\\",\\"Resource\\":\\"arn:aws:events:$REGION:$ACCOUNT:event-bus/default'
+            in launch
+        )
 
     def test_template_starts_no_host_and_stages_no_secret(self, template):
         _, _, calls, _ = template
