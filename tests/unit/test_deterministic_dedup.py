@@ -190,3 +190,71 @@ class TestGenReturnsDfDedup:
 
         feb_ret = result.filter(pl.col("datadate") == date(2024, 2, 29))["ret"][0]
         assert feb_ret == pytest.approx(0.1, rel=1e-10)
+
+    def test_keeps_return_above_10x(self, test_paths) -> None:
+        """Returns above 1000% are kept as-is, matching the SAS source: raw ret/ret_exc
+        are never magnitude-filtered there, only winsorized downstream into a separate
+        ret_exc_wins column. A prior null-above-1000% guard here was Python-only, not
+        part of the documented methodology, and deleting only the spike side of a
+        round-trip data glitch (while keeping the crash-back day) could distort rolling
+        characteristics computed from the raw daily series more than leaving it alone."""
+        from jkp.data.aux_functions import gen_returns_df
+
+        df = pl.DataFrame(
+            {
+                "gvkey": ["001"] * 4,
+                "iid": ["01"] * 4,
+                "datadate": [
+                    date(2024, 1, 31),
+                    date(2024, 2, 29),
+                    date(2024, 3, 29),
+                    date(2024, 4, 30),
+                ],
+                "eom": [
+                    date(2024, 1, 31),
+                    date(2024, 2, 29),
+                    date(2024, 3, 31),
+                    date(2024, 4, 30),
+                ],
+                "prcstd": [4, 4, 4, 4],
+                "ri": [100.0, 1000.0, 12000.0, 12000.0],
+                "ri_local": [100.0, 1000.0, 12000.0, 12000.0],
+                "curcdd": ["USD"] * 4,
+            }
+        )
+        df.write_parquet(test_paths.interim_dir / "__comp_msf.parquet")
+
+        result = gen_returns_df(test_paths, "m")
+
+        feb = result.filter(pl.col("datadate") == date(2024, 2, 29))
+        mar = result.filter(pl.col("datadate") == date(2024, 3, 29))
+        assert feb["ret"][0] == pytest.approx(9.0, rel=1e-10)
+        assert mar["ret"][0] == pytest.approx(11.0, rel=1e-10)
+        assert mar["ret_local"][0] == pytest.approx(11.0, rel=1e-10)
+
+    def test_nulls_infinite_and_nan_return(self, test_paths) -> None:
+        """A zero prior price produces an undefined pct_change (inf/NaN), which must
+        still be nulled — this is a computational artifact, not a magnitude filter."""
+        from jkp.data.aux_functions import gen_returns_df
+
+        df = pl.DataFrame(
+            {
+                "gvkey": ["001"] * 3,
+                "iid": ["01"] * 3,
+                "datadate": [date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 29)],
+                "eom": [date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 31)],
+                "prcstd": [4, 4, 4],
+                "ri": [100.0, 0.0, 50.0],
+                "ri_local": [100.0, 0.0, 50.0],
+                "curcdd": ["USD"] * 3,
+            }
+        )
+        df.write_parquet(test_paths.interim_dir / "__comp_msf.parquet")
+
+        result = gen_returns_df(test_paths, "m")
+
+        feb = result.filter(pl.col("datadate") == date(2024, 2, 29))
+        mar = result.filter(pl.col("datadate") == date(2024, 3, 29))
+        assert feb["ret"][0] == pytest.approx(-1.0, rel=1e-10)
+        assert mar["ret"][0] is None  # 50.0 / 0.0 -> inf
+        assert mar["ret_local"][0] is None

@@ -10,6 +10,7 @@ Writes:
 from __future__ import annotations
 
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -19,6 +20,9 @@ from jkp.data.paths import DataPaths
 from tests.golden.comp_sic_naics_inputs import build_sic_naics_inputs
 
 GOLDEN_DIR = Path(__file__).parent / "fixtures" / "comp_sic_naics"
+# Panel end: the latest datadate among the fixture inputs. Keep in sync with
+# GOLDEN_END in tests/unit/test_comp_sic_naics.py.
+GOLDEN_END = date(2020, 6, 15)
 
 
 def main() -> None:
@@ -29,7 +33,7 @@ def main() -> None:
         sic_naics_na, sic_naics_gl = build_sic_naics_inputs()
         sic_naics_na.write_parquet(paths.interim_dir / "raw_data_dfs" / "sic_naics_na.parquet")
         sic_naics_gl.write_parquet(paths.interim_dir / "raw_data_dfs" / "sic_naics_gl.parquet")
-        comp_sic_naics(paths)
+        comp_sic_naics(paths, end_date=GOLDEN_END)
         out_path = GOLDEN_DIR / "comp_other.parquet"
         pl.read_parquet(paths.interim_dir / "comp_other.parquet").write_parquet(out_path)
         n_rows = pl.read_parquet(out_path).height

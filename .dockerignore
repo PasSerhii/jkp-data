@@ -1,0 +1,36 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.claude
+.debug-output
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+
+# Licensed/generated data must never enter the image or ECR build context.
+data
+raw
+interim
+processed
+*.parquet
+*.csv
+*.ddb
+
+# Development and validation material is not required at runtime.
+# sql/ is the exception: the monthly run's Fama-French refresh and identifier
+# capture live in sql/xpressfeed_views/ and ship in the image so they cannot
+# drift from the pipeline they run alongside.
+tests
+documentation
+slurm
+*.md
+!README.md
+Dockerfile*
+!Dockerfile
+compose*.yml
+compose*.yaml
