@@ -504,6 +504,9 @@ rerunning it.
   eu-central-1b: `m6a.32xlarge` was ~77% off on demand but `r7i.16xlarge` only
   ~49%. Check `describe-spot-price-history` rather than assuming. A spot test
   run of 20 October 2026 was reclaimed after 1h18m, before any output.
+- **`user-data.sh` has almost no room left.** EC2 refuses user-data over
+  16,384 bytes, and the rendered script is 16,185. Anything added there has to
+  be short, or another part has to move into the image.
 - **The Compustat RDS stops at 14:45 Israel time.** The build reads it only
   during `source_download` (~26 minutes). The scheduled run is done with it by
   about 10:40 at the latest: a 09:00 start, up to 60 minutes of waiting for the
@@ -526,6 +529,12 @@ Automated since 20 October 2026; the first scheduled run is on 1 November 2026:
 - **Loading the research database.** `--db-update`, including
   `fama_french_factors_monthly` and `dailyreturnsproduction_full_history`.
 - **Terminating the host.** Right after the S3 upload, or 5 hours after a failure.
+- **Starting Alpha Lab's models.** After a successful run that uploaded every
+  country, the host sends a `dataset.updated` event to EventBridge (source
+  `alpha.jkp-data`, dataset `characteristicsproduction`, period `END_DATE`), and
+  the Lambda `alpha-lab-dispatcher` picks it up. If it cannot be sent in three
+  tries, the usual alert says the models will not start for that month; the run
+  still counts as successful.
 - **Reporting.** Start, finish and failure by email and in #wrds, and an alarm
   when the schedule cannot launch a host.
 
