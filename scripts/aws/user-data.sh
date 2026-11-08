@@ -41,6 +41,16 @@ INTERIM_KEEP="acc_std_ann.parquet acc_std_qtr.parquet achars_world.parquet qchar
 
 notify() { aws sns publish --region "$REGION" --topic-arn "$TOPIC" --subject "$1" --message "$2" >/dev/null 2>&1 || true; }
 
+# Starts the Alpha Lab models. Kept short: user-data is limited to 16 KB.
+publish_dataset_updated() {
+  local d="{\\\"dataset\\\":\\\"characteristicsproduction\\\",\\\"period\\\":\\\"$END_DATE\\\",\\\"run_tag\\\":\\\"$RUN_TAG\\\"}" f i
+  for i in 1 2 3; do
+    f=$(aws events put-events --region "$REGION" --entries "[{\"Source\":\"alpha.jkp-data\",\"DetailType\":\"dataset.updated\",\"Detail\":\"$d\"}]" --query FailedEntryCount --output text 2>/dev/null) && [ "$f" = 0 ] && return
+    sleep 20
+  done
+  notify "JKP RUN: Alpha Lab event not sent" "The models will not start for $END_DATE."
+}
+
 # The host retires itself, so an unattended run cannot leave a paid instance
 # idling. launch.sh starts it with --instance-initiated-shutdown-behavior
 # terminate, so `shutdown` ends the instance and its volume. A successful run
@@ -316,6 +326,9 @@ touch /mnt/jkp-data/DONE
 ship_setup_log
 
 if [ "$RC" -eq 0 ]; then
+  if [ -n "$DB_FLAG" ] && [ -z "$COUNTRIES" ]; then
+    publish_dataset_updated
+  fi
   notify "JKP RUN: FINISHED OK ($(cat /mnt/jkp-data/ELAPSED))" \
 "Total elapsed (download -> all CSVs): $(cat /mnt/jkp-data/ELAPSED)
 Started:  $(cat /mnt/jkp-data/STARTED_AT)

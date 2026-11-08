@@ -382,6 +382,25 @@ class TestLaunchTemplate:
         ):
             assert line in user_data, line
 
+    def test_template_tells_alpha_lab_after_a_full_database_update(self, template):
+        _, user_data, _, _ = template
+        assert "aws events put-events" in user_data
+        assert "alpha.jkp-data" in user_data and "dataset.updated" in user_data
+        assert "characteristicsproduction" in user_data
+        assert "--query FailedEntryCount" in user_data
+        gate = user_data.index('if [ -n "$DB_FLAG" ] && [ -z "$COUNTRIES" ]; then')
+        success = user_data.index('if [ "$RC" -eq 0 ]; then')
+        assert success < gate < user_data.index("publish_dataset_updated\n  fi")
+        assert user_data.index("publish_dataset_updated\n  fi") < user_data.index("shutdown -h now")
+
+    def test_template_user_data_fits_the_ec2_limit(self, template):
+        _, user_data, _, _ = template
+        assert len(user_data.encode("utf-8")) <= 16384
+
+    def test_the_role_may_publish_to_the_default_bus_only(self):
+        launch = LAUNCH.read_text(encoding="utf-8")
+        assert 'events:PutEvents\\",\\"Resource\\":\\"arn:aws:events:$REGION:$ACCOUNT:event-bus/default' in launch
+
     def test_template_starts_no_host_and_stages_no_secret(self, template):
         _, _, calls, _ = template
         assert "ec2 create-launch-template" in calls
